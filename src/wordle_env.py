@@ -60,6 +60,29 @@ LEARNER_GUESS_PROMPT = (
 
 
 # -----------------------------------------------------------------------------
+# Guess extraction — pull actual word from noisy LLM output
+# -----------------------------------------------------------------------------
+def extract_guess(raw_guess: str) -> str:
+    """Best-effort extraction of a single word from noisy model output."""
+    text = raw_guess.lower().strip()
+    # Strip <think>...</think> blocks (Qwen3 style)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Strip leftover <think> without closing tag
+    text = re.sub(r"<think>.*", "", text, flags=re.DOTALL).strip()
+    # Try to find quoted word: "word" or 'word'
+    m = re.search(r'["\']([a-z]+)["\']', text)
+    if m:
+        return m.group(1)
+    # Try "the secret word is X" pattern
+    m = re.search(r'(?:secret word is|guess is|answer is|it is|word is)[:\s]+([a-z]+)', text)
+    if m:
+        return m.group(1)
+    # Fallback: last word that is purely alphabetic
+    words = re.findall(r'[a-z]+', text)
+    return words[-1] if words else text
+
+
+# -----------------------------------------------------------------------------
 # Hard-coded leak filter — the ONLY format enforcement
 # -----------------------------------------------------------------------------
 def censor_word(text: str, secret_word: str) -> str:
@@ -122,7 +145,7 @@ def compute_reward(
                        (soft proxy, always negative but less negative = better)
       - Optional format bonus/penalty
     """
-    guess_clean = guess.strip().lower()
+    guess_clean = extract_guess(guess)
     secret_clean = secret_word.strip().lower()
 
     info = {}
@@ -241,7 +264,7 @@ class WordleEnv:
     def step_guess(self, state: GameState, guess: str, model=None, tokenizer=None) -> GameState:
         """Learner guesses. Computes reward."""
         assert not state.done
-        state.guess = guess.strip().lower()
+        state.guess = extract_guess(guess)
 
         if model is not None and tokenizer is not None:
             info = compute_reward(state.guess, state.secret_word, model, tokenizer, state, self.config)
