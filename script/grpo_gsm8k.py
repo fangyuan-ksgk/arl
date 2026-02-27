@@ -100,9 +100,12 @@ def main():
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--use_vllm", action="store_true", default=True)
     parser.add_argument("--no_vllm", action="store_true")
+    parser.add_argument("--vllm_mode", type=str, default="colocate",
+                        choices=["colocate", "server"],
+                        help="'colocate': vLLM shares GPU with training (single-GPU). "
+                             "'server': vLLM runs as separate server on dedicated GPUs.")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.5,
-                        help="Fraction of GPU VRAM for vLLM KV cache. Rest is for model+grads+optim. "
-                             "0.5 for small models, 0.3 for large models that need more grad memory.")
+                        help="(colocate only) Fraction of GPU VRAM for vLLM KV cache.")
     parser.add_argument("--save_strategy", type=str, default="no")
     parser.add_argument("--report_to", type=str, default="none")
     args = parser.parse_args()
@@ -127,8 +130,9 @@ def main():
         config_kwargs["max_steps"] = args.max_steps
     if not args.no_vllm:
         config_kwargs["use_vllm"] = True
-        config_kwargs["vllm_mode"] = "colocate"
-        config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+        config_kwargs["vllm_mode"] = args.vllm_mode
+        if args.vllm_mode == "colocate":
+            config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
 
     config = GRPOConfig(**config_kwargs)
 
