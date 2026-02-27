@@ -7,6 +7,10 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODEL_NAME="Qwen/Qwen3-4B"
 PORT=8888
 
+# Kill any leftover processes from previous runs
+fuser -k ${PORT}/tcp 2>/dev/null || true
+sleep 1
+
 # =============================================
 # (1) Spin up vLLM server
 # =============================================
