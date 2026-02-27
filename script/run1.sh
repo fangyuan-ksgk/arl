@@ -23,6 +23,12 @@ OUTPUT_2="${PROJECT_DIR}/output/grpo_qwen3_4b"
 MAX_STEPS=200
 N_ANALYSIS_SAMPLES=50
 VLLM_PORT=8000
+LOG_DIR="${PROJECT_DIR}/logs"
+mkdir -p "${LOG_DIR}"
+LOG_FILE="${LOG_DIR}/run1_$(date +%Y%m%d_%H%M%S).log"
+
+# Tee all output to log file
+exec > >(tee -a "${LOG_FILE}") 2>&1
 
 echo "============================================"
 echo "  GRPO Training + Rollout Analysis Pipeline"
@@ -51,12 +57,14 @@ run_grpo() {
     N_TRAIN_GPUS=$(echo "${TRAIN_GPUS}" | tr ',' '\n' | wc -l | tr -d ' ')
 
     echo "  Starting vLLM server for ${MODEL} (GPUs ${VLLM_GPUS}, TP=${TP_SIZE}, port ${PORT}) ..."
+    set -m  # enable job control so background job gets its own process group
     CUDA_VISIBLE_DEVICES=${VLLM_GPUS} trl vllm-serve \
         --model "${MODEL}" \
         --tensor-parallel-size ${TP_SIZE} \
         --data-parallel-size 1 \
         --port ${PORT} &
     VLLM_PID=$!
+    set +m
 
     # Wait for vLLM to be ready
     echo "  Waiting for vLLM server (PID ${VLLM_PID}) to be ready ..."
@@ -91,13 +99,27 @@ run_grpo() {
         --gradient_accumulation_steps ${GRAD_ACCUM} \
         --learning_rate ${LR} \
         --logging_steps 10 \
-        --save_strategy "steps" \
+        --save_strategy "no" \
         --report_to "none"
     local TRAIN_EXIT=$?
 
-    echo "  Stopping vLLM server (PID ${VLLM_PID}) ..."
-    kill ${VLLM_PID} 2>/dev/null || true
+    echo "  Stopping vLLM server (PID ${VLLM_PID}) and its children ..."
+    # Kill the entire process group spawned by vLLM (child workers hold GPU memory)
+    kill -- -${VLLM_PID} 2>/dev/null || kill ${VLLM_PID} 2>/dev/null || true
     wait ${VLLM_PID} 2>/dev/null || true
+    sleep 3
+
+    # Safety net: kill any orphaned GPU processes (e.g. vLLM EngineCore workers)
+    local ORPHANS
+    ORPHANS=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -d ' ')
+    if [[ -n "${ORPHANS}" ]]; then
+        echo "  Killing orphaned GPU processes: ${ORPHANS}"
+        echo "${ORPHANS}" | xargs -r kill -9 2>/dev/null || true
+        sleep 2
+    fi
+
+    echo "  GPU memory released."
+    nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv,noheader
 
     return ${TRAIN_EXIT}
 }
@@ -156,4 +178,5 @@ echo "  Checkpoints: ${OUTPUT_1}"
 echo "               ${OUTPUT_2}"
 echo "  Analysis:    ${OUTPUT_1}/rollout_analysis.json"
 echo "               ${OUTPUT_2}/rollout_analysis.json"
+echo "  Log:         ${LOG_FILE}"
 echo "============================================"

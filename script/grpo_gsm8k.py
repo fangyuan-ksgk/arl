@@ -106,6 +106,10 @@ def main():
                              "'server': vLLM runs as separate server on dedicated GPUs.")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.5,
                         help="(colocate only) Fraction of GPU VRAM for vLLM KV cache.")
+    parser.add_argument("--vllm_server_host", type=str, default="0.0.0.0",
+                        help="(server only) Host of the vLLM server.")
+    parser.add_argument("--vllm_server_port", type=int, default=8000,
+                        help="(server only) Port of the vLLM server.")
     parser.add_argument("--save_strategy", type=str, default="no")
     parser.add_argument("--report_to", type=str, default="none")
     args = parser.parse_args()
@@ -133,6 +137,9 @@ def main():
         config_kwargs["vllm_mode"] = args.vllm_mode
         if args.vllm_mode == "colocate":
             config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+        elif args.vllm_mode == "server":
+            config_kwargs["vllm_server_host"] = args.vllm_server_host
+            config_kwargs["vllm_server_port"] = args.vllm_server_port
 
     config = GRPOConfig(**config_kwargs)
 

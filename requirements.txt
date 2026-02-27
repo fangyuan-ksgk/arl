@@ -1,0 +1,26 @@
+accelerate>=1.4.0
+datasets>=3.0.0
+hf_transfer>=0.1.9
+torch>=2.2
+transformers>=5.0.0
+trl>=0.29.0
+vllm>=0.12.0
+huggingface_hub>=0.25.0
+
+# python script/patch_transformers.py
+
+# Patch requiresd for transformers 
+# ● The except on line 178-181 doesn't catch RemoteEntryNotFoundError (which is what the 404 raises). Let me fix it:
+
+# ● Update(/usr/local/lib/python3.12/dist-packages/transformers/utils/hub.py)
+#   ⎿  Added 2 lines
+#       179              raise  # valid errors => do not catch
+#       180          except (HTTPError, OfflineModeIsEnabled, requests.exceptions.ConnectionError):
+#       181              pass  # offline mode, internet down, etc. => try local files
+#       182 +        except EntryNotFoundError:                                                                                                                   
+#       183 +            return []  # repo has no additional_chat_templates directory                                                                             
+#       184  
+#       185      # check local files
+#       186      try:
+
+# ● Now let me verify that EntryNotFoundError is imported (or if I need to use the full name):
