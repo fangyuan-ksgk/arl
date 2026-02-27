@@ -5,7 +5,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODEL_NAME="Qwen/Qwen3-4B"
-PORT=8888
+PORT=8880
 
 # Kill any leftover processes from previous runs
 fuser -k ${PORT}/tcp 2>/dev/null || true
