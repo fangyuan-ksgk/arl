@@ -34,8 +34,10 @@ CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 \
     --output_dir "${PROJECT_DIR}/output/grpo_qwen3_4b" \
     --max_steps 200 \
     --use_vllm --vllm_mode server --vllm_server_port ${PORT} \
+    --num_generations 4 \
+    --max_completion_length 256 \
     --per_device_train_batch_size 1 \
-    --gradient_accumulation_steps 8 \
+    --gradient_accumulation_steps 16 \
     --learning_rate 3e-6 \
     --logging_steps 10 \
     --save_strategy no \
