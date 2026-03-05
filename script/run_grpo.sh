@@ -1,5 +1,5 @@
-#!/bin/bash
-# GRPO on GSM8K: Qwen3-4B then Qwen3-4B (4 GPUs, vLLM server mode)
+# GRPO on GSM8K: Qwen3-4B
+# vLLM server on GPUs 2,3 (TP=2) — training on GPUs 0,1 (accelerate)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -12,23 +12,23 @@ fuser -k ${PORT}/tcp 2>/dev/null || true
 sleep 1
 
 # =============================================
-# (1) Spin up vLLM server
+# (1) Spin up vLLM server (TP=2 on GPUs 2,3)
 # =============================================
-echo ">>> Starting vLLM server for ${MODEL_NAME} on GPUs 0,1 (TP=2) ..."
-CUDA_VISIBLE_DEVICES=0,1 trl vllm-serve \
+echo ">>> Starting vLLM server for ${MODEL_NAME} on GPUs 2,3 (TP=2) ..."
+CUDA_VISIBLE_DEVICES=2,3 trl vllm-serve \
     --model ${MODEL_NAME} \
     --tensor-parallel-size 2 \
     --port ${PORT} &
 VLLM_PID=$!
 echo ">>> Waiting for vLLM server (PID ${VLLM_PID}) ..."
-until curl -s http://localhost:${PORT}/health > /dev/null 2>&1; do sleep 1; done
+until curl -s http://localhost:${PORT}/health > /dev/null 2>&1; do sleep 2; done
 echo ">>> vLLM server ready."
 
 # =============================================
-# (2) Train model on GPUs 2,3
+# (2) Train on GPUs 0,1 via accelerate
 # =============================================
-echo ">>> Training ${MODEL_NAME} on GPUs 2,3 ..."
-CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 \
+echo ">>> Training ${MODEL_NAME} on GPUs 0,1 ..."
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
     "${SCRIPT_DIR}/grpo_gsm8k.py" \
     --model ${MODEL_NAME} \
     --output_dir "${PROJECT_DIR}/output/grpo_qwen3_4b" \
@@ -36,7 +36,7 @@ CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 \
     --use_vllm --vllm_mode server --vllm_server_port ${PORT} \
     --num_generations 4 \
     --max_completion_length 256 \
-    --per_device_train_batch_size 1 \
+    --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 16 \
     --learning_rate 3e-6 \
     --logging_steps 10 \
@@ -48,8 +48,8 @@ CUDA_VISIBLE_DEVICES=2,3 accelerate launch --num_processes 2 \
 # =============================================
 echo ">>> Killing vLLM server ..."
 kill ${VLLM_PID} 2>/dev/null || true; wait ${VLLM_PID} 2>/dev/null || true
+ps aux | grep -iE "vllm|EngineCore" | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null || true
 sleep 3
-
 
 # =============================================
 # (4) Rollout analysis

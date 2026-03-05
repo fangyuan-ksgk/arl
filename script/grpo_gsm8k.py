@@ -20,7 +20,9 @@ import argparse
 import os
 import re
 
+import torch
 from datasets import load_dataset
+from transformers import AutoModelForCausalLM
 from trl import GRPOTrainer, GRPOConfig
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -112,6 +114,9 @@ def main():
                         help="(server only) Port of the vLLM server.")
     parser.add_argument("--save_strategy", type=str, default="no")
     parser.add_argument("--report_to", type=str, default="none")
+    parser.add_argument("--train_device", type=int, default=0,
+                        help="CUDA device index for training (server mode only). "
+                             "Must not overlap with vLLM server GPUs.")
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
@@ -143,8 +148,18 @@ def main():
 
     config = GRPOConfig(**config_kwargs)
 
+    # Explicitly load model onto training device to avoid occupying vLLM server GPUs
+    if not args.no_vllm and args.vllm_mode == "server":
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model,
+            torch_dtype=torch.bfloat16,
+            device_map={"": f"cuda:{args.train_device}"},
+        )
+    else:
+        model = args.model  # let TRL handle device placement for colocate/no-vllm
+
     trainer = GRPOTrainer(
-        model=args.model,
+        model=model,
         reward_funcs=[correctness_reward, format_reward],
         args=config,
         train_dataset=train_dataset,
