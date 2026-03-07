@@ -20,6 +20,9 @@ import os
 import re
 import sys
 
+import torch
+from transformers import AutoModelForCausalLM
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from datasets import load_dataset
@@ -114,6 +117,14 @@ def main():
     parser.add_argument("--mbe_patch_size", type=int, default=8)
     parser.add_argument("--lambda_logit_entropy", type=float, default=0.0,
                         help="Weight for logit entropy maximization bonus. 0 = disabled.")
+    parser.add_argument("--mbe_max_value", type=float, default=None,
+                        help="Maximum MBE value to clamp to. None = no clamping.")
+    # vLLM server mode support
+    parser.add_argument("--vllm_mode", type=str, default="colocate",
+                        choices=["colocate", "server"])
+    parser.add_argument("--vllm_server_host", type=str, default="0.0.0.0")
+    parser.add_argument("--vllm_server_port", type=int, default=8000)
+    parser.add_argument("--gradient_checkpointing", action="store_true")
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
@@ -129,6 +140,7 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         bf16=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         save_strategy=args.save_strategy,
         report_to=args.report_to,
         # IBRL fields
@@ -137,18 +149,38 @@ def main():
         mbe_layer=args.mbe_layer,
         mbe_patch_size=args.mbe_patch_size,
         lambda_logit_entropy=args.lambda_logit_entropy,
+        mbe_max_value=args.mbe_max_value,
     )
     if args.max_steps > 0:
         config_kwargs["max_steps"] = args.max_steps
     if not args.no_vllm:
         config_kwargs["use_vllm"] = True
-        config_kwargs["vllm_mode"] = "colocate"
-        config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+        config_kwargs["vllm_mode"] = args.vllm_mode
+        if args.vllm_mode == "colocate":
+            config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
+        elif args.vllm_mode == "server":
+            config_kwargs["vllm_server_host"] = args.vllm_server_host
+            config_kwargs["vllm_server_port"] = args.vllm_server_port
 
     config = IBRLConfig(**config_kwargs)
 
+    # Explicit model loading for server mode (avoid GPU overlap with vLLM)
+    if not args.no_vllm and args.vllm_mode == "server":
+        num_processes = int(os.environ.get("WORLD_SIZE", "1"))
+        if num_processes > 1:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, torch_dtype=torch.bfloat16,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, torch_dtype=torch.bfloat16,
+                device_map={"": "cuda:0"},
+            )
+    else:
+        model = args.model
+
     trainer = IBRLTrainer(
-        model=args.model,
+        model=model,
         reward_funcs=[correctness_reward, format_reward],
         args=config,
         train_dataset=train_dataset,
