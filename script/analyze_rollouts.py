@@ -344,6 +344,14 @@ def main():
     torch.manual_seed(args.seed)
     model_path = args.checkpoint if args.checkpoint else args.model
 
+    # Auto-detect max_new_tokens from training args if not explicitly set
+    training_args_path = os.path.join(model_path, "training_args.bin")
+    if os.path.exists(training_args_path) and args.max_new_tokens == 512:
+        training_args = torch.load(training_args_path, weights_only=False)
+        if hasattr(training_args, "max_completion_length"):
+            args.max_new_tokens = training_args.max_completion_length
+            print(f"Auto-detected max_new_tokens={args.max_new_tokens} from training args")
+
     # Generate sample indices
     dataset = load_dataset("openai/gsm8k", "main")["test"]
     indices = torch.randperm(len(dataset))[:args.n_samples].tolist()

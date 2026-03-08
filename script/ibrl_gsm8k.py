@@ -125,6 +125,14 @@ def main():
     parser.add_argument("--vllm_server_host", type=str, default="0.0.0.0")
     parser.add_argument("--vllm_server_port", type=int, default=8000)
     parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--torch_empty_cache_steps", type=int, default=0,
+                        help="Call torch.cuda.empty_cache() every N steps. 0 disables it.")
+    # LoRA
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Use LoRA (PEFT) instead of full fine-tuning. Saves VRAM.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
@@ -151,6 +159,10 @@ def main():
         lambda_logit_entropy=args.lambda_logit_entropy,
         mbe_max_value=args.mbe_max_value,
     )
+    if args.gradient_checkpointing:
+        config_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
+    if args.torch_empty_cache_steps and args.torch_empty_cache_steps > 0:
+        config_kwargs["torch_empty_cache_steps"] = args.torch_empty_cache_steps
     if args.max_steps > 0:
         config_kwargs["max_steps"] = args.max_steps
     if not args.no_vllm:
@@ -163,6 +175,20 @@ def main():
             config_kwargs["vllm_server_port"] = args.vllm_server_port
 
     config = IBRLConfig(**config_kwargs)
+
+    # LoRA config
+    peft_config = None
+    if args.use_lora:
+        from peft import LoraConfig
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            task_type="CAUSAL_LM",
+        )
+        print(f"LoRA enabled: r={args.lora_r}, alpha={args.lora_alpha}")
 
     # Explicit model loading for server mode (avoid GPU overlap with vLLM)
     if not args.no_vllm and args.vllm_mode == "server":
@@ -184,6 +210,7 @@ def main():
         reward_funcs=[correctness_reward, format_reward],
         args=config,
         train_dataset=train_dataset,
+        peft_config=peft_config,
     )
 
     trainer.train()

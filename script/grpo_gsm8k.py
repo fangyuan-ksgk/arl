@@ -112,11 +112,18 @@ def main():
                         help="(server only) Host of the vLLM server.")
     parser.add_argument("--vllm_server_port", type=int, default=8000,
                         help="(server only) Port of the vLLM server.")
+    parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--save_strategy", type=str, default="no")
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--train_device", type=int, default=0,
                         help="CUDA device index for training (server mode only). "
                              "Must not overlap with vLLM server GPUs.")
+    # LoRA
+    parser.add_argument("--use_lora", action="store_true",
+                        help="Use LoRA (PEFT) instead of full fine-tuning.")
+    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05)
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
@@ -132,6 +139,7 @@ def main():
         learning_rate=args.learning_rate,
         logging_steps=args.logging_steps,
         bf16=True,
+        gradient_checkpointing=args.gradient_checkpointing,
         save_strategy=args.save_strategy,
         report_to=args.report_to,
     )
@@ -148,13 +156,37 @@ def main():
 
     config = GRPOConfig(**config_kwargs)
 
-    # Explicitly load model onto training device to avoid occupying vLLM server GPUs
-    if not args.no_vllm and args.vllm_mode == "server":
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model,
-            torch_dtype=torch.bfloat16,
-            device_map={"": f"cuda:{args.train_device}"},
+    # LoRA config
+    peft_config = None
+    if args.use_lora:
+        from peft import LoraConfig
+        peft_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                            "gate_proj", "up_proj", "down_proj"],
+            task_type="CAUSAL_LM",
         )
+        print(f"LoRA enabled: r={args.lora_r}, alpha={args.lora_alpha}")
+
+    # Explicitly load model to avoid occupying vLLM server GPUs.
+    # - Single GPU: pin to --train_device
+    # - Multi-GPU (accelerate): load to CPU, let accelerate handle placement
+    if not args.no_vllm and args.vllm_mode == "server":
+        num_processes = int(os.environ.get("WORLD_SIZE", "1"))
+        if num_processes > 1:
+            # accelerate multi-GPU: load to CPU, accelerate places per rank
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                torch_dtype=torch.bfloat16,
+            )
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model,
+                torch_dtype=torch.bfloat16,
+                device_map={"": f"cuda:{args.train_device}"},
+            )
     else:
         model = args.model  # let TRL handle device placement for colocate/no-vllm
 
@@ -163,6 +195,7 @@ def main():
         reward_funcs=[correctness_reward, format_reward],
         args=config,
         train_dataset=train_dataset,
+        peft_config=peft_config,
     )
 
     trainer.train()
