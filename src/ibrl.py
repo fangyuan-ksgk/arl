@@ -30,9 +30,9 @@ class IBRLConfig(GRPOConfig):
         default=0.01,
         metadata={"help": "Weight on MBE loss term. Negative MBE is added to maximize representation entropy."},
     )
-    mbe_layer: int = field(
-        default=-1,
-        metadata={"help": "Which hidden layer to extract for MBE computation (-1 = last)."},
+    mbe_layer: int | list[int] | None = field(
+        default=None,
+        metadata={"help": "Which hidden layer(s) to extract for MBE computation. If unset, uses all hidden layers."},
     )
     mbe_patch_size: int = field(
         default=8,
@@ -70,7 +70,7 @@ class IBRLTrainer(GRPOTrainer):
         super().__init__(*args, **kwargs)
         # Store MBE config for easy access
         self.lambda_mbe = self.args.lambda_mbe if hasattr(self.args, "lambda_mbe") else 0.01
-        self.mbe_layer = self.args.mbe_layer if hasattr(self.args, "mbe_layer") else -1
+        self.mbe_layer = self.args.mbe_layer if hasattr(self.args, "mbe_layer") else None
         self.mbe_patch_size = self.args.mbe_patch_size if hasattr(self.args, "mbe_patch_size") else 8
 
     # -----------------------------------------------------------------
@@ -122,22 +122,31 @@ class IBRLTrainer(GRPOTrainer):
                     entropies = entropy_from_logits(logits)
                 all_entropies.append(entropies)
 
-            # Extract hidden states from the specified layer
+            # Extract hidden states from the specified layer or all layers
             if outputs.hidden_states is not None:
-                hidden = outputs.hidden_states[self.mbe_layer]  # (B_chunk, T, D)
-                # Keep only completion portion
-                hidden = hidden[:, -logits_to_keep:, :]
+                if self.mbe_layer is None:
+                    hidden = [layer_hidden[:, -logits_to_keep:, :] for layer_hidden in outputs.hidden_states[1:]]
+                elif isinstance(self.mbe_layer, list):
+                    hidden = [outputs.hidden_states[layer_idx][:, -logits_to_keep:, :] for layer_idx in self.mbe_layer]
+                else:
+                    hidden = outputs.hidden_states[self.mbe_layer][:, -logits_to_keep:, :]
                 all_hidden.append(hidden)
 
         logps = torch.cat(all_logps, dim=0)
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
-        hidden = torch.cat(all_hidden, dim=0) if all_hidden else None
+        if all_hidden:
+            if self.mbe_layer is None or isinstance(self.mbe_layer, list):
+                hidden = [torch.cat(layer_hidden, dim=0) for layer_hidden in zip(*all_hidden)]
+            else:
+                hidden = torch.cat(all_hidden, dim=0)
+        else:
+            hidden = None
         return logps, entropies, hidden
 
     # -----------------------------------------------------------------
     # MBE loss computation
     # -----------------------------------------------------------------
-    def _compute_mbe_loss(self, hidden: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _compute_mbe_loss(self, hidden: torch.Tensor | list[torch.Tensor], mask: torch.Tensor) -> torch.Tensor:
         """
         Compute MBE on hidden representations. We want to MAXIMIZE MBE
         (encourage diverse representations), so the loss term is -MBE.
@@ -151,6 +160,10 @@ class IBRLTrainer(GRPOTrainer):
         """
         if hidden is None:
             return torch.tensor(0.0, device=hidden.device if hidden is not None else "cpu")
+
+        if isinstance(hidden, list):
+            layer_losses = [self._compute_mbe_loss(layer_hidden, mask) for layer_hidden in hidden]
+            return torch.stack(layer_losses).mean() if layer_losses else torch.tensor(0.0, device=mask.device)
 
         B, T, D = hidden.shape
         patch_size = self.mbe_patch_size
