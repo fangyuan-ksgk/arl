@@ -113,7 +113,8 @@ def main():
     # IBRL-specific
     parser.add_argument("--lambda_mbe", type=float, default=0.01)
     parser.add_argument("--mbe_sign", type=str, default="maximize", choices=["maximize", "minimize"])
-    parser.add_argument("--mbe_layer", type=int, default=-1)
+    parser.add_argument("--mbe_layer", type=int, nargs="+", default=None,
+                        help="Hidden layer index or indices for MBE. Omit to use all hidden layers.")
     parser.add_argument("--mbe_patch_size", type=int, default=8)
     parser.add_argument("--lambda_logit_entropy", type=float, default=0.0,
                         help="Weight for logit entropy maximization bonus. 0 = disabled.")
@@ -134,6 +135,9 @@ def main():
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     args = parser.parse_args()
+
+    if args.mbe_layer is not None and len(args.mbe_layer) == 1:
+        args.mbe_layer = args.mbe_layer[0]
 
     train_dataset, test_dataset = load_gsm8k()
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")

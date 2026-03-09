@@ -90,6 +90,14 @@ def compute_mbe_trace(hidden_states, prompt_len, patch_size=8, layer=-1):
     return mbe_vals
 
 
+def compute_per_layer_mbe(hidden_states, prompt_len, patch_size=8):
+    per_layer = []
+    for layer_idx in range(1, len(hidden_states)):
+        mbe_vals = compute_mbe_trace(hidden_states, prompt_len, patch_size=patch_size, layer=layer_idx)
+        per_layer.append(mbe_vals.mean().item())
+    return per_layer
+
+
 # ---------------------------------------------------------------------------
 # Metric 3: P(correct answer | prefix_t) across generation
 # ---------------------------------------------------------------------------
@@ -179,6 +187,7 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
     logprob_trace = bin_trace(logprob_trace_raw, n_bins)
     mbe_trace_raw = compute_mbe_trace(hidden_states, prompt_len, patch_size=8)
     mbe_trace = bin_trace(mbe_trace_raw, n_bins)
+    per_layer_mbe = compute_per_layer_mbe(hidden_states, prompt_len, patch_size=8)
     answer_prob_trace = compute_answer_prob_trace(logits, full_ids, prompt_len, gold_token_ids, n_bins)
     end_cos_sim = compute_end_similarity(model, hidden_states, prompt_len, gold_token_ids)
 
@@ -192,6 +201,7 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
         "logprob_trace": logprob_trace,
         "mean_mbe": mbe_trace_raw.mean().item(),
         "mbe_trace": mbe_trace,
+        "per_layer_mbe": per_layer_mbe,
         "answer_prob_trace": answer_prob_trace,
         "end_cos_sim": end_cos_sim,
     }
@@ -326,6 +336,61 @@ def print_report(results, model_path):
         vals = [r["end_cos_sim"] for r in incorrect]
         print(f"  Incorrect: mean={sum(vals)/len(vals):.4f}  min={min(vals):.4f}  max={max(vals):.4f}")
 
+    if results and "per_layer_mbe" in results[0] and results[0]["per_layer_mbe"]:
+        n_layers = len(results[0]["per_layer_mbe"])
+        labels = torch.tensor([1.0 if r["correct"] else 0.0 for r in results], dtype=torch.float32)
+        label_std = labels.std(unbiased=False)
+        print(f"\n--- 5. Per-layer MBE vs answer correctness ---")
+        print(f"{'Layer':>8} {'Correct':>10} {'Incorrect':>10} {'Delta':>10} {'Corr':>10}")
+        print("-" * 54)
+        for layer_idx in range(n_layers):
+            layer_vals = torch.tensor([r["per_layer_mbe"][layer_idx] for r in results], dtype=torch.float32)
+            correct_vals = [r["per_layer_mbe"][layer_idx] for r in correct]
+            incorrect_vals = [r["per_layer_mbe"][layer_idx] for r in incorrect]
+            vc = sum(correct_vals) / len(correct_vals) if correct_vals else 0.0
+            vi = sum(incorrect_vals) / len(incorrect_vals) if incorrect_vals else 0.0
+            val_std = layer_vals.std(unbiased=False)
+            if len(results) > 1 and val_std.item() > 0 and label_std.item() > 0:
+                corr = ((layer_vals - layer_vals.mean()) * (labels - labels.mean())).mean() / (val_std * label_std)
+                corr_value = corr.item()
+            else:
+                corr_value = 0.0
+            print(f"{layer_idx + 1:>8} {vc:>10.4f} {vi:>10.4f} {vc - vi:>+10.4f} {corr_value:>10.4f}")
+
+
+def summarize_per_layer_mbe(results):
+    if not results or "per_layer_mbe" not in results[0] or not results[0]["per_layer_mbe"]:
+        return []
+
+    correct = [r for r in results if r["correct"]]
+    incorrect = [r for r in results if not r["correct"]]
+    n_layers = len(results[0]["per_layer_mbe"])
+    labels = torch.tensor([1.0 if r["correct"] else 0.0 for r in results], dtype=torch.float32)
+    label_std = labels.std(unbiased=False)
+    summary = []
+
+    for layer_idx in range(n_layers):
+        layer_vals = torch.tensor([r["per_layer_mbe"][layer_idx] for r in results], dtype=torch.float32)
+        correct_vals = [r["per_layer_mbe"][layer_idx] for r in correct]
+        incorrect_vals = [r["per_layer_mbe"][layer_idx] for r in incorrect]
+        vc = sum(correct_vals) / len(correct_vals) if correct_vals else 0.0
+        vi = sum(incorrect_vals) / len(incorrect_vals) if incorrect_vals else 0.0
+        val_std = layer_vals.std(unbiased=False)
+        if len(results) > 1 and val_std.item() > 0 and label_std.item() > 0:
+            corr = ((layer_vals - layer_vals.mean()) * (labels - labels.mean())).mean() / (val_std * label_std)
+            corr_value = corr.item()
+        else:
+            corr_value = 0.0
+        summary.append({
+            "layer": layer_idx + 1,
+            "correct_mean": vc,
+            "incorrect_mean": vi,
+            "delta": vc - vi,
+            "corr_with_correctness": corr_value,
+        })
+
+    return summary
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -420,11 +485,13 @@ def main():
 
     # Save
     out_path = os.path.join(model_path, "rollout_analysis.json") if os.path.isdir(model_path) else "rollout_analysis.json"
+    per_layer_mbe_summary = summarize_per_layer_mbe(results)
     with open(out_path, "w") as f:
         json.dump({
             "model": model_path,
             "n_samples": len(results),
             "accuracy": len([r for r in results if r["correct"]]) / len(results) if results else 0,
+            "per_layer_mbe_summary": per_layer_mbe_summary,
             "results": results,
         }, f, indent=2)
     print(f"\nSaved to {out_path}")
