@@ -1,6 +1,47 @@
 GRPO + GSM8K Rollout analysis: What properties do successful rollouts have? 
 
 
+  Key Findings
+
+  1. MBE-Correctness correlation is strongly positive
+
+  ┌───────┬──────────────┬──────────┬────────────┬─────────────┐
+  │ Model │    Config    │ Accuracy │ Best Layer │ Correlation │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 0.6B  │ tok512       │ 37%      │ Layer 18   │ r=+0.48     │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 1.7B  │ tok512       │ 8%       │ Layer 19   │ r=+0.20     │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 1.7B  │ tok1024      │ 42%      │ Layer 21   │ r=+0.67     │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 1.7B  │ tok2048      │ 69%      │ Layer 23   │ r=+0.75     │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 4B    │ tok1024/gen4 │ 46%      │ Layer 31   │ r=+0.61     │
+  ├───────┼──────────────┼──────────┼────────────┼─────────────┤
+  │ 4B    │ tok2048      │ 71%      │ Layer 36   │ r=+0.64     │
+  └───────┴──────────────┴──────────┴────────────┴─────────────┘
+
+  2. Clear patterns
+
+  - Correlation strengthens with longer token budgets: 1.7B goes from r=+0.20 (tok512) → +0.67 (tok1024) → +0.75 (tok2048). The model needs enough tokens to actually
+  reason for MBE to be meaningful.
+
+  3. Best layers are in the upper half, not the last layer
+
+  - 0.6B (28 layers): best at layer 18 (~64%)
+  - 1.7B (28 layers): best at layers 21-23 (~75-82%)
+  - 4B (36 layers): best at layers 29-36 (~80-100%)
+
+  The best correlation layers are consistently in the upper 60-80% of the network — the late-middle to final layers. The current IBRL implementation using mbe_layer=-1
+   (last transformer layer) is close but not optimal. The actual last output (layer 28 for 0.6B/1.7B, layer 36 for 4B) sometimes has the highest correlation, but the
+  sweet spot tends to be a few layers before that.
+
+  4. Implication for IBRL
+
+  The previous IBRL runs used mbe_layer=-1 (last hidden layer). This is reasonable but suboptimal — layers around 75% depth show stronger signal. Also, the negative
+  correlation at low-accuracy regimes suggests that maximizing MBE could be counterproductive early in training when the model hasn't learned to solve problems yet.
+
+
 ======================================================================
 Model: /workspace/arl/script/../output/sweep_all/0.6b//tok512_gen8/
 Samples: 100  |  Correct: 37  |  Incorrect: 63
