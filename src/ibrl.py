@@ -70,6 +70,7 @@ class IBRLTrainer(GRPOTrainer):
         super().__init__(*args, **kwargs)
         # Store MBE config for easy access
         self.lambda_mbe = self.args.lambda_mbe if hasattr(self.args, "lambda_mbe") else 0.01
+        self.mbe_sign = self.args.mbe_sign if hasattr(self.args, "mbe_sign") else "maximize"
         self.mbe_layer = self.args.mbe_layer if hasattr(self.args, "mbe_layer") else None
         self.mbe_patch_size = self.args.mbe_patch_size if hasattr(self.args, "mbe_patch_size") else 8
 
@@ -186,9 +187,11 @@ class IBRLTrainer(GRPOTrainer):
         mbe_values = mbe_reverse_gram(h_patches)
 
         mbe_mean = mbe_values.mean()
-
-        # Maximize MBE => loss = -MBE
-        return -mbe_mean
+        
+        if self.mbe_sign == "minimize": # Minimize MBE => loss = MBE
+            return mbe_mean
+        else: # Maximize MBE => loss = -MBE
+            return -mbe_mean
 
     # -----------------------------------------------------------------
     # Override _compute_loss to add MBE term
