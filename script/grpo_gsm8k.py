@@ -204,7 +204,7 @@ def main():
     mbe_reward_obj = None
 
     if args.mbe_reward or args.gated_mbe_reward:
-        from script.mbe_reward import MBEReward, CorrectnessGatedMBEReward
+        from src.mbe_reward import MBEReward, CorrectnessGatedMBEReward
         tokenizer = AutoTokenizer.from_pretrained(args.model)
         if args.gated_mbe_reward:
             mbe_reward_obj = CorrectnessGatedMBEReward(
