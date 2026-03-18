@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 BASE_PORT=8900
 PORT=${BASE_PORT}
 EXPERIMENT_INDEX=0
