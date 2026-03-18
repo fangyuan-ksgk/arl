@@ -6,6 +6,8 @@ transformers==4.56.2
 trl[vllm]>=0.29.0
 vllm>=0.12.0
 huggingface_hub>=0.25.0
+matplotlib
+seaborn
 
 # python script/patch_transformers.py
 
