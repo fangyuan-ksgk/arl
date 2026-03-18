@@ -11,14 +11,9 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Exact MBE calculation
 def mbe_alpha2_exact(Z, detach=False, epsilon=1e-5):   
     Z = Z.float()  # Force FP32
-      
-    gram = torch.bmm(Z, Z.transpose(1,2))
-    if detach: 
-        gram_trace = torch.diagonal(gram.detach(), dim1=1, dim2=2).sum(dim=1)
-    else:
-        gram_trace = torch.diagonal(gram, dim1=1, dim2=2).sum(dim=1)
-    gram_sq = gram.pow(2).sum(dim=(1,2))
-
+    G = torch.bmm(Z, Z.transpose(1,2))
+    gram_trace = torch.diagonal(G, dim1=1, dim2=2).sum(dim=1)
+    gram_sq = G.pow(2).sum(dim=(1,2))
     log_trace = torch.log(gram_trace.abs() + epsilon)
     log_sq = torch.log(gram_sq + epsilon)
     mbe = 2 * log_trace - log_sq 

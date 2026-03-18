@@ -22,7 +22,7 @@ import re
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import GRPOTrainer, GRPOConfig
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -118,6 +118,15 @@ def main():
     parser.add_argument("--train_device", type=int, default=0,
                         help="CUDA device index for training (server mode only). "
                              "Must not overlap with vLLM server GPUs.")
+    # MBE reward
+    parser.add_argument("--mbe_reward", action="store_true",
+                        help="Add scaled MBE reward: min(mbe, clip) / scale")
+    parser.add_argument("--gated_mbe_reward", action="store_true",
+                        help="Add correctness-gated MBE reward (MBE only for correct rollouts)")
+    parser.add_argument("--mbe_scale", type=float, default=40.0,
+                        help="MBE reward denominator (default 40.0 → max ~0.05)")
+    parser.add_argument("--mbe_clip", type=float, default=2.0,
+                        help="MBE value clipped before scaling")
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
                         help="Use LoRA (PEFT) instead of full fine-tuning.")
@@ -190,13 +199,36 @@ def main():
     else:
         model = args.model  # let TRL handle device placement for colocate/no-vllm
 
+    # Build reward function list
+    reward_funcs = [correctness_reward, format_reward]
+    mbe_reward_obj = None
+
+    if args.mbe_reward or args.gated_mbe_reward:
+        from script.mbe_reward import MBEReward, CorrectnessGatedMBEReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        if args.gated_mbe_reward:
+            mbe_reward_obj = CorrectnessGatedMBEReward(
+                tokenizer, scale=args.mbe_scale, clip=args.mbe_clip,
+            )
+        else:
+            mbe_reward_obj = MBEReward(
+                tokenizer, scale=args.mbe_scale, clip=args.mbe_clip,
+            )
+        reward_funcs.append(mbe_reward_obj)
+        print(f"MBE reward enabled: {'gated' if args.gated_mbe_reward else 'plain'}, "
+              f"scale={args.mbe_scale}, clip={args.mbe_clip}")
+
     trainer = GRPOTrainer(
         model=model,
-        reward_funcs=[correctness_reward, format_reward],
+        reward_funcs=reward_funcs,
         args=config,
         train_dataset=train_dataset,
         peft_config=peft_config,
     )
+
+    # Bind model ref for MBE forward passes
+    if mbe_reward_obj is not None:
+        mbe_reward_obj.set_model(trainer.model)
 
     trainer.train()
     trainer.save_model(args.output_dir)
