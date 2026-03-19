@@ -109,7 +109,7 @@ run_experiment() {
         --logging_steps 10 \
         --save_strategy no \
         --report_to none \
-        --eval_steps ${MAX_STEPS} --eval_samples 0 \
+        --eval_steps ${MAX_STEPS} \
         ${mbe_args} \
         2>&1 | tee "${train_log}"
     local end_time=$(date +%s)

@@ -121,8 +121,8 @@ def main():
     # Eval
     parser.add_argument("--eval_steps", type=int, default=50,
                         help="Run eval every N steps (0 to disable)")
-    parser.add_argument("--eval_samples", type=int, default=0,
-                        help="Number of test samples to eval on (0 = full test set)")
+    parser.add_argument("--eval_samples", type=int, default=None,
+                        help="Subsample N test examples for eval (default: full test set)")
     # MBE reward
     parser.add_argument("--mbe_reward", action="store_true",
                         help="Add scaled MBE reward: min(mbe, clip) / scale")
@@ -230,7 +230,7 @@ def main():
     eval_dataset = None
     if args.eval_steps > 0:
         eval_dataset = test_dataset
-        if args.eval_samples > 0:
+        if args.eval_samples is not None:
             eval_dataset = test_dataset.select(range(min(args.eval_samples, len(test_dataset))))
         print(f"Eval enabled: {len(eval_dataset)} samples every {args.eval_steps} steps")
 
