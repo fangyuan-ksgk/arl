@@ -21,7 +21,7 @@ MODEL="Qwen/Qwen3-0.6B"
 MODEL_TAG="0.6b"
 
 # Training config (matches sweep_all tok512_gen8 for 0.6B)
-MAX_TOKENS=512
+MAX_TOKENS=1024
 LR=5e-6
 NUM_GEN=8
 GRAD_ACCUM=8
