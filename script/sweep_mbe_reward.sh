@@ -109,6 +109,7 @@ run_experiment() {
         --logging_steps 10 \
         --save_strategy no \
         --report_to none \
+        --eval_steps ${MAX_STEPS} --eval_samples 0 \
         ${mbe_args} \
         2>&1 | tee "${train_log}"
     local end_time=$(date +%s)
@@ -151,20 +152,20 @@ run_experiment "baseline"          ""                   0   0
 
 # Plain MBE reward — sweep scale (clip fixed at 2.0)
 ensure_vllm "${VLLM_LOG}"
-run_experiment "mbe_s20_c2"        "--mbe_reward"       20  2.0
+run_experiment "mbe_s1_c2"        "--mbe_reward"       1  2.0
 
 ensure_vllm "${VLLM_LOG}"
-run_experiment "mbe_s40_c2"        "--mbe_reward"       40  2.0
+run_experiment "mbe_s2_c2"        "--mbe_reward"       2  2.0
 
 ensure_vllm "${VLLM_LOG}"
-run_experiment "mbe_s100_c2"       "--mbe_reward"       100 2.0
+run_experiment "mbe_s5_c2"       "--mbe_reward"       5 2.0
 
 # Plain MBE reward — sweep clip (scale fixed at 40)
 ensure_vllm "${VLLM_LOG}"
-run_experiment "mbe_s40_c1"        "--mbe_reward"       40  1.0
+run_experiment "mbe_s10_c2"        "--mbe_reward"       10  2.0
 
 ensure_vllm "${VLLM_LOG}"
-run_experiment "mbe_s40_c3"        "--mbe_reward"       40  3.0
+run_experiment "mbe_s10_c3"        "--mbe_reward"       10  3.0
 
 # Correctness-gated MBE reward — sweep scale
 ensure_vllm "${VLLM_LOG}"
@@ -172,9 +173,6 @@ run_experiment "gated_s20_c2"      "--gated_mbe_reward" 20  2.0
 
 ensure_vllm "${VLLM_LOG}"
 run_experiment "gated_s40_c2"      "--gated_mbe_reward" 40  2.0
-
-ensure_vllm "${VLLM_LOG}"
-run_experiment "gated_s100_c2"     "--gated_mbe_reward" 100 2.0
 
 # =============================================
 # Final summary
