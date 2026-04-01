@@ -32,7 +32,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from src.mbe import mbe_reverse_gram
+from src.mbe import mbe_reverse_gram, OnlineMBE
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +96,68 @@ def compute_per_layer_mbe(hidden_states, prompt_len, patch_size=8):
         mbe_vals = compute_mbe_trace(hidden_states, prompt_len, patch_size=patch_size, layer=layer_idx)
         per_layer.append(mbe_vals.mean().item())
     return per_layer
+
+
+# ---------------------------------------------------------------------------
+# MBE dynamics: cumulative, online trajectory, sliding window, velocity
+# ---------------------------------------------------------------------------
+def compute_online_mbe_trajectory(hidden_states, prompt_len, layer=-1):
+    """Token-by-token MBE using OnlineMBE (incremental Gram update).
+    Returns list of MBE values, one per completion token."""
+    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
+    T, D = h.shape
+    if T < 2:
+        return [0.0]
+    tracker = OnlineMBE(D)
+    trajectory = []
+    for t in range(T):
+        tracker.update(h[t])
+        trajectory.append(tracker.mbe().item())
+    return trajectory
+
+
+def compute_mbe_velocity(trajectory, smooth_kernel=5):
+    """Compute smoothed dMBE/dt from an MBE trajectory.
+    Returns list of velocity values (length = len(trajectory) - smooth_kernel)."""
+    if len(trajectory) < 2:
+        return [0.0]
+    import numpy as np
+    mbes = np.array(trajectory)
+    dmbe = np.diff(mbes)
+    if len(dmbe) > smooth_kernel:
+        smoothed = np.convolve(dmbe, np.ones(smooth_kernel) / smooth_kernel, mode="valid")
+        return smoothed.tolist()
+    return dmbe.tolist()
+
+
+def compute_sliding_window_mbe(hidden_states, prompt_len, window_size=32, layer=-1):
+    """MBE on sliding window of W tokens across the completion.
+    Returns list of MBE values, one per window position."""
+    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
+    T = h.shape[0]
+    if T < window_size:
+        return []
+    results = []
+    for start in range(0, T - window_size + 1):
+        h_win = h[start:start + window_size].unsqueeze(0)  # (1, W, D)
+        mbe_val = mbe_reverse_gram(h_win).item()
+        results.append(mbe_val)
+    return results
+
+
+def compute_cumulative_mbe_checkpoints(hidden_states, prompt_len, layer=-1,
+                                        fractions=(0.25, 0.5, 0.75, 1.0)):
+    """MBE at key completion-length checkpoints (25%, 50%, 75%, 100%).
+    Returns dict mapping fraction -> MBE value."""
+    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
+    T = h.shape[0]
+    checkpoints = {}
+    for frac in fractions:
+        t = max(2, int(T * frac))
+        t = min(t, T)
+        mbe_val = mbe_reverse_gram(h[:t].unsqueeze(0)).item()
+        checkpoints[f"mbe@{int(frac*100)}%"] = mbe_val
+    return checkpoints
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +253,16 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
     answer_prob_trace = compute_answer_prob_trace(logits, full_ids, prompt_len, gold_token_ids, n_bins)
     end_cos_sim = compute_end_similarity(model, hidden_states, prompt_len, gold_token_ids)
 
+    # MBE dynamics
+    mbe_trajectory = compute_online_mbe_trajectory(hidden_states, prompt_len, layer=-1)
+    mbe_velocity = compute_mbe_velocity(mbe_trajectory, smooth_kernel=5)
+    mbe_checkpoints = compute_cumulative_mbe_checkpoints(hidden_states, prompt_len, layer=-1)
+    sw_mbe_32 = compute_sliding_window_mbe(hidden_states, prompt_len, window_size=32, layer=-1)
+
+    # Velocity summary stats
+    mean_velocity = sum(mbe_velocity) / len(mbe_velocity) if mbe_velocity else 0.0
+    final_velocity = (mbe_trajectory[-1] - mbe_trajectory[-min(10, len(mbe_trajectory))]) / min(10, len(mbe_trajectory)) if len(mbe_trajectory) >= 2 else 0.0
+
     return {
         "correct": correct,
         "predicted": predicted,
@@ -204,6 +276,15 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
         "per_layer_mbe": per_layer_mbe,
         "answer_prob_trace": answer_prob_trace,
         "end_cos_sim": end_cos_sim,
+        # MBE dynamics
+        "mbe_trajectory": bin_trace(mbe_trajectory, n_bins),
+        "mbe_trajectory_raw": mbe_trajectory,
+        "mbe_velocity": bin_trace(mbe_velocity, n_bins) if mbe_velocity else [0.0] * n_bins,
+        "mbe_velocity_raw": mbe_velocity,
+        "mean_mbe_velocity": mean_velocity,
+        "final_mbe_velocity": final_velocity,
+        "mbe_checkpoints": mbe_checkpoints,
+        "sw_mbe_32": bin_trace(sw_mbe_32, n_bins) if sw_mbe_32 else [0.0] * n_bins,
     }
 
 
@@ -314,7 +395,8 @@ def print_report(results, model_path):
     print(f"\n--- Scalar metrics ---")
     print(f"{'':>20} {'Correct':>10} {'Incorrect':>10} {'Delta':>10}")
     print("-" * 55)
-    for key in ["mean_logprob", "mean_mbe", "end_cos_sim", "completion_len"]:
+    for key in ["mean_logprob", "mean_mbe", "end_cos_sim", "completion_len",
+                "mean_mbe_velocity", "final_mbe_velocity"]:
         vc = sum(r[key] for r in correct) / len(correct) if correct else 0
         vi = sum(r[key] for r in incorrect) / len(incorrect) if incorrect else 0
         print(f"{key:>20} {vc:>10.4f} {vi:>10.4f} {vc - vi:>+10.4f}")
@@ -324,6 +406,40 @@ def print_report(results, model_path):
 
     print_trace("2. MBE (representation diversity)", [r["mbe_trace"] for r in correct],
                 [r["mbe_trace"] for r in incorrect], n_bins, higher_is_better=True)
+
+    print_trace("2b. Online MBE trajectory", [r["mbe_trajectory"] for r in correct],
+                [r["mbe_trajectory"] for r in incorrect], n_bins, higher_is_better=True)
+
+    print_trace("2c. MBE velocity (dMBE/dt)", [r["mbe_velocity"] for r in correct],
+                [r["mbe_velocity"] for r in incorrect], n_bins, higher_is_better=True)
+
+    print_trace("2d. Sliding window MBE (W=32)", [r["sw_mbe_32"] for r in correct],
+                [r["sw_mbe_32"] for r in incorrect], n_bins, higher_is_better=True)
+
+    # MBE checkpoints
+    if results and "mbe_checkpoints" in results[0]:
+        ckpt_keys = sorted(results[0]["mbe_checkpoints"].keys())
+        print(f"\n--- 2e. MBE at completion checkpoints ---")
+        print(f"{'':>12}", end="")
+        for k in ckpt_keys:
+            print(f" {k:>10}", end="")
+        print()
+        print("-" * (12 + 11 * len(ckpt_keys)))
+        for label, group in [("Correct", correct), ("Incorrect", incorrect)]:
+            if not group:
+                continue
+            print(f"{label:>12}", end="")
+            for k in ckpt_keys:
+                avg = sum(r["mbe_checkpoints"][k] for r in group) / len(group)
+                print(f" {avg:>10.4f}", end="")
+            print(f"  (n={len(group)})")
+        if correct and incorrect:
+            print(f"{'Delta':>12}", end="")
+            for k in ckpt_keys:
+                vc = sum(r["mbe_checkpoints"][k] for r in correct) / len(correct)
+                vi = sum(r["mbe_checkpoints"][k] for r in incorrect) / len(incorrect)
+                print(f" {vc - vi:>+10.4f}", end="")
+            print()
 
     print_trace("3. P(correct answer | prefix)", [r["answer_prob_trace"] for r in correct],
                 [r["answer_prob_trace"] for r in incorrect], n_bins, higher_is_better=True)
@@ -483,16 +599,39 @@ def main():
     # Report
     print_report(results, model_path)
 
-    # Save
+    # Save — strip raw trajectories to keep file size manageable
     out_path = os.path.join(model_path, "rollout_analysis.json") if os.path.isdir(model_path) else "rollout_analysis.json"
     per_layer_mbe_summary = summarize_per_layer_mbe(results)
+    results_compact = []
+    for r in results:
+        rc = {k: v for k, v in r.items() if k not in ("mbe_trajectory_raw", "mbe_velocity_raw")}
+        results_compact.append(rc)
+
+    # Aggregate MBE dynamics summary
+    correct = [r for r in results if r["correct"]]
+    incorrect = [r for r in results if not r["correct"]]
+    mbe_dynamics_summary = {}
+    for label, group in [("correct", correct), ("incorrect", incorrect), ("all", results)]:
+        if not group:
+            continue
+        mbe_dynamics_summary[label] = {
+            "mean_mbe_velocity": sum(r["mean_mbe_velocity"] for r in group) / len(group),
+            "final_mbe_velocity": sum(r["final_mbe_velocity"] for r in group) / len(group),
+        }
+        if "mbe_checkpoints" in group[0]:
+            ckpt_keys = sorted(group[0]["mbe_checkpoints"].keys())
+            mbe_dynamics_summary[label]["checkpoints"] = {
+                k: sum(r["mbe_checkpoints"][k] for r in group) / len(group) for k in ckpt_keys
+            }
+
     with open(out_path, "w") as f:
         json.dump({
             "model": model_path,
             "n_samples": len(results),
             "accuracy": len([r for r in results if r["correct"]]) / len(results) if results else 0,
             "per_layer_mbe_summary": per_layer_mbe_summary,
-            "results": results,
+            "mbe_dynamics_summary": mbe_dynamics_summary,
+            "results": results_compact,
         }, f, indent=2)
     print(f"\nSaved to {out_path}")
 
