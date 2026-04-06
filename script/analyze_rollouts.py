@@ -26,6 +26,7 @@ import sys
 import tempfile
 import multiprocessing as mp
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -33,6 +34,87 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.mbe import mbe_reverse_gram, OnlineMBE
+
+
+# ---------------------------------------------------------------------------
+# Multi-dataset registry
+# ---------------------------------------------------------------------------
+DATASET_REGISTRY = {
+    "gsm8k": {
+        "hf_path": "openai/gsm8k", "hf_name": "main", "split": "test", "category": "math",
+    },
+    "humaneval": {
+        "hf_path": "openai/openai_humaneval", "hf_name": None, "split": "test", "category": "coding",
+    },
+    "arc_challenge": {
+        "hf_path": "allenai/ai2_arc", "hf_name": "ARC-Challenge", "split": "test", "category": "reasoning",
+    },
+    "mmlu": {
+        "hf_path": "cais/mmlu", "hf_name": "all", "split": "test", "category": "knowledge",
+    },
+}
+
+
+def _format_question(example, dataset_name):
+    """Format a dataset example into a question prompt string."""
+    if dataset_name == "gsm8k":
+        return example["question"]
+    elif dataset_name == "humaneval":
+        return f"Complete the following Python function:\n\n{example['prompt']}"
+    elif dataset_name == "arc_challenge":
+        choices = example["choices"]
+        opts = "\n".join(f"{l}. {t}" for l, t in zip(choices["label"], choices["text"]))
+        return f"{example['question']}\n\n{opts}\n\nAnswer with the letter only."
+    elif dataset_name == "mmlu":
+        opts = "\n".join(f"{chr(65+i)}. {c}" for i, c in enumerate(example["choices"]))
+        return f"{example['question']}\n\n{opts}\n\nAnswer with the letter only."
+    return example.get("question", example.get("prompt", ""))
+
+
+def _extract_gold(example, dataset_name):
+    """Extract the gold answer string from a dataset example."""
+    if dataset_name == "gsm8k":
+        return extract_gold_answer(example["answer"])
+    elif dataset_name == "humaneval":
+        return example["entry_point"]
+    elif dataset_name == "arc_challenge":
+        return str(example["answerKey"]).strip()
+    elif dataset_name == "mmlu":
+        return chr(65 + int(example["answer"]))
+    return str(example.get("answer", ""))
+
+
+def _check_correctness(completion, gold, dataset_name):
+    """Dataset-specific correctness check."""
+    if dataset_name == "gsm8k":
+        predicted = extract_answer_from_completion(completion)
+        try:
+            return float(predicted) == float(gold)
+        except (ValueError, TypeError):
+            return False
+    elif dataset_name == "humaneval":
+        return gold in completion  # heuristic: entry_point function appears in output
+    elif dataset_name in ("arc_challenge", "mmlu"):
+        matches = re.findall(r'\b([A-D])\b', completion.upper())
+        predicted = matches[-1] if matches else ""
+        return predicted == gold.upper()
+    return False
+
+
+def load_dataset_examples(dataset_name, n_samples, seed=42):
+    """Load n_samples examples from the named dataset.
+
+    Returns list of (question_str, gold_str) tuples.
+    """
+    cfg = DATASET_REGISTRY[dataset_name]
+    if cfg["hf_name"]:
+        ds = load_dataset(cfg["hf_path"], cfg["hf_name"])[cfg["split"]]
+    else:
+        ds = load_dataset(cfg["hf_path"])[cfg["split"]]
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(len(ds), size=min(n_samples, len(ds)), replace=False).tolist()
+    return [(_format_question(ds[int(i)], dataset_name), _extract_gold(ds[int(i)], dataset_name))
+            for i in indices]
 
 
 # ---------------------------------------------------------------------------
@@ -99,65 +181,92 @@ def compute_per_layer_mbe(hidden_states, prompt_len, patch_size=8):
 
 
 # ---------------------------------------------------------------------------
-# MBE dynamics: cumulative, online trajectory, sliding window, velocity
+# MBE dynamics: per-token cumulative MBE across all layers + growth profile
+# (aligned with rollout.ipynb)
 # ---------------------------------------------------------------------------
-def compute_online_mbe_trajectory(hidden_states, prompt_len, layer=-1):
-    """Token-by-token MBE using OnlineMBE (incremental Gram update).
-    Returns list of MBE values, one per completion token."""
-    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
-    T, D = h.shape
-    if T < 2:
-        return [0.0]
-    tracker = OnlineMBE(D)
-    trajectory = []
-    for t in range(T):
-        tracker.update(h[t])
-        trajectory.append(tracker.mbe().item())
-    return trajectory
+def compute_per_token_mbe(hidden_states, prompt_len):
+    """
+    Compute cumulative MBE for each token position using OnlineMBE, across all layers.
+    For each layer and prefix length t, returns MBE(hidden[prompt_len : prompt_len+t]).
+
+    Returns:
+        np.array of shape (n_layers, comp_len)
+    """
+    n_layers = len(hidden_states) - 1  # skip embedding layer [0]
+    seq_len = hidden_states[1].shape[1]
+    comp_len = seq_len - prompt_len
+
+    if comp_len < 1:
+        return np.zeros((n_layers, 0))
+
+    mbe = np.zeros((n_layers, comp_len))
+
+    for layer_idx in range(n_layers):
+        h = hidden_states[layer_idx + 1][0, prompt_len:, :].float()  # (comp_len, D)
+        D = h.shape[1]
+
+        tracker = OnlineMBE(D, device=h.device)
+        for t in range(comp_len):
+            tracker.update(h[t])
+            mbe[layer_idx, t] = tracker.mbe().item()
+
+    return mbe
 
 
-def compute_mbe_velocity(trajectory, smooth_kernel=5):
-    """Compute smoothed dMBE/dt from an MBE trajectory.
-    Returns list of velocity values (length = len(trajectory) - smooth_kernel)."""
-    if len(trajectory) < 2:
-        return [0.0]
-    import numpy as np
-    mbes = np.array(trajectory)
-    dmbe = np.diff(mbes)
-    if len(dmbe) > smooth_kernel:
-        smoothed = np.convolve(dmbe, np.ones(smooth_kernel) / smooth_kernel, mode="valid")
-        return smoothed.tolist()
-    return dmbe.tolist()
+def compute_growth_profile(mbe_matrix):
+    """
+    For each layer, compute:
+      - total_growth: MBE(final) - MBE(initial)
+      - half_life: completion % at which MBE reaches 50% of total growth
+
+    Args:
+        mbe_matrix: np.array (n_layers, comp_len)
+    Returns:
+        growth: np.array (n_layers,)
+        half_life: np.array (n_layers,)  — in % of completion (0-100)
+    """
+    n_layers, comp_len = mbe_matrix.shape
+    growth = np.zeros(n_layers)
+    half_life = np.zeros(n_layers)
+
+    for layer in range(n_layers):
+        trace = mbe_matrix[layer]
+        if comp_len < 2:
+            continue
+
+        total = trace[-1] - trace[0]
+        growth[layer] = total
+
+        mid = trace[0] + total * 0.5
+        crossed = np.where(trace >= mid)[0]
+        if len(crossed) > 0:
+            half_life[layer] = crossed[0] / (comp_len - 1) * 100
+        else:
+            half_life[layer] = 100.0
+
+    return growth, half_life
 
 
-def compute_sliding_window_mbe(hidden_states, prompt_len, window_size=32, layer=-1):
-    """MBE on sliding window of W tokens across the completion.
-    Returns list of MBE values, one per window position."""
-    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
-    T = h.shape[0]
-    if T < window_size:
-        return []
-    results = []
-    for start in range(0, T - window_size + 1):
-        h_win = h[start:start + window_size].unsqueeze(0)  # (1, W, D)
-        mbe_val = mbe_reverse_gram(h_win).item()
-        results.append(mbe_val)
-    return results
+def interpolate_mbe(mbe_matrix, n_points=50):
+    """Interpolate a per-token MBE matrix to a common normalized axis [0, 1]."""
+    comp_len = mbe_matrix.shape[1]
+    if comp_len < 2:
+        return None
+    n_layers = mbe_matrix.shape[0]
+    norm_pos = np.linspace(0, 1, comp_len)
+    common_axis = np.linspace(0, 1, n_points)
+    interp = np.zeros((n_layers, n_points))
+    for layer in range(n_layers):
+        interp[layer] = np.interp(common_axis, norm_pos, mbe_matrix[layer])
+    return interp
 
 
-def compute_cumulative_mbe_checkpoints(hidden_states, prompt_len, layer=-1,
-                                        fractions=(0.25, 0.5, 0.75, 1.0)):
-    """MBE at key completion-length checkpoints (25%, 50%, 75%, 100%).
-    Returns dict mapping fraction -> MBE value."""
-    h = hidden_states[layer][0, prompt_len:, :].float()  # (T_comp, D)
-    T = h.shape[0]
-    checkpoints = {}
-    for frac in fractions:
-        t = max(2, int(T * frac))
-        t = min(t, T)
-        mbe_val = mbe_reverse_gram(h[:t].unsqueeze(0)).item()
-        checkpoints[f"mbe@{int(frac*100)}%"] = mbe_val
-    return checkpoints
+def compute_mbe_velocity(mbe_matrix, layer_idx=-1):
+    """Mean ΔMBE per token for a given layer (last layer by default)."""
+    if mbe_matrix.shape[1] < 2:
+        return 0.0
+    delta = np.diff(mbe_matrix[layer_idx])
+    return float(delta.mean())
 
 
 # ---------------------------------------------------------------------------
@@ -253,15 +362,32 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
     answer_prob_trace = compute_answer_prob_trace(logits, full_ids, prompt_len, gold_token_ids, n_bins)
     end_cos_sim = compute_end_similarity(model, hidden_states, prompt_len, gold_token_ids)
 
-    # MBE dynamics
-    mbe_trajectory = compute_online_mbe_trajectory(hidden_states, prompt_len, layer=-1)
-    mbe_velocity = compute_mbe_velocity(mbe_trajectory, smooth_kernel=5)
-    mbe_checkpoints = compute_cumulative_mbe_checkpoints(hidden_states, prompt_len, layer=-1)
-    sw_mbe_32 = compute_sliding_window_mbe(hidden_states, prompt_len, window_size=32, layer=-1)
+    # MBE dynamics — cumulative MBE across all layers (aligned with rollout.ipynb)
+    mbe_matrix = compute_per_token_mbe(hidden_states, prompt_len)  # (n_layers, comp_len)
+    n_layers = mbe_matrix.shape[0]
+    growth, half_life = compute_growth_profile(mbe_matrix)
 
-    # Velocity summary stats
-    mean_velocity = sum(mbe_velocity) / len(mbe_velocity) if mbe_velocity else 0.0
-    final_velocity = (mbe_trajectory[-1] - mbe_trajectory[-min(10, len(mbe_trajectory))]) / min(10, len(mbe_trajectory)) if len(mbe_trajectory) >= 2 else 0.0
+    # Binned trajectory for last layer
+    last_layer_traj = mbe_matrix[-1].tolist() if n_layers > 0 else []
+    last_layer_traj_binned = bin_trace(last_layer_traj, n_bins)
+
+    # ΔMBE (rate of change) for last layer
+    if len(last_layer_traj) >= 2:
+        delta_mbe = np.diff(mbe_matrix[-1]).tolist()
+    else:
+        delta_mbe = [0.0]
+    delta_mbe_binned = bin_trace(delta_mbe, n_bins)
+
+    # MBE at checkpoints (last layer)
+    mbe_checkpoints = {}
+    for frac in (0.25, 0.5, 0.75, 1.0):
+        t = max(1, int(mbe_matrix.shape[1] * frac)) - 1
+        t = min(t, mbe_matrix.shape[1] - 1)
+        if mbe_matrix.shape[1] > 0:
+            mbe_checkpoints[f"mbe@{int(frac*100)}%"] = float(mbe_matrix[-1, t])
+
+    # Interpolated MBE for cross-rollout averaging
+    interp = interpolate_mbe(mbe_matrix, n_points=50)
 
     return {
         "correct": correct,
@@ -276,16 +402,101 @@ def run_rollout(model, tokenizer, question, gold_answer, max_new_tokens=512, n_b
         "per_layer_mbe": per_layer_mbe,
         "answer_prob_trace": answer_prob_trace,
         "end_cos_sim": end_cos_sim,
-        # MBE dynamics
-        "mbe_trajectory": bin_trace(mbe_trajectory, n_bins),
-        "mbe_trajectory_raw": mbe_trajectory,
-        "mbe_velocity": bin_trace(mbe_velocity, n_bins) if mbe_velocity else [0.0] * n_bins,
-        "mbe_velocity_raw": mbe_velocity,
-        "mean_mbe_velocity": mean_velocity,
-        "final_mbe_velocity": final_velocity,
+        # MBE dynamics (aligned with rollout.ipynb)
+        "mbe_trajectory": last_layer_traj_binned,
+        "delta_mbe": delta_mbe_binned,
         "mbe_checkpoints": mbe_checkpoints,
-        "sw_mbe_32": bin_trace(sw_mbe_32, n_bins) if sw_mbe_32 else [0.0] * n_bins,
+        "mbe_growth": growth.tolist(),       # per-layer total growth
+        "mbe_half_life": half_life.tolist(),  # per-layer half-life (% of completion)
+        "mbe_interp": interp.tolist() if interp is not None else None,  # (n_layers, 50)
     }
+
+
+# ---------------------------------------------------------------------------
+# vLLM batch generation + dataset rollout entry point
+# ---------------------------------------------------------------------------
+def batch_generate_vllm(vllm_engine, tokenizer, questions, max_new_tokens=512):
+    """Batch-generate completions with vLLM offline engine.
+
+    Returns list of (completion_text, prompt_text) tuples.
+    """
+    from vllm import SamplingParams
+    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=max_new_tokens)
+    prompts = [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True
+        )
+        for q in questions
+    ]
+    outputs = vllm_engine.generate(prompts, sampling_params)
+    return [(out.outputs[0].text, prompt) for prompt, out in zip(prompts, outputs)]
+
+
+def build_result_from_completion(model, tokenizer, question, gold, completion_text, prompt_text,
+                                  dataset_name="gsm8k"):
+    """Run HF forward pass on a pre-generated completion to get hidden states + MBE."""
+    full_text = prompt_text + completion_text
+    prompt_ids = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    full_ids = tokenizer(full_text, return_tensors="pt")["input_ids"].to(model.device)
+    prompt_len = prompt_ids.shape[1]
+
+    correct = _check_correctness(completion_text, gold, dataset_name)
+    _, hidden_states = full_forward(model, full_ids)
+    mbe = compute_per_token_mbe(hidden_states, prompt_len)
+
+    comp_ids = full_ids[0, prompt_len:].tolist()
+    tokens = [tokenizer.decode([tid]) for tid in comp_ids]
+
+    return {
+        "dataset": dataset_name,
+        "question": question[:100],
+        "gold": gold,
+        "correct": correct,
+        "comp_len": full_ids.shape[1] - prompt_len,
+        "completion_text": completion_text[:300],
+        "tokens": tokens,
+        "mbe": mbe,
+        "mbe_velocity": compute_mbe_velocity(mbe),
+    }
+
+
+def run_dataset_rollouts(model, tokenizer, dataset_name, n_samples,
+                         vllm_engine=None, max_new_tokens=512, seed=42):
+    """Run rollouts for a dataset; returns list of result dicts with MBE dynamics.
+
+    Uses vLLM for fast batch generation when vllm_engine is provided,
+    then HF forward passes for hidden-state extraction.
+    """
+    examples = load_dataset_examples(dataset_name, n_samples, seed=seed)
+    results = []
+
+    if vllm_engine is not None:
+        questions = [q for q, _ in examples]
+        vllm_outputs = batch_generate_vllm(vllm_engine, tokenizer, questions, max_new_tokens)
+        for (question, gold), (completion_text, prompt_text) in zip(examples, vllm_outputs):
+            r = build_result_from_completion(
+                model, tokenizer, question, gold, completion_text, prompt_text, dataset_name
+            )
+            results.append(r)
+    else:
+        for question, gold in examples:
+            prompt_text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": question}], tokenize=False, add_generation_prompt=True
+            )
+            inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+            prompt_len = inputs["input_ids"].shape[1]
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs, max_new_tokens=max_new_tokens,
+                    do_sample=True, temperature=0.7, top_p=0.9,
+                )
+            completion_text = tokenizer.decode(output_ids[0, prompt_len:], skip_special_tokens=True)
+            r = build_result_from_completion(
+                model, tokenizer, question, gold, completion_text, prompt_text, dataset_name
+            )
+            results.append(r)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -395,8 +606,7 @@ def print_report(results, model_path):
     print(f"\n--- Scalar metrics ---")
     print(f"{'':>20} {'Correct':>10} {'Incorrect':>10} {'Delta':>10}")
     print("-" * 55)
-    for key in ["mean_logprob", "mean_mbe", "end_cos_sim", "completion_len",
-                "mean_mbe_velocity", "final_mbe_velocity"]:
+    for key in ["mean_logprob", "mean_mbe", "end_cos_sim", "completion_len"]:
         vc = sum(r[key] for r in correct) / len(correct) if correct else 0
         vi = sum(r[key] for r in incorrect) / len(incorrect) if incorrect else 0
         print(f"{key:>20} {vc:>10.4f} {vi:>10.4f} {vc - vi:>+10.4f}")
@@ -404,22 +614,19 @@ def print_report(results, model_path):
     print_trace("1. Confidence (log-prob)", [r["logprob_trace"] for r in correct],
                 [r["logprob_trace"] for r in incorrect], n_bins, higher_is_better=True)
 
-    print_trace("2. MBE (representation diversity)", [r["mbe_trace"] for r in correct],
+    print_trace("2. MBE patch trace", [r["mbe_trace"] for r in correct],
                 [r["mbe_trace"] for r in incorrect], n_bins, higher_is_better=True)
 
-    print_trace("2b. Online MBE trajectory", [r["mbe_trajectory"] for r in correct],
+    print_trace("2b. Cumulative MBE trajectory (last layer)", [r["mbe_trajectory"] for r in correct],
                 [r["mbe_trajectory"] for r in incorrect], n_bins, higher_is_better=True)
 
-    print_trace("2c. MBE velocity (dMBE/dt)", [r["mbe_velocity"] for r in correct],
-                [r["mbe_velocity"] for r in incorrect], n_bins, higher_is_better=True)
-
-    print_trace("2d. Sliding window MBE (W=32)", [r["sw_mbe_32"] for r in correct],
-                [r["sw_mbe_32"] for r in incorrect], n_bins, higher_is_better=True)
+    print_trace("2c. ΔMBE rate (last layer)", [r["delta_mbe"] for r in correct],
+                [r["delta_mbe"] for r in incorrect], n_bins, higher_is_better=True)
 
     # MBE checkpoints
-    if results and "mbe_checkpoints" in results[0]:
+    if results and "mbe_checkpoints" in results[0] and results[0]["mbe_checkpoints"]:
         ckpt_keys = sorted(results[0]["mbe_checkpoints"].keys())
-        print(f"\n--- 2e. MBE at completion checkpoints ---")
+        print(f"\n--- 2d. MBE at completion checkpoints (last layer) ---")
         print(f"{'':>12}", end="")
         for k in ckpt_keys:
             print(f" {k:>10}", end="")
@@ -430,16 +637,29 @@ def print_report(results, model_path):
                 continue
             print(f"{label:>12}", end="")
             for k in ckpt_keys:
-                avg = sum(r["mbe_checkpoints"][k] for r in group) / len(group)
+                avg = sum(r["mbe_checkpoints"].get(k, 0) for r in group) / len(group)
                 print(f" {avg:>10.4f}", end="")
             print(f"  (n={len(group)})")
         if correct and incorrect:
             print(f"{'Delta':>12}", end="")
             for k in ckpt_keys:
-                vc = sum(r["mbe_checkpoints"][k] for r in correct) / len(correct)
-                vi = sum(r["mbe_checkpoints"][k] for r in incorrect) / len(incorrect)
+                vc = sum(r["mbe_checkpoints"].get(k, 0) for r in correct) / len(correct)
+                vi = sum(r["mbe_checkpoints"].get(k, 0) for r in incorrect) / len(incorrect)
                 print(f" {vc - vi:>+10.4f}", end="")
             print()
+
+    # Per-layer MBE growth profile
+    if results and "mbe_growth" in results[0] and results[0]["mbe_growth"]:
+        n_layers = len(results[0]["mbe_growth"])
+        print(f"\n--- 2e. Per-layer MBE growth & half-life ---")
+        print(f"{'Layer':>8} {'Growth(C)':>10} {'Growth(I)':>10} {'Delta':>10} {'HL%(C)':>8} {'HL%(I)':>8}")
+        print("-" * 62)
+        for li in range(n_layers):
+            gc = sum(r["mbe_growth"][li] for r in correct) / len(correct) if correct else 0
+            gi = sum(r["mbe_growth"][li] for r in incorrect) / len(incorrect) if incorrect else 0
+            hc = sum(r["mbe_half_life"][li] for r in correct) / len(correct) if correct else 0
+            hi = sum(r["mbe_half_life"][li] for r in incorrect) / len(incorrect) if incorrect else 0
+            print(f"{li + 1:>8} {gc:>10.4f} {gi:>10.4f} {gc - gi:>+10.4f} {hc:>8.1f} {hi:>8.1f}")
 
     print_trace("3. P(correct answer | prefix)", [r["answer_prob_trace"] for r in correct],
                 [r["answer_prob_trace"] for r in incorrect], n_bins, higher_is_better=True)
@@ -599,30 +819,40 @@ def main():
     # Report
     print_report(results, model_path)
 
-    # Save — strip raw trajectories to keep file size manageable
+    # Save — strip mbe_interp (large) from per-result to keep file size manageable
     out_path = os.path.join(model_path, "rollout_analysis.json") if os.path.isdir(model_path) else "rollout_analysis.json"
     per_layer_mbe_summary = summarize_per_layer_mbe(results)
     results_compact = []
     for r in results:
-        rc = {k: v for k, v in r.items() if k not in ("mbe_trajectory_raw", "mbe_velocity_raw")}
+        rc = {k: v for k, v in r.items() if k != "mbe_interp"}
         results_compact.append(rc)
 
-    # Aggregate MBE dynamics summary
+    # Aggregate MBE dynamics summary (aligned with rollout.ipynb)
     correct = [r for r in results if r["correct"]]
     incorrect = [r for r in results if not r["correct"]]
     mbe_dynamics_summary = {}
     for label, group in [("correct", correct), ("incorrect", incorrect), ("all", results)]:
         if not group:
             continue
-        mbe_dynamics_summary[label] = {
-            "mean_mbe_velocity": sum(r["mean_mbe_velocity"] for r in group) / len(group),
-            "final_mbe_velocity": sum(r["final_mbe_velocity"] for r in group) / len(group),
-        }
-        if "mbe_checkpoints" in group[0]:
+        n_layers = len(group[0].get("mbe_growth", []))
+        entry = {}
+        if "mbe_checkpoints" in group[0] and group[0]["mbe_checkpoints"]:
             ckpt_keys = sorted(group[0]["mbe_checkpoints"].keys())
-            mbe_dynamics_summary[label]["checkpoints"] = {
-                k: sum(r["mbe_checkpoints"][k] for r in group) / len(group) for k in ckpt_keys
+            entry["checkpoints"] = {
+                k: sum(r["mbe_checkpoints"].get(k, 0) for r in group) / len(group) for k in ckpt_keys
             }
+        if n_layers > 0:
+            entry["growth_per_layer"] = [
+                sum(r["mbe_growth"][li] for r in group) / len(group) for li in range(n_layers)
+            ]
+            entry["half_life_per_layer"] = [
+                sum(r["mbe_half_life"][li] for r in group) / len(group) for li in range(n_layers)
+            ]
+        # Averaged interpolated MBE (n_layers, 50) for plotting
+        interps = [np.array(r["mbe_interp"]) for r in group if r.get("mbe_interp") is not None]
+        if interps:
+            entry["avg_interp_mbe"] = np.mean(interps, axis=0).tolist()
+        mbe_dynamics_summary[label] = entry
 
     with open(out_path, "w") as f:
         json.dump({
