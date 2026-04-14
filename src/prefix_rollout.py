@@ -171,19 +171,22 @@ class PrefixRolloutBuffer:
         prefix_text = completion_text[:cut]
 
         # Build the pre-formatted prompt string.
-        # `continue_final_message=True` omits the closing <|im_end|> so
-        # the model continues from the end of prefix_text.
+        # Strategy: get the standard generation prompt (ends with
+        # "<|im_start|>assistant\n<think>\n" on Qwen3), then strip the
+        # template-added "<think>\n" if prefix_text already starts with one.
+        # This avoids the double-think-tag artefact that occurs when
+        # apply_chat_template wraps an assistant content that already contains
+        # <think> tokens.
         try:
-            messages = [
-                {"role": "user", "content": question},
-                {"role": "assistant", "content": prefix_text},
-            ]
-            prompt_str = tokenizer.apply_chat_template(
-                messages,
+            gen_prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": question}],
                 tokenize=False,
-                add_generation_prompt=False,
-                continue_final_message=True,
+                add_generation_prompt=True,
             )
+            _THINK_OPEN = "<think>\n"
+            if gen_prompt.endswith(_THINK_OPEN) and prefix_text.startswith(_THINK_OPEN):
+                gen_prompt = gen_prompt[: -len(_THINK_OPEN)]
+            prompt_str = gen_prompt + prefix_text
         except Exception:
             return None
 
