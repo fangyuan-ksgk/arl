@@ -44,7 +44,15 @@ from typing import Optional
 
 class PrefixRolloutBuffer:
     """
-    Circular FIFO buffer of (question, completion_text, is_correct) triples.
+    Circular FIFO buffer of rollout records.
+
+    Each record is a dict:
+        {
+            "question"   : str,
+            "completion" : str,
+            "correct"    : bool,
+            "reward"     : float,   # scalar reward from the correctness/reward fn
+        }
 
     Args:
         max_size: Maximum number of rollouts to retain.
@@ -61,23 +69,30 @@ class PrefixRolloutBuffer:
         self.max_size = max_size
         self.min_prefix_frac = min_prefix_frac
         self.max_prefix_frac = max_prefix_frac
-        self._buf: list[tuple[str, str, bool]] = []  # (question, completion, is_correct)
+        self._buf: list[dict] = []
 
     def __len__(self) -> int:
         return len(self._buf)
 
     # ------------------------------------------------------------------
-    def add(self, question: str, completion_text: str, is_correct: bool) -> None:
+    def add(self, question: str, completion_text: str, is_correct: bool,
+             reward: float = 0.0) -> None:
         """Add a single rollout (FIFO eviction when full)."""
         if len(self._buf) >= self.max_size:
             self._buf.pop(0)
-        self._buf.append((question, completion_text, is_correct))
+        self._buf.append({
+            "question"   : question,
+            "completion" : completion_text,
+            "correct"    : bool(is_correct),
+            "reward"     : float(reward),
+        })
 
     def add_batch(
         self,
         prompts: list,
         completions: list,
         correctness: list[bool],
+        rewards: Optional[list] = None,
     ) -> None:
         """
         Add a batch of rollouts.
@@ -87,12 +102,15 @@ class PrefixRolloutBuffer:
             completions: List of completion message-dicts (TRL format:
                          [[{"role": "assistant", "content": "..."}], ...]).
             correctness: List of booleans, one per rollout.
+            rewards:     Optional list of scalar reward values (default: float(correct)).
         """
-        for prompt, comp, ok in zip(prompts, completions, correctness):
+        if rewards is None:
+            rewards = [float(ok) for ok in correctness]
+        for prompt, comp, ok, r in zip(prompts, completions, correctness, rewards):
             question = _extract_question(prompt)
             comp_text = _extract_completion_text(comp)
             if question and comp_text:
-                self.add(question, comp_text, bool(ok))
+                self.add(question, comp_text, bool(ok), reward=float(r))
 
     # ------------------------------------------------------------------
     def sample_prefix_augmented_item(
@@ -124,22 +142,32 @@ class PrefixRolloutBuffer:
 
         candidates = self._buf
         if from_correct is True:
-            candidates = [r for r in self._buf if r[2]]
+            candidates = [r for r in self._buf if r["correct"]]
         elif from_correct is False:
-            candidates = [r for r in self._buf if not r[2]]
+            candidates = [r for r in self._buf if not r["correct"]]
 
         if not candidates:
             return None
 
-        question, completion_text, _ = random.choice(candidates)
+        entry = random.choice(candidates)
+        question, completion_text = entry["question"], entry["completion"]
 
-        # Random character-level truncation
-        L = len(completion_text)
-        if L < 20:
-            return None
-        lo = max(1, int(L * self.min_prefix_frac))
-        hi = max(lo + 1, int(L * self.max_prefix_frac))
-        cut = random.randint(lo, hi)
+        # Only sample from inside the reasoning block (before </think>).
+        # A prefix that already contains </think> has effectively finished
+        # thinking; the suffix would be trivially short and reward-irrelevant.
+        _THINK_END = "</think>"
+        think_end_pos = completion_text.find(_THINK_END)
+        if think_end_pos == -1:
+            # No think block — treat entire completion as the reasoning span.
+            think_end_pos = len(completion_text)
+
+        if think_end_pos < 20:
+            return None  # reasoning too short to sample a meaningful prefix
+
+        # min/max_prefix_frac are relative to the reasoning block, not full length.
+        lo = max(1, int(think_end_pos * self.min_prefix_frac))
+        hi = max(lo + 1, int(think_end_pos * self.max_prefix_frac))
+        cut = random.randint(lo, min(hi, think_end_pos - 1))
         prefix_text = completion_text[:cut]
 
         # Build the pre-formatted prompt string.
@@ -163,11 +191,13 @@ class PrefixRolloutBuffer:
 
     # ------------------------------------------------------------------
     def get_stats(self) -> dict:
-        n_correct = sum(1 for _, _, ok in self._buf if ok)
+        n_correct = sum(1 for r in self._buf if r["correct"])
+        rewards = [r["reward"] for r in self._buf]
         return {
-            "buffer_size": len(self._buf),
-            "n_correct": n_correct,
-            "n_incorrect": len(self._buf) - n_correct,
+            "buffer_size"   : len(self._buf),
+            "n_correct"     : n_correct,
+            "n_incorrect"   : len(self._buf) - n_correct,
+            "mean_reward"   : round(sum(rewards) / len(rewards), 4) if rewards else 0.0,
         }
 
 
@@ -205,16 +235,17 @@ class PrefixRolloutCollector:
     def __call__(self, prompts, completions, **kwargs) -> list[float]:
         if self.correctness_fn is not None:
             try:
-                correct_flags = self.correctness_fn(
+                reward_vals = self.correctness_fn(
                     prompts=prompts, completions=completions, **kwargs
                 )
             except TypeError:
-                correct_flags = self.correctness_fn(completions, **kwargs)
-            correctness = [float(r) >= 0.5 for r in correct_flags]
+                reward_vals = self.correctness_fn(completions, **kwargs)
+            correctness = [float(r) >= 0.5 for r in reward_vals]
         else:
+            reward_vals = [0.0] * len(completions)
             correctness = [False] * len(completions)
 
-        self.buffer.add_batch(prompts, completions, correctness)
+        self.buffer.add_batch(prompts, completions, correctness, rewards=reward_vals)
         return [0.0] * len(completions)
 
 
