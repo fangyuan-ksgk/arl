@@ -62,6 +62,7 @@ echo ">>> Training ${MODEL_NAME} on GPUs 0,1 ..."
 echo ">>> Training logs: ${TRAIN_LOG}"
 echo ">>> Follow live: tail -f ${TRAIN_LOG}"
 CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
+    --num_machines 1 --mixed_precision bf16 --dynamo_backend no \
     "${SCRIPT_DIR}/grpo_gsm8k.py" \
     --model ${MODEL_NAME} \
     --output_dir "${OUTPUT_DIR}" \
