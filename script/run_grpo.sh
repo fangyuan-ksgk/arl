@@ -10,6 +10,21 @@ MODEL_NAME="Qwen/Qwen3-4B"
 PORT=8880
 OUTPUT_DIR="${PROJECT_DIR}/output/grpo_qwen3_4b"
 
+# ---------------------------------------------------------------
+# MBE dynamics logging (optional)
+# Set MBE_LOG=1 to log per-token MBE/CE traces during training.
+# Records are written to ${OUTPUT_DIR}/mbe_dynamics.jsonl
+# ---------------------------------------------------------------
+MBE_LOG=0           # 1 = enable, 0 = disable
+MBE_LOG_STEPS=5     # log every N reward-function calls
+MBE_LOG_SAMPLE_K=4  # rollouts to analyse per logged step
+
+MBE_FLAGS=""
+if [ "${MBE_LOG}" = "1" ]; then
+    MBE_FLAGS="--mbe_log --mbe_log_steps ${MBE_LOG_STEPS} --mbe_log_sample_k ${MBE_LOG_SAMPLE_K}"
+    echo ">>> MBE dynamics logging ON  (every ${MBE_LOG_STEPS} steps, ${MBE_LOG_SAMPLE_K} samples) → ${OUTPUT_DIR}/mbe_dynamics.jsonl"
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 # Kill any leftover processes from previous runs
@@ -60,6 +75,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
     --logging_steps 10 \
     --save_strategy no \
     --report_to none \
+    ${MBE_FLAGS} \
     2>&1 | tee "${TRAIN_LOG}"
 
 # =============================================

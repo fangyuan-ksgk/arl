@@ -123,6 +123,13 @@ def main():
                         help="Run eval every N steps (0 to disable)")
     parser.add_argument("--eval_samples", type=int, default=None,
                         help="Subsample N test examples for eval (default: full test set)")
+    # MBE dynamics logging
+    parser.add_argument("--mbe_log", action="store_true",
+                        help="Log MBE dynamics (correct vs incorrect) to JSONL during training")
+    parser.add_argument("--mbe_log_steps", type=int, default=1,
+                        help="Log MBE every N reward-function calls (1 = every step)")
+    parser.add_argument("--mbe_log_sample_k", type=int, default=4,
+                        help="Max rollouts to analyse per logged step")
     # MBE reward
     parser.add_argument("--mbe_reward", action="store_true",
                         help="Add scaled MBE reward: min(mbe, clip) / scale")
@@ -132,6 +139,20 @@ def main():
                         help="MBE reward denominator (default 40.0 → max ~0.05)")
     parser.add_argument("--mbe_clip", type=float, default=2.0,
                         help="MBE value clipped before scaling")
+    # Prefix-conditioned rollout exploration (PCRE)
+    parser.add_argument("--prefix_rollout", action="store_true",
+                        help="Enable prefix-conditioned rollout exploration")
+    parser.add_argument("--prefix_augment_prob", type=float, default=0.3,
+                        help="Fraction of training examples to replace with prefix-augmented ones")
+    parser.add_argument("--prefix_buffer_size", type=int, default=500,
+                        help="Max rollouts stored in the prefix buffer")
+    parser.add_argument("--prefix_min_frac", type=float, default=0.15,
+                        help="Min fraction of completion to keep as prefix")
+    parser.add_argument("--prefix_max_frac", type=float, default=0.75,
+                        help="Max fraction of completion to keep as prefix")
+    parser.add_argument("--prefix_from_correct", type=str, default="all",
+                        choices=["all", "correct", "incorrect"],
+                        help="Sample prefixes from: all / correct / incorrect rollouts")
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
                         help="Use LoRA (PEFT) instead of full fine-tuning.")
@@ -141,6 +162,10 @@ def main():
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
+
+    # Tokenizer needed early if prefix rollout is enabled (for prompt formatting)
+    if args.prefix_rollout:
+        _tok_for_prefix = AutoTokenizer.from_pretrained(args.model)
     print(f"Train: {len(train_dataset)}, Test: {len(test_dataset)}")
 
     config_kwargs = dict(
@@ -208,9 +233,58 @@ def main():
     else:
         model = args.model  # let TRL handle device placement for colocate/no-vllm
 
+    # MBE dynamics logger (logs as side-effect, zero reward signal)
+    mbe_logger = None
+    if args.mbe_log:
+        from src.mbe_logger import MBEDynamicsLogger
+        tokenizer_for_log = AutoTokenizer.from_pretrained(args.model)
+        log_path = os.path.join(args.output_dir, "mbe_dynamics.jsonl")
+        mbe_logger = MBEDynamicsLogger(
+            tokenizer_for_log,
+            log_path=log_path,
+            log_steps=args.mbe_log_steps,
+            sample_k=args.mbe_log_sample_k,
+        )
+        print(f"MBE dynamics logger enabled → {log_path}  "
+              f"(every {args.mbe_log_steps} steps, {args.mbe_log_sample_k} samples/step)")
+
+    # Prefix rollout buffer (created before reward_funcs so collector can reference it)
+    prefix_buffer = None
+    prefix_dataset = None
+    if args.prefix_rollout:
+        from src.prefix_rollout import PrefixRolloutBuffer, PrefixRolloutCollector, PrefixAugmentedDataset
+        _from_correct_map = {"all": None, "correct": True, "incorrect": False}
+        prefix_buffer = PrefixRolloutBuffer(
+            max_size=args.prefix_buffer_size,
+            min_prefix_frac=args.prefix_min_frac,
+            max_prefix_frac=args.prefix_max_frac,
+        )
+        prefix_dataset = PrefixAugmentedDataset(
+            train_dataset,
+            prefix_buffer,
+            _tok_for_prefix,
+            augment_prob=args.prefix_augment_prob,
+            from_correct=_from_correct_map[args.prefix_from_correct],
+        )
+        print(
+            f"Prefix rollout enabled: augment_prob={args.prefix_augment_prob}, "
+            f"buffer_size={args.prefix_buffer_size}, "
+            f"prefix_frac=[{args.prefix_min_frac}, {args.prefix_max_frac}], "
+            f"from={args.prefix_from_correct}"
+        )
+
     # Build reward function list
     reward_funcs = [correctness_reward, format_reward]
     mbe_reward_obj = None
+
+    if args.mbe_log and mbe_logger is not None:
+        reward_funcs.append(mbe_logger.as_reward(correctness_fn=correctness_reward))
+
+    if args.prefix_rollout and prefix_buffer is not None:
+        prefix_collector = PrefixRolloutCollector(
+            prefix_buffer, correctness_fn=correctness_reward
+        )
+        reward_funcs.append(prefix_collector)
 
     if args.mbe_reward or args.gated_mbe_reward:
         from src.mbe_reward import MBEReward, CorrectnessGatedMBEReward
@@ -238,12 +312,14 @@ def main():
         model=model,
         reward_funcs=reward_funcs,
         args=config,
-        train_dataset=train_dataset,
+        train_dataset=prefix_dataset if prefix_dataset is not None else train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
     )
 
     # Bind model ref for MBE forward passes
+    if mbe_logger is not None:
+        mbe_logger.set_model(trainer.model)
     if mbe_reward_obj is not None:
         mbe_reward_obj.set_model(trainer.model)
 
