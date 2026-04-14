@@ -183,12 +183,16 @@ class MBEDynamicsLogger:
 
         rollout_records = []
         for i in indices:
-            rec = self._analyse_rollout(
-                prompt          = prompts[i],
-                completion_text = completions[i][0]["content"],
-                correct         = correct_flags[i],
-                device          = device,
-            )
+            try:
+                rec = self._analyse_rollout(
+                    prompt          = prompts[i],
+                    completion_text = completions[i][0]["content"],
+                    correct         = correct_flags[i],
+                    device          = device,
+                )
+            except Exception as e:
+                print(f"[MBELogger] _analyse_rollout failed for idx {i}: {e}")
+                rec = None
             if rec is not None:
                 rollout_records.append(rec)
 

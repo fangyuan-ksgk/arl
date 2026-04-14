@@ -76,7 +76,7 @@ class PrefixRolloutBuffer:
 
     # ------------------------------------------------------------------
     def add(self, question: str, completion_text: str, is_correct: bool,
-             reward: float = 0.0) -> None:
+             reward: float = 0.0, gold_answer: str = "") -> None:
         """Add a single rollout (FIFO eviction when full)."""
         if len(self._buf) >= self.max_size:
             self._buf.pop(0)
@@ -85,6 +85,7 @@ class PrefixRolloutBuffer:
             "completion" : completion_text,
             "correct"    : bool(is_correct),
             "reward"     : float(reward),
+            "gold_answer": gold_answer,
         })
 
     def add_batch(
@@ -93,24 +94,28 @@ class PrefixRolloutBuffer:
         completions: list,
         correctness: list[bool],
         rewards: Optional[list] = None,
+        gold_answers: Optional[list] = None,
     ) -> None:
         """
         Add a batch of rollouts.
 
         Args:
-            prompts:     List of prompts as message-dicts or strings.
-            completions: List of completion message-dicts (TRL format:
-                         [[{"role": "assistant", "content": "..."}], ...]).
-            correctness: List of booleans, one per rollout.
-            rewards:     Optional list of scalar reward values (default: float(correct)).
+            prompts:      List of prompts as message-dicts or strings.
+            completions:  List of completion message-dicts (TRL format:
+                          [[{"role": "assistant", "content": "..."}], ...]).
+            correctness:  List of booleans, one per rollout.
+            rewards:      Optional list of scalar reward values (default: float(correct)).
+            gold_answers: Optional list of gold answer strings (default: "").
         """
         if rewards is None:
             rewards = [float(ok) for ok in correctness]
-        for prompt, comp, ok, r in zip(prompts, completions, correctness, rewards):
+        if gold_answers is None:
+            gold_answers = [""] * len(completions)
+        for prompt, comp, ok, r, gold in zip(prompts, completions, correctness, rewards, gold_answers):
             question = _extract_question(prompt)
             comp_text = _extract_completion_text(comp)
             if question and comp_text:
-                self.add(question, comp_text, bool(ok), reward=float(r))
+                self.add(question, comp_text, bool(ok), reward=float(r), gold_answer=gold)
 
     # ------------------------------------------------------------------
     def sample_prefix_augmented_item(
@@ -190,7 +195,8 @@ class PrefixRolloutBuffer:
         except Exception:
             return None
 
-        return {**base_item, "prompt": prompt_str}
+        gold = entry.get("gold_answer", "") or base_item.get("gold_answer", "")
+        return {**base_item, "prompt": prompt_str, "gold_answer": gold}
 
     # ------------------------------------------------------------------
     def get_stats(self) -> dict:
@@ -248,7 +254,11 @@ class PrefixRolloutCollector:
             reward_vals = [0.0] * len(completions)
             correctness = [False] * len(completions)
 
-        self.buffer.add_batch(prompts, completions, correctness, rewards=reward_vals)
+        gold_answers = list(kwargs.get("gold_answer", [""] * len(completions)))
+        self.buffer.add_batch(
+            prompts, completions, correctness,
+            rewards=reward_vals, gold_answers=gold_answers,
+        )
         return [0.0] * len(completions)
 
 
@@ -302,7 +312,19 @@ class PrefixAugmentedDataset(torch.utils.data.Dataset):
                 item, self.tokenizer, from_correct=self.from_correct
             )
             if augmented is not None:
-                return augmented
+                return augmented  # prompt is already a pre-formatted string
+
+        # Normalise non-augmented items to string prompt so that every item in
+        # a DataLoader batch has the same type (str), avoiding collation errors
+        # when augmented and non-augmented items land in the same batch.
+        prompt = item.get("prompt")
+        if isinstance(prompt, list):
+            item = dict(item)
+            item["prompt"] = self.tokenizer.apply_chat_template(
+                prompt,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
         return item
 
     # TRL compatibility: expose column_names / features from base dataset
