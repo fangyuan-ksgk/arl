@@ -1,29 +1,58 @@
 #!/bin/bash
-# GRPO on GSM8K: Qwen3-4B
-# vLLM server on GPUs 2,3 (TP=2) — training on GPUs 0,1 (accelerate)
-# Logs: output/grpo_qwen3_4b/vllm.log, output/grpo_qwen3_4b/train.log
+# GRPO on GSM8K — 2-GPU layout
+#   GPU 0 : vLLM server (TP=1)  ← GPU 0 avoids NVMLError_InvalidArgument
+#   GPU 1 : training   (accelerate, 1 process)
+#
+# Override any variable from the command line, e.g.:
+#   PCRE=1 PREFIX_FROM=correct MBE_LOG=1 bash script/run_grpo.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 MODEL_NAME="Qwen/Qwen3-4B"
 PORT=8880
-OUTPUT_DIR="${PROJECT_DIR}/output/grpo_qwen3_4b"
 
 # ---------------------------------------------------------------
-# MBE dynamics logging (optional)
-# Set MBE_LOG=1 to log per-token MBE/CE traces during training.
-# Records are written to ${OUTPUT_DIR}/mbe_dynamics.jsonl
+# Experiment knobs — all overridable via env vars
 # ---------------------------------------------------------------
-MBE_LOG=0           # 1 = enable, 0 = disable
-MBE_LOG_STEPS=5     # log every N reward-function calls
-MBE_LOG_SAMPLE_K=4  # rollouts to analyse per logged step
+MBE_LOG=${MBE_LOG:-0}               # 1 = log per-token MBE/CE traces
+MBE_LOG_STEPS=${MBE_LOG_STEPS:-5}
+MBE_LOG_SAMPLE_K=${MBE_LOG_SAMPLE_K:-4}
 
+PCRE=${PCRE:-0}                          # 1 = prefix-conditioned rollout exploration
+PREFIX_AUGMENT_PROB=${PREFIX_AUGMENT_PROB:-0.3}   # fraction of queries to replace with prefixes
+PREFIX_BUFFER_SIZE=${PREFIX_BUFFER_SIZE:-500}
+PREFIX_MIN_FRAC=${PREFIX_MIN_FRAC:-0.15}
+PREFIX_MAX_FRAC=${PREFIX_MAX_FRAC:-0.75}
+PREFIX_FROM=${PREFIX_FROM:-all}           # all | correct | incorrect
+
+# Derive a unique output dir from the experiment configuration
+EXP_TAG="baseline"
+if [ "${PCRE}" = "1" ]; then EXP_TAG="pcre_${PREFIX_FROM}"; fi
+if [ "${MBE_LOG}" = "1" ]; then EXP_TAG="${EXP_TAG}_mbe"; fi
+OUTPUT_DIR="${PROJECT_DIR}/output/grpo_${EXP_TAG}"
+
+# ---------------------------------------------------------------
 MBE_FLAGS=""
 if [ "${MBE_LOG}" = "1" ]; then
     MBE_FLAGS="--mbe_log --mbe_log_steps ${MBE_LOG_STEPS} --mbe_log_sample_k ${MBE_LOG_SAMPLE_K}"
-    echo ">>> MBE dynamics logging ON  (every ${MBE_LOG_STEPS} steps, ${MBE_LOG_SAMPLE_K} samples) → ${OUTPUT_DIR}/mbe_dynamics.jsonl"
+    echo ">>> MBE logging ON  (every ${MBE_LOG_STEPS} steps, ${MBE_LOG_SAMPLE_K} samples)"
 fi
+
+PCRE_FLAGS=""
+if [ "${PCRE}" = "1" ]; then
+    PCRE_FLAGS="--prefix_rollout \
+        --prefix_augment_prob ${PREFIX_AUGMENT_PROB} \
+        --prefix_buffer_size ${PREFIX_BUFFER_SIZE} \
+        --prefix_min_frac ${PREFIX_MIN_FRAC} \
+        --prefix_max_frac ${PREFIX_MAX_FRAC} \
+        --prefix_from_correct ${PREFIX_FROM}"
+    echo ">>> PCRE ON  (prob=${PREFIX_AUGMENT_PROB}, buf=${PREFIX_BUFFER_SIZE}, frac=[${PREFIX_MIN_FRAC},${PREFIX_MAX_FRAC}], from=${PREFIX_FROM})"
+fi
+
+echo ">>> Output dir: ${OUTPUT_DIR}"
+
+export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 
 mkdir -p "${OUTPUT_DIR}"
 
@@ -39,14 +68,14 @@ if fuser ${PORT}/tcp 2>/dev/null; then
 fi
 
 # =============================================
-# (1) Spin up vLLM server (TP=2 on GPUs 2,3)
+# (1) Spin up vLLM server (TP=1 on GPU 0)
 # =============================================
 VLLM_LOG="${OUTPUT_DIR}/vllm.log"
-echo ">>> Starting vLLM server for ${MODEL_NAME} on GPUs 2,3 (TP=2) ..."
+echo ">>> Starting vLLM server for ${MODEL_NAME} on GPU 0 (TP=1) ..."
 echo ">>> vLLM logs: ${VLLM_LOG}"
-CUDA_VISIBLE_DEVICES=2,3 trl vllm-serve \
+CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
     --model ${MODEL_NAME} \
-    --tensor-parallel-size 2 \
+    --tensor-parallel-size 1 \
     --port ${PORT} \
     > "${VLLM_LOG}" 2>&1 &
 VLLM_PID=$!
@@ -55,13 +84,13 @@ until curl -s http://localhost:${PORT}/health > /dev/null 2>&1; do sleep 2; done
 echo ">>> vLLM server ready."
 
 # =============================================
-# (2) Train on GPUs 0,1 via accelerate
+# (2) Train on GPU 0 via accelerate
 # =============================================
 TRAIN_LOG="${OUTPUT_DIR}/train.log"
-echo ">>> Training ${MODEL_NAME} on GPUs 0,1 ..."
+echo ">>> Training ${MODEL_NAME} on GPU 1 ..."
 echo ">>> Training logs: ${TRAIN_LOG}"
 echo ">>> Follow live: tail -f ${TRAIN_LOG}"
-CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
+CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 \
     --num_machines 1 --mixed_precision bf16 --dynamo_backend no \
     "${SCRIPT_DIR}/grpo_gsm8k.py" \
     --model ${MODEL_NAME} \
@@ -77,6 +106,7 @@ CUDA_VISIBLE_DEVICES=0,1 accelerate launch --num_processes 2 \
     --save_strategy no \
     --report_to none \
     ${MBE_FLAGS} \
+    ${PCRE_FLAGS} \
     2>&1 | tee "${TRAIN_LOG}"
 
 # =============================================
