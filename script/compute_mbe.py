@@ -56,7 +56,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rollouts", required=True, help="Path to rollouts.jsonl from RolloutRecorder")
     parser.add_argument("--output",   required=True, help="Path to write mbe_dynamics.jsonl")
-    parser.add_argument("--model",    default="Qwen/Qwen3-4B")
+    parser.add_argument("--model",    default="Qwen/Qwen3-1.7B")
     parser.add_argument("--device",   default="cuda:0")
     args = parser.parse_args()
 

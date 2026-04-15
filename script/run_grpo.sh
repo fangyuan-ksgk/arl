@@ -9,7 +9,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-MODEL_NAME="Qwen/Qwen3-4B"
+MODEL_NAME="Qwen/Qwen3-1.7B"
 PORT=8880
 
 # ---------------------------------------------------------------
@@ -98,7 +98,7 @@ CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 \
     --max_steps 200 \
     --use_vllm --vllm_mode server --vllm_server_port ${PORT} \
     --num_generations 4 \
-    --max_completion_length 256 \
+    --max_completion_length 1024 \
     --per_device_train_batch_size 4 \
     --gradient_accumulation_steps 16 \
     --learning_rate 3e-6 \
