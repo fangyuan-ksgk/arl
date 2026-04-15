@@ -1,7 +1,7 @@
 #!/bin/bash
 # GRPO on GSM8K — 2-GPU layout
-#   GPU 0 : vLLM server (TP=1)  ← GPU 0 avoids NVMLError_InvalidArgument
-#   GPU 1 : training   (accelerate, 1 process)
+#   GPU 1 : vLLM server (TP=1)
+#   GPU 0 : training   (accelerate, 1 process)
 #
 # Override any variable from the command line, e.g.:
 #   PCRE=1 PREFIX_FROM=correct MBE_LOG=1 bash script/run_grpo.sh
@@ -68,12 +68,12 @@ if fuser ${PORT}/tcp 2>/dev/null; then
 fi
 
 # =============================================
-# (1) Spin up vLLM server (TP=1 on GPU 0)
+# (1) Spin up vLLM server (TP=1 on GPU 1)
 # =============================================
 VLLM_LOG="${OUTPUT_DIR}/vllm.log"
-echo ">>> Starting vLLM server for ${MODEL_NAME} on GPU 0 (TP=1) ..."
+echo ">>> Starting vLLM server for ${MODEL_NAME} on GPU 1 (TP=1) ..."
 echo ">>> vLLM logs: ${VLLM_LOG}"
-CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
+CUDA_VISIBLE_DEVICES=1 trl vllm-serve \
     --model ${MODEL_NAME} \
     --tensor-parallel-size 1 \
     --port ${PORT} \
@@ -87,10 +87,10 @@ echo ">>> vLLM server ready."
 # (2) Train on GPU 0 via accelerate
 # =============================================
 TRAIN_LOG="${OUTPUT_DIR}/train.log"
-echo ">>> Training ${MODEL_NAME} on GPU 1 ..."
+echo ">>> Training ${MODEL_NAME} on GPU 0 ..."
 echo ">>> Training logs: ${TRAIN_LOG}"
 echo ">>> Follow live: tail -f ${TRAIN_LOG}"
-CUDA_VISIBLE_DEVICES=1 accelerate launch --num_processes 1 \
+CUDA_VISIBLE_DEVICES=0 accelerate launch --num_processes 1 \
     --num_machines 1 --mixed_precision bf16 --dynamo_backend no \
     "${SCRIPT_DIR}/grpo_gsm8k.py" \
     --model ${MODEL_NAME} \
@@ -118,7 +118,21 @@ ps aux | grep -iE "vllm|EngineCore" | grep -v grep | awk '{print $2}' | xargs ki
 sleep 3
 
 # =============================================
-# (4) Rollout analysis
+# (4) MBE computation (offline, if enabled)
+# =============================================
+if [ "${MBE_LOG}" = "1" ]; then
+    MBE_OUT="${OUTPUT_DIR}/mbe_dynamics.jsonl"
+    echo ">>> Computing MBE traces from rollouts (GPU 0) → ${MBE_OUT} ..."
+    CUDA_VISIBLE_DEVICES=0 python "${SCRIPT_DIR}/compute_mbe.py" \
+        --rollouts "${OUTPUT_DIR}/rollouts.jsonl" \
+        --output   "${MBE_OUT}" \
+        --model    "${MODEL_NAME}" \
+        --device   cuda:0 \
+        2>&1 | tee "${OUTPUT_DIR}/compute_mbe.log"
+fi
+
+# =============================================
+# (5) Rollout analysis
 # =============================================
 ANALYSIS_LOG="${OUTPUT_DIR}/analysis.log"
 echo ">>> Rollout analysis ..."
@@ -133,3 +147,8 @@ echo ">>> Logs:"
 echo ">>>   vLLM:     ${VLLM_LOG}"
 echo ">>>   Training: ${TRAIN_LOG}"
 echo ">>>   Analysis: ${ANALYSIS_LOG}"
+
+
+
+
+

@@ -175,7 +175,9 @@ class MBEDynamicsLogger:
         if self.model is None:
             return
 
-        device = next(self.model.parameters()).device
+        # Run on CPU to avoid OOM — training model occupies GPU memory
+        # during reward computation. Slower but reliable.
+        device = torch.device("cpu")
 
         indices = list(range(len(completions)))
         if len(indices) > self.sample_k:
@@ -207,6 +209,14 @@ class MBEDynamicsLogger:
 
         with open(self.log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
+
+        n_correct = sum(1 for r in rollout_records if r["correct"])
+        print(
+            f"[MBEDynamicsLogger] step={self._call_idx}  "
+            f"saved {len(rollout_records)} rollouts "
+            f"({n_correct} correct, {len(rollout_records)-n_correct} incorrect) "
+            f"→ {self.log_path}"
+        )
 
     # ------------------------------------------------------------------ #
     # Reward-function wrapper (logs as side-effect, returns zeros)        #

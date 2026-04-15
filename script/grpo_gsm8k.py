@@ -233,20 +233,22 @@ def main():
     else:
         model = args.model  # let TRL handle device placement for colocate/no-vllm
 
-    # MBE dynamics logger (logs as side-effect, zero reward signal)
+    # Rollout recorder: lightweight text-only logger, zero forward-pass overhead.
+    # Run script/compute_mbe.py after training to get full MBE/CE traces.
     mbe_logger = None
     if args.mbe_log:
-        from src.mbe_logger import MBEDynamicsLogger
+        from src.mbe_logger import RolloutRecorder
         tokenizer_for_log = AutoTokenizer.from_pretrained(args.model)
-        log_path = os.path.join(args.output_dir, "mbe_dynamics.jsonl")
-        mbe_logger = MBEDynamicsLogger(
+        log_path = os.path.join(args.output_dir, "rollouts.jsonl")
+        mbe_logger = RolloutRecorder(
             tokenizer_for_log,
             log_path=log_path,
             log_steps=args.mbe_log_steps,
             sample_k=args.mbe_log_sample_k,
         )
-        print(f"MBE dynamics logger enabled → {log_path}  "
-              f"(every {args.mbe_log_steps} steps, {args.mbe_log_sample_k} samples/step)")
+        print(f"Rollout recorder enabled → {log_path}  "
+              f"(every {args.mbe_log_steps} steps, {args.mbe_log_sample_k} samples/step)"
+              f"\nRun script/compute_mbe.py after training to compute MBE traces.")
 
     # Prefix rollout buffer (created before reward_funcs so collector can reference it)
     prefix_buffer = None
@@ -317,8 +319,8 @@ def main():
         peft_config=peft_config,
     )
 
-    # Bind model ref for MBE forward passes
-    if mbe_logger is not None:
+    # Bind model ref for MBE forward passes (MBEDynamicsLogger only, not RolloutRecorder)
+    if mbe_logger is not None and hasattr(mbe_logger, "set_model"):
         mbe_logger.set_model(trainer.model)
     if mbe_reward_obj is not None:
         mbe_reward_obj.set_model(trainer.model)
