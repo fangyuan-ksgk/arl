@@ -93,7 +93,7 @@ def load_gsm8k():
         return ""
 
     def format_example(example):
-        example["prompt"] = [{"role": "user", "content": example["question"]}]
+        example["prompt"] = [{"role": "user", "content": example["question"] + " /no_think"}]
         example["gold_answer"] = extract_gold_answer(example["answer"])
         return example
 
