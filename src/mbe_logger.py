@@ -188,7 +188,7 @@ class MBEDynamicsLogger:
             try:
                 rec = self._analyse_rollout(
                     prompt          = prompts[i],
-                    completion_text = completions[i][0]["content"],
+                    completion_text = completions[i][0]["content"] if isinstance(completions[i], list) else str(completions[i]),
                     correct         = correct_flags[i],
                     device          = device,
                 )
@@ -244,4 +244,88 @@ class MBEDynamicsLogger:
             return [0.0] * len(completions)
 
         _reward.__name__ = "mbe_dynamics_logger"
+        return _reward
+
+
+# ---------------------------------------------------------------------------
+# Phase-1 only: lightweight rollout recorder (zero forward pass)
+# ---------------------------------------------------------------------------
+
+class RolloutRecorder:
+    """
+    Saves (step, prompt_text, completion_text, correct) tuples to JSONL
+    during training with zero forward-pass overhead.
+
+    Run compute_mbe.py on the output JSONL after training to get MBE traces.
+    """
+
+    def __init__(self, tokenizer, log_path="rollouts.jsonl", log_steps=1, sample_k=4):
+        self.tokenizer = tokenizer
+        self.log_path  = log_path
+        self.log_steps = log_steps
+        self.sample_k  = sample_k
+        self._call_idx = 0
+        os.makedirs(os.path.dirname(os.path.abspath(log_path)), exist_ok=True)
+
+    def as_reward(self, correctness_fn=None):
+        recorder = self
+
+        def _reward(prompts, completions, gold_answer=None, **kwargs):
+            recorder._call_idx += 1
+            if recorder._call_idx % recorder.log_steps != 0:
+                return [0.0] * len(completions)
+            if int(os.environ.get("LOCAL_RANK", "0")) != 0:
+                return [0.0] * len(completions)
+
+            if correctness_fn is not None and gold_answer is not None:
+                rewards = correctness_fn(
+                    completions=completions, gold_answer=gold_answer,
+                    prompts=prompts, **kwargs,
+                )
+                correct_flags = [r > 0.0 for r in rewards]
+            else:
+                correct_flags = [False] * len(completions)
+
+            indices = list(range(len(completions)))
+            if len(indices) > recorder.sample_k:
+                indices = random.sample(indices, recorder.sample_k)
+
+            records = []
+            for i in indices:
+                prompt = prompts[i]
+                if isinstance(prompt, list):
+                    try:
+                        prompt_text = recorder.tokenizer.apply_chat_template(
+                            prompt, tokenize=False, add_generation_prompt=True
+                        )
+                    except Exception:
+                        prompt_text = str(prompt)
+                else:
+                    prompt_text = str(prompt)
+
+                comp = completions[i]
+                comp_text = comp[0]["content"] if isinstance(comp, list) and comp and isinstance(comp[0], dict) else str(comp)
+
+                records.append({
+                    "step"      : recorder._call_idx,
+                    "prompt"    : prompt_text,
+                    "completion": comp_text,
+                    "correct"   : bool(correct_flags[i]),
+                })
+
+            with open(recorder.log_path, "a") as f:
+                for rec in records:
+                    f.write(json.dumps(rec) + "\n")
+
+            n_correct = sum(1 for r in records if r["correct"])
+            print(
+                f"[RolloutRecorder] step={recorder._call_idx}  "
+                f"saved {len(records)} rollouts "
+                f"({n_correct} correct, {len(records)-n_correct} incorrect) "
+                f"→ {recorder.log_path}"
+            )
+
+            return [0.0] * len(completions)
+
+        _reward.__name__ = "rollout_recorder"
         return _reward

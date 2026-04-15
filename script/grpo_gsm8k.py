@@ -41,10 +41,27 @@ def extract_answer_from_completion(text: str) -> str:
     return ""
 
 
+def _completion_text(completion) -> str:
+    """Normalise completion to plain text regardless of TRL format.
+
+    TRL passes completions as list-of-dicts when the prompt is a message list,
+    but as a plain string when the prompt is already a pre-formatted string
+    (e.g. from PrefixAugmentedDataset).
+    """
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list) and completion:
+        first = completion[0]
+        if isinstance(first, dict):
+            return first.get("content", "")
+        return str(first)
+    return str(completion)
+
+
 def correctness_reward(completions, gold_answer, **kwargs):
     rewards = []
     for completion, gold in zip(completions, gold_answer):
-        text = completion[0]["content"]
+        text = _completion_text(completion)
         predicted = extract_answer_from_completion(text)
         try:
             correct = float(predicted) == float(gold)
@@ -57,7 +74,7 @@ def correctness_reward(completions, gold_answer, **kwargs):
 def format_reward(completions, **kwargs):
     rewards = []
     for completion in completions:
-        text = completion[0]["content"]
+        text = _completion_text(completion)
         has_format = bool(re.search(r"####\s*[\d,\.\-]+", text))
         rewards.append(0.5 if has_format else 0.0)
     return rewards
