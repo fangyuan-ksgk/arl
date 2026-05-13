@@ -30,7 +30,7 @@ __all__ = [
     # prompt formatting
     "SYSTEM_PROMPT", "to_chat", "build_datasets",
     # rewards
-    "completion_text", "extract_expr",
+    "completion_text", "_text", "extract_expr",
     "correctness_reward", "format_reward",
 ]
 
@@ -203,6 +203,10 @@ def completion_text(completion: Any) -> str:
     if isinstance(completion, list) and completion and isinstance(completion[0], dict):
         return completion[0].get("content", "")
     return str(completion)
+
+
+# Short alias used by the rollout logger and other diagnostic call sites.
+_text = completion_text
 
 
 def extract_expr(text: str) -> str:
