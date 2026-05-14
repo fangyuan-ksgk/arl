@@ -80,6 +80,19 @@ brittle coefficient sweeps to balance the two. What is missing is a
 \emph{single} reward whose structure already prices the cost of additional
 tokens against their contribution to solving the problem.
 
+A striking side-symptom makes the severity of redundancy concrete: under a
+\emph{fixed} CoT token budget \(T_{\max}\), larger models in the same family
+can underperform smaller ones on the same task, simply because their
+characteristic CoT exceeds \(T_{\max}\) and is truncated before the answer
+is emitted. Equivalently, holding accuracy fixed, the CoT budget required
+grows super-linearly with model scale even when the underlying problem does
+not. We document this size--budget inversion empirically on Game of 24 in
+Section~\ref{sec:exp}; it is, in effect, a scale-dependent
+manifestation of D1: the larger the model, the more of its emitted chain is
+filler whose only effect is to push the answer past the budget cliff. A
+principled reward should therefore tighten as model scale increases, not
+require a larger \(T_{\max}\) to compensate.
+
 \paragraph{(D2) No principled per-token signal.}
 The reward in GRPO is sparse and trajectory-level. Every intermediate token
 inherits the same advantage estimate, leaving the per-token credit assignment
@@ -297,6 +310,49 @@ pathology of vanilla GRPO at its source.
 \textit{This section is under active development.} We outline below the
 experiments that will populate this section.
 
+\subsection{Research Questions}
+\label{subsec:rq}
+
+The Experiments section is organised around three head-to-head comparisons
+between vanilla GRPO and GRPO augmented with the decoding-velocity reward
+(plus the answer buffer \(\mathcal{A}_q\) and prefix buffer \(\mathcal{P}_q\)
+of Section~\ref{sec:method}). Each question targets one of the drawbacks
+that the method is designed to address.
+
+\paragraph{(RQ1) Does the velocity reward shorten the CoT without hurting
+accuracy?}
+This is the causal test for \textbf{D1}. Under a matched training budget and
+a fixed token cap \(T_{\max}\), we compare mean CoT length and pass-rate
+trajectories between the two algorithms. The hypothesis is that the
+velocity reward, by pricing redundant tokens at zero per-token contribution,
+drives the emitted chain to a substantially shorter steady state while
+preserving (or improving) accuracy --- something a hand-tuned length
+penalty achieves only by trading against correctness.
+
+\paragraph{(RQ2) Does the velocity reward break the zero-pass@\(K\) dead
+zone?}
+This is the test for \textbf{D3}. We isolate the hardest difficulty bucket
+on which vanilla GRPO records pass-rate \(\approx 0\) for the entire
+training run, and ask whether the dense per-token signal --- combined with
+the answer buffer that injects known-correct trajectories into the group
+--- enables non-trivial learning where GRPO is structurally stuck. The
+hypothesis is that the velocity reward provides gradient even when no
+sampled trajectory is correct, because \(v_t\) is computed against a
+reference answer rather than against the group.
+
+\paragraph{(RQ3) Does the prefix buffer increase solution diversity?}
+This probes the answer/prefix-buffer design rather than a specific GRPO
+drawback. We measure the number of distinct correct expressions per puzzle
+emitted by the trained policy under temperature sampling, and compare
+against vanilla GRPO. We expect the prefix buffer \(\mathcal{P}_q\), by
+randomly priming rollouts with previously discovered correct prefixes, to
+keep multiple solution modes simultaneously near the top of the logit
+ranking, rather than letting GRPO collapse onto a single canonical CoT per
+puzzle. We are explicit that an LLM cannot store \(K\) genuinely
+independent responses to a single prompt without something like a
+prefix-conditioning mechanism: \(\mathcal{P}_q\) is precisely that
+mechanism, and RQ3 is the empirical check that it works.
+
 \subsection{Setup}
 
 \paragraph{Models and tasks.}
@@ -304,8 +360,57 @@ experiments that will populate this section.
 MATH and a code-reasoning benchmark.
 
 \paragraph{Baselines.}
-Vanilla GRPO with verifiable correctness reward; GRPO with a hand-tuned
-length penalty; SFT-only reference.
+We organise baselines in three groups, each isolating a different reason
+the velocity reward might or might not help.
+
+\textit{(A) Non-RL on correct trajectories.} These are the floor: do we
+need RL at all, or does fine-tuning on correct rollouts suffice?
+\begin{itemize}
+  \item \textbf{SFT} on a fixed pool of canonical correct solutions.
+  \item \textbf{Rejection-sampling fine-tuning} (RFT / ReST\textsuperscript{EM}~\citep{yuan2023rft, singh2023restem}):
+        sample, filter by verifier, supervised fine-tune, repeat.
+  \item \textbf{STaR}~\citep{zelikman2022star}: bootstrap rationales by
+        SFT on filtered self-generated chains, with rationalisation on
+        problems the model fails (the answer is revealed and a rationale
+        is generated to match). This is the closest non-RL analogue to
+        our prefix buffer \(\mathcal{P}_q\).
+\end{itemize}
+
+\textit{(B) RL with a sparse trajectory reward.} These isolate the value
+of moving from trajectory-level to per-token credit.
+\begin{itemize}
+  \item \textbf{Vanilla GRPO}~\citep{shao2024deepseekmath, deepseek2025r1}
+        with a verifiable correctness reward.
+  \item \textbf{GRPO + linear length penalty}: \(R \leftarrow R - \lambda |o|\).
+        The naive variant most practitioners try first; expected to trade
+        accuracy for length.
+  \item \textbf{GRPO + outcome-conditional length penalty} (Kimi-1.5
+        style~\citep{kimi2025k15}): penalise length only on correct
+        rollouts. The strongest hand-tuned baseline for D1; the one that
+        could plausibly match the velocity reward's
+        length--accuracy frontier.
+\end{itemize}
+For both penalised variants we report a sweep over \(\lambda\) and plot
+the resulting (length, accuracy) Pareto curve, against which the
+velocity-reward result is a single point.
+
+\textit{(C) RL with a dense per-token reward.} These are the closest
+competitors and isolate whether \emph{velocity-derived} density (change in
+answer likelihood) is the right kind, as opposed to other analytic or
+learned per-token signals.
+\begin{itemize}
+  \item \textbf{PRIME}~\citep{cui2025prime}: train an implicit process
+        reward model with a DPO-style objective on outcome labels; its
+        per-token log-ratio
+        \(\beta\bigl[\log\pi_\phi(o_t \mid \cdot) - \log\pi_{\text{ref}}(o_t \mid \cdot)\bigr]\)
+        is used as the dense RL signal. Like our velocity reward, the
+        per-token decomposition is analytic; unlike ours, the signal
+        measures policy-vs-reference deviation rather than change in
+        the answer posterior.
+  \item \textbf{PRM-guided PPO}~\citep{lightman2023letsverify, wang2024mathshepherd}:
+        a learned step-level verifier supplies dense reward. Different
+        mechanism (learned vs. analytic), same goal as PRIME and ours.
+\end{itemize}
 
 \paragraph{Implementation of \(r\) and \(v\).}
 \textit{TBD.} We will detail how the reference answer \(a\) (or set of

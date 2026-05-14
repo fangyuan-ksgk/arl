@@ -7,9 +7,9 @@
 \@writefile{toc}{\contentsline {section}{\numberline {2}The Four Drawbacks of GRPO}{1}{section.2}\protected@file@percent }
 \newlabel{sec:problem}{{2}{1}{The Four Drawbacks of GRPO}{section.2}{}}
 \@writefile{toc}{\contentsline {paragraph}{(D1) CoT redundancy.}{1}{section*.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{(D2) No principled per-token signal.}{1}{section*.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{(D3) The zero-pass@\(K\) dead zone.}{1}{section*.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{(D4) Indiscriminate credit assignment.}{1}{section*.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(D2) No principled per-token signal.}{2}{section*.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(D3) The zero-pass@\(K\) dead zone.}{2}{section*.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(D4) Indiscriminate credit assignment.}{2}{section*.4}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {3}Method: Decoding-Velocity Reward}{2}{section.3}\protected@file@percent }
 \newlabel{sec:method}{{3}{2}{Method: Decoding-Velocity Reward}{section.3}{}}
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Setup and Notation}{2}{subsection.3.1}\protected@file@percent }
@@ -30,21 +30,39 @@
 \@writefile{toc}{\contentsline {subsection}{\numberline {3.7}What This Buys Us}{3}{subsection.3.7}\protected@file@percent }
 \newlabel{subsec:buys}{{3.7}{3}{What This Buys Us}{subsection.3.7}{}}
 \@writefile{toc}{\contentsline {paragraph}{D1 -- CoT redundancy is priced at every scale.}{3}{section*.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{D2 -- The per-token signal is exactly the sequence-level reward.}{3}{section*.6}\protected@file@percent }
-\bibdata{iclr2026_conference}
-\bibcite{deepseek2025r1}{{1}{2025}{{DeepSeek-AI}}{{}}}
-\bibcite{shao2024deepseekmath}{{2}{2024}{{Shao et~al.}}{{Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu, and Guo}}}
-\bibstyle{iclr2026_conference}
+\@writefile{toc}{\contentsline {paragraph}{D2 -- The per-token signal is exactly the sequence-level reward.}{4}{section*.6}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{D3 -- Toward learning, not just sharpening (hypothesis).}{4}{section*.7}\protected@file@percent }
 \@writefile{toc}{\contentsline {paragraph}{D4 -- Credit follows contribution, not outcome.}{4}{section*.8}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {4}Experiments}{4}{section.4}\protected@file@percent }
 \newlabel{sec:exp}{{4}{4}{Experiments}{section.4}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Setup}{4}{subsection.4.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Models and tasks.}{4}{section*.9}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Baselines.}{4}{section*.10}\protected@file@percent }
-\@writefile{toc}{\contentsline {paragraph}{Implementation of \(r\) and \(v\).}{4}{section*.11}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Main Results}{4}{subsection.4.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Ablations}{4}{subsection.4.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Diagnostics}{4}{subsection.4.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix}{5}{appendix.A}\protected@file@percent }
-\gdef \@abspage@last{5}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Research Questions}{4}{subsection.4.1}\protected@file@percent }
+\newlabel{subsec:rq}{{4.1}{4}{Research Questions}{subsection.4.1}{}}
+\@writefile{toc}{\contentsline {paragraph}{(RQ1) Does the velocity reward shorten the CoT without hurting accuracy?}{4}{section*.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(RQ2) Does the velocity reward break the zero-pass@\(K\) dead zone?}{4}{section*.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{(RQ3) Does the prefix buffer increase solution diversity?}{4}{section*.11}\protected@file@percent }
+\citation{yuan2023rft,singh2023restem}
+\citation{zelikman2022star}
+\citation{shao2024deepseekmath,deepseek2025r1}
+\citation{kimi2025k15}
+\citation{cui2025prime}
+\citation{lightman2023letsverify,wang2024mathshepherd}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Setup}{5}{subsection.4.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Models and tasks.}{5}{section*.12}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Baselines.}{5}{section*.13}\protected@file@percent }
+\@writefile{toc}{\contentsline {paragraph}{Implementation of \(r\) and \(v\).}{5}{section*.14}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Main Results}{5}{subsection.4.3}\protected@file@percent }
+\bibdata{iclr2026_conference}
+\bibcite{cui2025prime}{{1}{2025}{{Cui et~al.}}{{Cui, Yuan, Wang, Wang, Li, He, Fan, Yu, Xu, Chen, Yuan, Chen, Zhang, Lv, Wang, Yao, Han, Peng, Cheng, Liu, Sun, Zhou, and Ding}}}
+\bibcite{deepseek2025r1}{{2}{2025}{{DeepSeek-AI}}{{}}}
+\bibcite{kimi2025k15}{{3}{2025}{{Kimi Team}}{{}}}
+\bibcite{lightman2023letsverify}{{4}{2024}{{Lightman et~al.}}{{Lightman, Kosaraju, Burda, Edwards, Baker, Lee, Leike, Schulman, Sutskever, and Cobbe}}}
+\bibcite{shao2024deepseekmath}{{5}{2024}{{Shao et~al.}}{{Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu, and Guo}}}
+\bibcite{singh2023restem}{{6}{2024}{{Singh et~al.}}{{Singh, Co-Reyes, Agarwal, Anand, Patil, Garcia, Liu, Harrison, Lee, Xu, et~al.}}}
+\bibcite{wang2024mathshepherd}{{7}{2024}{{Wang et~al.}}{{Wang, Li, Shao, Xu, Dai, Li, Chen, Wu, and Sui}}}
+\bibcite{yuan2023rft}{{8}{2023}{{Yuan et~al.}}{{Yuan, Yuan, Li, Dong, Lu, Tan, Zhou, and Zhou}}}
+\bibcite{zelikman2022star}{{9}{2022}{{Zelikman et~al.}}{{Zelikman, Wu, Mu, and Goodman}}}
+\bibstyle{iclr2026_conference}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Ablations}{6}{subsection.4.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.5}Diagnostics}{6}{subsection.4.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {A}Appendix}{6}{appendix.A}\protected@file@percent }
+\gdef \@abspage@last{6}

@@ -1,20 +1,21 @@
 # Fdb version 4
-["bibtex main"] 1778654627.61999 "main.aux" "main.bbl" "main" 1778656790.32161 0
-  "./iclr2026_conference.bib" 1778641279.47951 1204 5955a204fe628dd73de08f4537828bd5 ""
+["bibtex main"] 1778687657.57119 "main.aux" "main.bbl" "main" 1778687658.37935 0
+  "./iclr2026_conference.bib" 1778687560.29172 3616 190c3ada188308b71169583f026ed8ee ""
   "./iclr2026_conference.bst" 1778639952.4247 26973 af983813ca1a1414954dbceae7baa2a1 ""
-  "main.aux" 1778656790.1049 4676 86ae37f4c736308179800ff3d47ec102 "pdflatex"
+  "main.aux" 1778687658.15525 6349 e66408b37f4465e1dc41d66b4461f62d "pdflatex"
   (generated)
   "main.bbl"
   "main.blg"
   (rewritten before read)
-["pdflatex"] 1778656789.68021 "/Users/fangyuanyu/Implementation/arl/manuscript/main.tex" "main.pdf" "main" 1778656790.32172 0
-  "/Users/fangyuanyu/Implementation/arl/manuscript/main.tex" 1778656789.48635 15141 580520e484018c8243dcd421fa6159ba ""
+["pdflatex"] 1778687657.67469 "/Users/fangyuanyu/Implementation/arl/manuscript/main.tex" "main.pdf" "main" 1778687658.37947 0
+  "/Users/fangyuanyu/Implementation/arl/manuscript/main.tex" 1778687655.62724 21126 1580d80b545c675f64c4d930cca3f89c ""
   "/usr/local/texlive/2024/texmf-dist/fonts/enc/dvips/base/8r.enc" 1165713224 4850 80dc9bab7f31fb78a000ccfed0e27cab ""
   "/usr/local/texlive/2024/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/helvetic/phvb.tfm" 1136768653 2300 14616918391efa49ac8b481a75fbdc1a ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmb7t.tfm" 1136768653 2172 fd0c924230362ff848a33632ed45dc23 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmb8r.tfm" 1136768653 4524 6bce29db5bc272ba5f332261583fee9c ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmr7t.tfm" 1136768653 2124 2601a75482e9426d33db523edf23570a ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmr8c.tfm" 1136768653 1352 fa28a7e6d323c65ce7d13d5342ff6be2 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmr8r.tfm" 1136768653 4408 25b74d011a4c66b7f212c0cc3c90061b ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmrc7t.tfm" 1136768653 2680 312a2d12b1f1df8ee0212e7ba1962402 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/tfm/adobe/times/ptmri7t.tfm" 1136768653 2288 f478fc8fed18759effb59f3dad7f3084 ""
@@ -49,6 +50,7 @@
   "/usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmri8a.pfb" 1136849748 45458 a3faba884469519614ca56ba5f6b1de1 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/vf/adobe/times/ptmb7t.vf" 1136768653 1372 788387fea833ef5963f4c5bffe33eb89 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/vf/adobe/times/ptmr7t.vf" 1136768653 1380 0ea3a3370054be6da6acd929ec569f06 ""
+  "/usr/local/texlive/2024/texmf-dist/fonts/vf/adobe/times/ptmr8c.vf" 1136768653 3556 8a9a6dcbcd146ef985683f677f4758a6 ""
   "/usr/local/texlive/2024/texmf-dist/fonts/vf/adobe/times/ptmrc7t.vf" 1136768653 1948 7330aeef3af211edff3b35fb2c12a0fd ""
   "/usr/local/texlive/2024/texmf-dist/fonts/vf/adobe/times/ptmri7t.vf" 1136768653 1384 a9d8adaf491ce34e5fba99dc7bbe5f39 ""
   "/usr/local/texlive/2024/texmf-dist/tex/context/base/mkii/supp-pdf.mkii" 1461363279 71627 94eb9990bed73c364d7f53f960cc8c5b ""
@@ -96,6 +98,7 @@
   "/usr/local/texlive/2024/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def" 1708463273 30006 3d512c0edd558928ddea1690180ef77e ""
   "/usr/local/texlive/2024/texmf-dist/tex/latex/psnfss/ot1ptm.fd" 1137110629 961 15056f4a61917ceed3a44e4ac11fcc52 ""
   "/usr/local/texlive/2024/texmf-dist/tex/latex/psnfss/times.sty" 1586716065 856 8e0e5c8cca7b18e0400f97f5a2b90a99 ""
+  "/usr/local/texlive/2024/texmf-dist/tex/latex/psnfss/ts1ptm.fd" 1137110629 619 96f56dc5d1ef1fe1121f1cfeec70ee0c ""
   "/usr/local/texlive/2024/texmf-dist/tex/latex/refcount/refcount.sty" 1576624809 9878 9e94e8fa600d95f9c7731bb21dfb67a4 ""
   "/usr/local/texlive/2024/texmf-dist/tex/latex/rerunfilecheck/rerunfilecheck.sty" 1657483315 9714 ba3194bd52c8499b3f1e3eb91d409670 ""
   "/usr/local/texlive/2024/texmf-dist/tex/latex/tools/bm.sty" 1698869629 13231 2c742011581e2bf297e33520567d9464 ""
@@ -107,10 +110,10 @@
   "/usr/local/texlive/2024/texmf.cnf" 1710266656 577 e590dabc9e28c5b61546e15f63eebcdf ""
   "fancyhdr.sty" 1778639952.42535 20521 e5d13d98d57bd53d4fed3aa61bd29c86 ""
   "iclr2026_conference.sty" 1778639952.42598 9025 a040392a6cfee8dc54aae17eb2635282 ""
-  "main.aux" 1778656790.1049 4676 86ae37f4c736308179800ff3d47ec102 "pdflatex"
-  "main.bbl" 1778654627.7193 881 1eece236c77a7d1480dcf3c0d7d05eac "bibtex main"
-  "main.out" 1778656790.10554 2348 d57c4a1fa57413fd7391353d9e007796 "pdflatex"
-  "main.tex" 1778656789.48635 15141 580520e484018c8243dcd421fa6159ba ""
+  "main.aux" 1778687658.15525 6349 e66408b37f4465e1dc41d66b4461f62d "pdflatex"
+  "main.bbl" 1778687657.67249 3500 de7cf88021ba8c8c3a3b71d77ae25519 "bibtex main"
+  "main.out" 1778687658.15604 2499 85e66dadb9d42874e9316add86291c3f "pdflatex"
+  "main.tex" 1778687655.62724 21126 1580d80b545c675f64c4d930cca3f89c ""
   "math_commands.tex" 1778639952.42516 12284 a71653715108dc62b66e3a0bde0307d8 ""
   "natbib.sty" 1778639952.42564 45154 40088ce024445d7ee2bca59e704cdd01 ""
   (generated)
