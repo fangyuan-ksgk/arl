@@ -224,3 +224,59 @@ def correctness_reward(completions, numbers, **_) -> List[float]:
 
 def format_reward(completions, **_) -> List[float]:
     return [0.2 if re.search(r"####\s*\S", completion_text(c)) else 0.0 for c in completions]
+
+
+# ============================
+# Logging Rollout Statistics
+# ============================
+
+class RolloutLogger:
+        __name__ = "rollout_logger"
+
+        def __init__(self, train_path: Path, eval_path: Path, tokenizer):
+            self.train_path = train_path
+            self.eval_path = eval_path
+            self.in_eval = False
+            self.train_step = 0   # reward-fn call counter (train)
+            self.eval_step = 0    # reward-fn call counter (eval)
+            # Trainer.state.global_step at the moment eval was triggered.
+            # Stamped by EvalFlagCallback; defaults to -1 before the first
+            # training step so pre-train smoke-eval is still distinguishable.
+            self.global_step = -1
+            self.tokenizer = tokenizer
+
+        def __call__(self, completions, numbers, **_):
+            path = self.eval_path if self.in_eval else self.train_path
+            step = self.eval_step if self.in_eval else self.train_step
+            with path.open("a") as f:
+                for i, (c, nums) in enumerate(zip(completions, numbers)):
+                    text = _text(c)
+                    expr = extract_expr(text)
+                    correct = verify_24(list(nums), expr)
+                    n_tok = len(self.tokenizer.encode(text, add_special_tokens=False))
+        
+                    think_idx = text.find("</think>")
+                    m_ans = re.search(r"####", text)
+                    if think_idx >= 0:
+                        cot_text = text[:think_idx]
+                    elif m_ans is not None:
+                        cot_text = text[: m_ans.start()]
+                    else:
+                        cot_text = text
+                    n_cot_tok = len(self.tokenizer.encode(cot_text, add_special_tokens=False))
+                    f.write(json.dumps({
+                        "step": step, "idx": i, "numbers": list(nums),
+                        "completion": text, "expr": expr,
+                        "correct": bool(correct),
+                        "n_tokens": int(n_tok),
+                        "n_cot_tokens": int(n_cot_tok),
+                        "has_answer_marker": bool(m_ans),
+                        "has_think_close": bool(think_idx >= 0),
+                        "split": "eval" if self.in_eval else "train",
+                        "global_step": int(self.global_step),
+                    }) + "\n")
+            if self.in_eval:
+                self.eval_step += 1
+            else:
+                self.train_step += 1
+            return [0.0] * len(completions)

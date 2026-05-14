@@ -8,13 +8,18 @@ Probes
 ------
 - ``d1_length_diversity``     — D1 collapse / mode collapse signature
 - ``coverage_probe``          — answer-buffer motivator (NOT D2)
-- ``d3_pass_rate_by_bucket``  — zero-pass@K dead-zone test
-- ``d2_vt_overlay``           — D2 structural — v_t vs broadcast advantage
-- ``d4_vt_on_failed``         — D4 indiscriminate credit on failed rollouts
+- ``d3_pass_rate_by_bucket``  — zero-pass@K dead-zone test, with
+                                a found-vs-total-solutions panel
+- ``rt_dynamics``             — per-eval-cycle 2-panel R_t figure
+                                (one (correct, incorrect) pair + global mean ±1σ)
+- ``rt_progress``             — mean R_T per eval cycle, split by correctness;
+                                summarises how training reshapes the
+                                decoding-velocity reward over time.
 
-The two ``v_t`` probes need a callable ``vt_scorer(prompt_messages,
-completion_text, reference_answer) -> (token_strs, vt, logps)``; build one with
-``make_vt_scorer(model_name)``.
+The R_T probes consume the augmented ``eval_rollout.jsonl`` produced by
+``script/run_game24_one.py`` (R_T, R_per_token, cumR_resampled). The
+underlying kernel lives in ``src/velocity.py``
+(``compute_vt_batched``, ``compute_cot_perplexity``).
 """
 
 from __future__ import annotations
@@ -23,11 +28,10 @@ import difflib
 import json
 import re
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import torch
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
@@ -36,12 +40,8 @@ __all__ = [
     "d1_length_diversity",
     "coverage_probe",
     "d3_pass_rate_by_bucket",
-    "make_vt_scorer",
-    "d2_vt_overlay",
-    "d4_vt_on_failed",
-    "score_rollout_sample",
-    "d2_pair_figures",
-    "decoding_reward_stats",
+    "rt_dynamics",
+    "rt_progress",
 ]
 
 
@@ -77,21 +77,31 @@ def d1_length_diversity(df: pd.DataFrame) -> Tuple[Dict[str, float], Figure]:
     if len(df) == 0:
         return {}, None
 
+    # Prefer CoT-only length when the logger recorded it; older runs only
+    # have the full-completion ``n_tokens`` field.
+    len_col = "n_cot_tokens" if "n_cot_tokens" in df.columns else "n_tokens"
+
     agg = df.groupby("step").agg(
-        n_tokens_mean=("n_tokens", "mean"),
-        n_tokens_p90=("n_tokens", lambda s: float(np.percentile(s, 90))),
+        n_tokens_mean=(len_col, "mean"),
+        n_tokens_p90=(len_col, lambda s: float(np.percentile(s, 90))),
         acc=("correct", "mean"),
     ).reset_index()
 
     ed_rows = []
-    for (step, _key), g in df[df.correct].groupby(["step", "key"]):
+    for (step, key), g in df[df.correct].groupby(["step", "key"]):
         texts = g.completion.tolist()
         if len(texts) < 2:
             continue
         pairs = [_norm_edit(texts[i], texts[j])
                  for i in range(len(texts)) for j in range(i + 1, len(texts))]
-        ed_rows.append({"step": step, "mean_edit": float(np.mean(pairs))})
+        ed_rows.append({"step": step, "key": key,
+                        "mean_edit": float(np.mean(pairs))})
     edf = pd.DataFrame(ed_rows)
+    # Aggregate puzzles → one point per step. mean over (step, puzzle) cells
+    # gives the average "within-puzzle diversity of correct CoTs" at that step.
+    edf_step = (edf.groupby("step")["mean_edit"]
+                   .agg(["mean", "std", "count"]).reset_index()
+                if len(edf) else pd.DataFrame(columns=["step","mean","std","count"]))
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     axes[0].plot(agg.step, agg.n_tokens_mean, label="mean")
@@ -100,17 +110,24 @@ def d1_length_diversity(df: pd.DataFrame) -> Tuple[Dict[str, float], Figure]:
     axes[0].legend()
 
     for ok, label in [(True, "correct"), (False, "incorrect")]:
-        sub = df[df.correct == ok].groupby("step").n_tokens.mean()
+        sub = df[df.correct == ok].groupby("step")[len_col].mean()
         if len(sub):
             axes[1].plot(sub.index, sub.values, label=label)
-    axes[1].set(xlabel="step", ylabel="mean tokens",
+    axes[1].set(xlabel="step", ylabel=f"mean {len_col}",
                 title="D1 · length, split by correctness")
     axes[1].legend()
 
-    if len(edf):
-        axes[2].plot(edf.step, edf.mean_edit)
-        axes[2].set(xlabel="step", ylabel="mean pairwise edit-distance",
+    if len(edf_step):
+        x = edf_step["step"].values
+        mu = edf_step["mean"].values
+        sd = edf_step["std"].fillna(0.0).values
+        axes[2].plot(x, mu, color="#264653", linewidth=2,
+                     label="mean over puzzles")
+        axes[2].fill_between(x, mu - sd, mu + sd, color="#264653", alpha=0.15,
+                             label="±1σ across puzzles")
+        axes[2].set(xlabel="step", ylabel="within-puzzle mean pairwise edit-dist",
                     title="D1 · diversity of correct CoTs\n(collapse → 0)")
+        axes[2].legend(fontsize=8)
     else:
         axes[2].text(0.5, 0.5, "not enough correct rollouts\non same puzzle",
                      ha="center", va="center")
@@ -121,7 +138,7 @@ def d1_length_diversity(df: pd.DataFrame) -> Tuple[Dict[str, float], Figure]:
         "d1_mean_tokens_first":  float(agg.n_tokens_mean.iloc[0])  if len(agg) else float("nan"),
         "d1_mean_tokens_last":   float(agg.n_tokens_mean.iloc[-1]) if len(agg) else float("nan"),
         "d1_mean_tokens_delta":  float(agg.n_tokens_mean.iloc[-1] - agg.n_tokens_mean.iloc[0]) if len(agg) > 1 else float("nan"),
-        "d1_edit_distance_last": float(edf.mean_edit.iloc[-1]) if len(edf) else float("nan"),
+        "d1_edit_distance_last": float(edf_step["mean"].iloc[-1]) if len(edf_step) else float("nan"),
     }
     return metrics, fig
 
@@ -163,6 +180,15 @@ def coverage_probe(df: pd.DataFrame, puzzles: List[Dict[str, Any]]) -> Tuple[Dic
 # D3 — pass-rate by difficulty bucket
 # ---------------------------------------------------------------------------
 def d3_pass_rate_by_bucket(df: pd.DataFrame, puzzles: List[Dict[str, Any]]) -> Tuple[Dict[str, float], Optional[Figure]]:
+    """Two-panel D3.
+
+    Left  — fraction of puzzles "ever solved" per difficulty bucket (binary).
+    Right — for each bucket, the average number of *distinct* canonical
+            solutions the model produced per puzzle, vs the average number
+            of total valid solutions the puzzle admits. Closes the loop on
+            "hard puzzles have fewer solutions" — even a 100 % pass-rate on
+            easy puzzles can hide low solution coverage.
+    """
     if len(df) == 0:
         return {}, None
     info = (
@@ -170,449 +196,197 @@ def d3_pass_rate_by_bucket(df: pd.DataFrame, puzzles: List[Dict[str, Any]]) -> T
                        "n_solutions": p["n_solutions"]} for p in puzzles])
         .drop_duplicates("key").set_index("key")
     )
+
+    # Distinct correct expressions found per puzzle (canonicalised).
+    correct_df = df[df.correct & df.expr.notna()].copy()
+    if len(correct_df):
+        correct_df["canon"] = correct_df["expr"].astype(str).map(_canon)
+        found = (correct_df.groupby("key")["canon"]
+                           .nunique().rename("n_found"))
+    else:
+        found = pd.Series(dtype=int, name="n_found")
+
     solved = df.groupby("key").correct.any().rename("ever_solved")
-    joined = info.join(solved).fillna({"ever_solved": False})
+    joined = info.join(solved).join(found).fillna(
+        {"ever_solved": False, "n_found": 0})
+    joined["n_found"] = joined["n_found"].astype(int)
+
     bucket = pd.cut(joined.n_solutions, [0, 2, 7, 1000],
                     labels=["hard (≤2)", "med (3-7)", "easy (≥8)"])
-    grouped = joined.groupby(bucket).ever_solved.agg(["mean", "count"])
+    pass_grouped = joined.groupby(bucket).ever_solved.agg(["mean", "count"])
+    sol_grouped  = joined.groupby(bucket).agg(
+        mean_found=("n_found", "mean"),
+        mean_total=("n_solutions", "mean"),
+    )
 
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.bar(range(len(grouped)), grouped["mean"].values,
-           tick_label=[str(i) for i in grouped.index])
-    ax.set(ylabel="fraction ever solved", ylim=(0, 1.05),
-           title="D3 · pass-rate by difficulty bucket")
-    for i, (m, n) in enumerate(zip(grouped["mean"], grouped["count"])):
-        ax.text(i, m + 0.02, f"{m:.0%}\n(n={n})", ha="center", fontsize=8)
+    fig, (ax_l, ax_r) = plt.subplots(1, 2, figsize=(12, 3.5))
+
+    # --- left: pass-rate bars (existing) ---
+    ax_l.bar(range(len(pass_grouped)), pass_grouped["mean"].values,
+             tick_label=[str(i) for i in pass_grouped.index])
+    ax_l.set(ylabel="fraction ever solved", ylim=(0, 1.05),
+             title="D3 · pass-rate by difficulty bucket")
+    for i, (m, n) in enumerate(zip(pass_grouped["mean"], pass_grouped["count"])):
+        ax_l.text(i, m + 0.02, f"{m:.0%}\n(n={n})", ha="center", fontsize=8)
+
+    # --- right: avg found vs avg total solutions (grouped bars) ---
+    x = np.arange(len(sol_grouped))
+    w = 0.38
+    ax_r.bar(x - w / 2, sol_grouped["mean_found"], w,
+             label="avg distinct found", color="#2a9d8f")
+    ax_r.bar(x + w / 2, sol_grouped["mean_total"], w,
+             label="avg total solutions", color="#9b9b9b")
+    ax_r.set_xticks(x)
+    ax_r.set_xticklabels([str(i) for i in sol_grouped.index])
+    ax_r.set(ylabel="# canonical solutions / puzzle",
+             title="D3 · solution coverage (found / total)")
+    ax_r.legend(fontsize=8)
+    for i, (f_, t_) in enumerate(zip(sol_grouped["mean_found"], sol_grouped["mean_total"])):
+        ratio = f_ / t_ if t_ > 0 else float("nan")
+        ax_r.text(i, max(f_, t_) + 0.05, f"{ratio:.0%}",
+                  ha="center", fontsize=8, color="#264653")
+
     fig.tight_layout()
 
     metrics = {f"d3_passrate_{label}": float(m)
-               for label, m in zip(grouped.index.astype(str), grouped["mean"])}
+               for label, m in zip(pass_grouped.index.astype(str), pass_grouped["mean"])}
     metrics["d3_passrate_overall"] = float(joined.ever_solved.mean())
+    for label, row in sol_grouped.iterrows():
+        metrics[f"d3_mean_found_{label}"] = float(row["mean_found"])
+        metrics[f"d3_mean_total_{label}"] = float(row["mean_total"])
+    metrics["d3_coverage_overall"] = (
+        float(sol_grouped["mean_found"].sum() / sol_grouped["mean_total"].sum())
+        if sol_grouped["mean_total"].sum() > 0 else float("nan")
+    )
     return metrics, fig
 
 
 # ---------------------------------------------------------------------------
-# v_t scorer
+# R_T — decoding-velocity reward dynamics (consumes augmented eval JSONL)
 # ---------------------------------------------------------------------------
-def make_vt_scorer(
-    model_name: str,
-    tokenizer,
-    *,
-    device: Optional[str] = None,
-    dtype: Optional[torch.dtype] = None,
-) -> Callable:
-    """Returns a callable that scores per-token v_t against a reference answer."""
-    from transformers import AutoModelForCausalLM
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = dtype or (torch.bfloat16 if device == "cuda" else torch.float32)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype).to(device).eval()
-
-    def _split_completion(completion: str) -> Tuple[str, str]:
-        m = re.search(r"####\s*(.*)$", completion.strip(), re.DOTALL)
-        if not m:
-            return completion, ""
-        return completion[: m.start()].rstrip(), f"#### {m.group(1).strip()}"
-
-    def _prompt_text(prompt_messages) -> str:
-        return tokenizer.apply_chat_template(
-            prompt_messages, tokenize=False, add_generation_prompt=True,
-        )
-
-    @torch.no_grad()
-    def compute_vt(prompt_messages, completion_text: str, reference_answer: str):
-        q_text = _prompt_text(prompt_messages)
-        cot, _ = _split_completion(completion_text)
-        a_text = reference_answer if reference_answer.startswith("####") else f"#### {reference_answer}"
-
-        q_ids = tokenizer(q_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        o_ids = tokenizer(cot,    return_tensors="pt", add_special_tokens=False).input_ids[0]
-        a_ids = tokenizer(a_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
-        T, La = len(o_ids), len(a_ids)
-        if T == 0 or La == 0:
-            return [], [], []
-
-        logps = []
-        for t in range(T + 1):
-            ids = torch.cat([q_ids, o_ids[:t], a_ids]).unsqueeze(0).to(device)
-            logits = model(ids).logits[0]
-            start = len(q_ids) + t
-            lp = sum(
-                torch.log_softmax(logits[start + i - 1], dim=-1)[a_ids[i]].item()
-                for i in range(La)
-            )
-            logps.append(lp)
-
-        vt = [logps[t] - logps[t - 1] for t in range(1, T + 1)]
-        toks = tokenizer.convert_ids_to_tokens(o_ids)
-        return toks, vt, logps
-
-    compute_vt.model = model     # expose for cleanup
-    return compute_vt
+def _stack_cumR(df_class: pd.DataFrame) -> np.ndarray:
+    """Stack `cumR_resampled` arrays into (N, n_pts). Skips None / empty rows."""
+    if len(df_class) == 0:
+        return np.empty((0, 0))
+    arrs = [np.asarray(x, dtype=float)
+            for x in df_class["cumR_resampled"].tolist()
+            if x is not None and len(x)]
+    return np.array(arrs) if arrs else np.empty((0, 0))
 
 
-# ---------------------------------------------------------------------------
-# D2 — v_t overlay (one correct + one incorrect)
-# ---------------------------------------------------------------------------
-def d2_vt_overlay(
+def rt_dynamics(
     df: pd.DataFrame,
-    puzzles: List[Dict[str, Any]],
-    vt_scorer: Callable,
-    to_chat: Callable,
+    step_idx: int,
     *,
-    seed: int = 1,
+    pair_seed: int = 0,
 ) -> Tuple[Dict[str, float], Optional[Figure]]:
-    if len(df) == 0:
+    """Two-panel R_t figure for one eval cycle (`global_step == step_idx`).
+
+    Left  — one randomly-sampled (correct, incorrect) pair: cumulative R_t
+            over normalised CoT position (t / T).
+    Right — global mean cumulative R_t across ALL rollouts at this step,
+            ±1σ band, split by correctness.
+
+    Requires the eval-log augmentation written by
+    ``script/run_game24_one.py --score-vt`` (default on): each row must
+    carry ``R_T`` and ``cumR_resampled``.
+    """
+    if "cumR_resampled" not in df.columns or "global_step" not in df.columns:
         return {}, None
-    idx = _puzzle_index(puzzles)
+    at = df[(df.global_step == step_idx) & df.cumR_resampled.notna()]
+    if len(at) == 0:
+        return {}, None
+    correct   = at[at.correct]
+    incorrect = at[~at.correct]
 
-    fig, axes = plt.subplots(2, 1, figsize=(14, 7))
-    metrics: Dict[str, float] = {}
-    for ax, correct_flag, label, broadcast in [
-        (axes[0], True,  "correct rollout (GRPO adv ≈ +A)",  +1.0),
-        (axes[1], False, "incorrect rollout (GRPO adv ≈ −A)", -1.0),
-    ]:
-        sub = df[df.correct == correct_flag]
-        if len(sub) == 0:
-            ax.text(0.5, 0.5, f"no {('correct' if correct_flag else 'incorrect')} rollouts",
-                    ha="center", va="center"); ax.axis("off"); continue
-        row = sub.sample(1, random_state=seed).iloc[0]
-        puzzle = idx.get(row.key)
-        if puzzle is None:
-            ax.axis("off"); continue
-        ref = puzzle["solutions"][0]
-        toks, vt, _ = vt_scorer(to_chat(puzzle)["prompt"], row.completion, ref)
-        ax.bar(range(len(vt)), vt,
-               color=["#2a9d8f" if v >= 0 else "#e76f51" for v in vt])
-        ax.axhline(broadcast, color="k", linestyle="--", alpha=0.7,
-                   label=f"GRPO broadcast adv = {broadcast:+.2f}")
-        ax.set(title=f"{label}  ·  puzzle={row.numbers}",
-               xlabel="token position t", ylabel="v_t")
-        ax.legend(loc="upper right", fontsize=8)
-        s = max(1, len(toks) // 20)
-        ax.set_xticks(range(0, len(toks), s))
-        ax.set_xticklabels([toks[i].replace("Ġ", "▁")[:6] for i in range(0, len(toks), s)],
-                           rotation=45, fontsize=7)
-        suffix = "correct" if correct_flag else "incorrect"
-        if vt:
-            metrics[f"d2_vt_std_{suffix}"]   = float(np.std(vt))
-            metrics[f"d2_vt_range_{suffix}"] = float(max(vt) - min(vt))
+    R_c, R_i = _stack_cumR(correct), _stack_cumR(incorrect)
+    n_pts = R_c.shape[1] if len(R_c) else (R_i.shape[1] if len(R_i) else 0)
+    if n_pts == 0:
+        return {}, None
+    x = np.linspace(0.0, 1.0, n_pts)
 
-    fig.suptitle("D2 · per-token v_t vs. GRPO's broadcast advantage", y=1.02)
+    pair_c = correct.sample(1,   random_state=pair_seed).iloc[0] if len(correct)   else None
+    pair_i = incorrect.sample(1, random_state=pair_seed).iloc[0] if len(incorrect) else None
+
+    fig, (ax_pair, ax_avg) = plt.subplots(1, 2, figsize=(14, 4.5))
+
+    for row, lbl, col in [(pair_c, "correct", "#2a9d8f"),
+                          (pair_i, "incorrect", "#e76f51")]:
+        if row is None:
+            continue
+        R = np.asarray(row.cumR_resampled, dtype=float)
+        T = row.get("n_cot_tokens", row.get("n_tokens", "?"))
+        ax_pair.plot(x, R, color=col, linewidth=2,
+                     label=f"{lbl}  (R_T={row.R_T:+.2f}, T={T})")
+    ax_pair.axhline(0, color="k", linestyle=":", alpha=0.4)
+    ax_pair.set(xlabel="normalised CoT position (t / T)",
+                ylabel="cumulative R_t",
+                title=f"R_t · individual pair  (step={step_idx})")
+    ax_pair.legend(fontsize=9); ax_pair.grid(alpha=0.3)
+
+    for R, lbl, col in [(R_c, "correct", "#2a9d8f"), (R_i, "incorrect", "#e76f51")]:
+        if len(R) == 0:
+            continue
+        mu, sd = R.mean(0), R.std(0)
+        ax_avg.plot(x, mu, color=col, linewidth=2, label=f"{lbl}  (n={len(R)})")
+        ax_avg.fill_between(x, mu - sd, mu + sd, color=col, alpha=0.15)
+    ax_avg.axhline(0, color="k", linestyle=":", alpha=0.4)
+    ax_avg.set(xlabel="normalised CoT position (t / T)",
+               ylabel="mean cumulative R_t",
+               title=f"R_t · global average  (step={step_idx})")
+    ax_avg.legend(fontsize=9); ax_avg.grid(alpha=0.3)
     fig.tight_layout()
-    return metrics, fig
 
-
-# ---------------------------------------------------------------------------
-# D4 — productive tokens inside failed rollouts
-# ---------------------------------------------------------------------------
-def d4_vt_on_failed(
-    df: pd.DataFrame,
-    puzzles: List[Dict[str, Any]],
-    vt_scorer: Callable,
-    to_chat: Callable,
-    *,
-    n_sample: int = 8,
-    seed: int = 0,
-) -> Tuple[Dict[str, float], Optional[Figure]]:
-    if len(df) == 0:
-        return {}, None
-    idx = _puzzle_index(puzzles)
-    failed = df[~df.correct]
-    if len(failed) == 0:
-        return {"d4_n_failed_probed": 0}, None
-    sample = failed.sample(min(n_sample, len(failed)), random_state=seed)
-
-    rows = []
-    for _, r in sample.iterrows():
-        p = idx.get(r.key)
-        if p is None:
-            continue
-        toks, vt, _ = vt_scorer(to_chat(p)["prompt"], r.completion, p["solutions"][0])
-        if not vt:
-            continue
-        pos = sum(1 for v in vt if v > 0)
-        rows.append({"frac_positive": pos / len(vt),
-                     "total_vt": float(sum(vt)),
-                     "n_tokens": len(vt)})
-    if not rows:
-        return {"d4_n_failed_probed": 0}, None
-
-    ddf = pd.DataFrame(rows)
-    fig, ax = plt.subplots(figsize=(6, 3))
-    ax.hist(ddf.frac_positive, bins=20)
-    ax.set(xlabel="fraction of tokens with v_t > 0 (failed rollouts)",
-           ylabel="# rollouts",
-           title="D4 · productive tokens inside failed trajectories")
-    fig.tight_layout()
-    return {
-        "d4_n_failed_probed":           int(len(ddf)),
-        "d4_mean_frac_positive":        float(ddf.frac_positive.mean()),
-        "d4_median_frac_positive":      float(ddf.frac_positive.median()),
-    }, fig
-
-
-# ---------------------------------------------------------------------------
-# Cached scoring + pair figures + global decoding-reward statistics
-# ---------------------------------------------------------------------------
-def score_rollout_sample(
-    df: pd.DataFrame,
-    puzzles: List[Dict[str, Any]],
-    vt_scorer: Callable,
-    to_chat: Callable,
-    *,
-    n_per_class: int = 50,
-    seed: int = 0,
-    verbose: bool = True,
-) -> pd.DataFrame:
-    """Score a balanced sample of correct/incorrect rollouts ONCE.
-
-    For each sampled rollout we cache ``(toks, vt, R_T, R_per_token)`` so that
-    downstream consumers (pair plots, global stats) don't repeat the
-    expensive forward passes. Reference answer is chosen as follows:
-
-    - **correct rollout**: model's own verified expression (`row.expr`) →
-      makes cumulative R_t cleanly trend upward.
-    - **incorrect rollout**: the puzzle's canonical `solutions[0]`.
-
-    Returns a DataFrame with one row per scored rollout. Columns include:
-    ``label`` ('correct' | 'incorrect'), ``key``, ``numbers``, ``completion``,
-    ``ref_answer``, ``toks``, ``vt``, ``R_T``, ``n_tokens``, ``R_per_token``,
-    ``step``, ``frac_positive``.
-    """
-    if len(df) == 0:
-        return pd.DataFrame()
-    idx = _puzzle_index(puzzles)
-
-    records: List[Dict[str, Any]] = []
-    for correct_flag, label in [(True, "correct"), (False, "incorrect")]:
-        sub = df[df.correct == correct_flag]
-        if len(sub) == 0:
-            continue
-        sample = sub.sample(min(n_per_class, len(sub)), random_state=seed)
-        if verbose:
-            print(f"  scoring {len(sample)} {label} rollouts...", flush=True)
-        for k, (_, r) in enumerate(sample.iterrows()):
-            puzzle = idx.get(r.key)
-            if puzzle is None:
-                continue
-            ref = r.expr if (correct_flag and isinstance(r.get("expr"), str) and r.expr.strip())\
-                  else puzzle["solutions"][0]
-            toks, vt, _ = vt_scorer(to_chat(puzzle)["prompt"], r.completion, ref)
-            if not vt:
-                continue
-            R_T = float(np.sum(vt))
-            records.append({
-                "label":         label,
-                "correct":       bool(correct_flag),
-                "key":           r.key,
-                "numbers":       r.get("numbers"),
-                "step":          int(r.get("step", -1)),
-                "completion":    r.completion,
-                "ref_answer":    ref,
-                "toks":          toks,
-                "vt":            vt,
-                "n_tokens":      len(vt),
-                "R_T":           R_T,
-                "R_per_token":   R_T / len(vt),
-                "frac_positive": float(sum(1 for v in vt if v > 0)) / len(vt),
-            })
-            if verbose and (k + 1) % 10 == 0:
-                print(f"    {k+1}/{len(sample)}", flush=True)
-    return pd.DataFrame(records)
-
-
-def d2_pair_figures(
-    scored: pd.DataFrame,
-    output_dir: Path,
-    *,
-    n_pairs: int = 50,
-    seed: int = 1,
-) -> int:
-    """Save up to ``n_pairs`` figures, each showing one correct + one incorrect
-    rollout (v_t bars + cumulative R_t line + GRPO broadcast advantage).
-
-    Pairs are sampled WITHOUT replacement within each class. Returns the number
-    of figures actually written.
-    """
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    correct   = scored[scored.label == "correct"]
-    incorrect = scored[scored.label == "incorrect"]
-    n = min(n_pairs, len(correct), len(incorrect))
-    if n == 0:
-        return 0
-
-    rng = np.random.default_rng(seed)
-    c_idx = rng.permutation(len(correct))[:n]
-    i_idx = rng.permutation(len(incorrect))[:n]
-
-    written = 0
-    for k, (ci, ii) in enumerate(zip(c_idx, i_idx)):
-        cr = correct.iloc[ci]
-        ir = incorrect.iloc[ii]
-        fig, axes = plt.subplots(2, 1, figsize=(14, 8))
-        for ax, row, broadcast, title in [
-            (axes[0], cr, +1.0, f"correct rollout (GRPO adv ≈ +A)   ·   puzzle={row_numbers(cr)}"),
-            (axes[1], ir, -1.0, f"incorrect rollout (GRPO adv ≈ −A)  ·   puzzle={row_numbers(ir)}"),
-        ]:
-            _plot_vt_with_cumulative(ax, row["toks"], row["vt"], broadcast, title)
-        fig.suptitle(f"pair {k+1}/{n}   ·   "
-                     f"R_T(correct)={cr.R_T:+.2f}   R_T(incorrect)={ir.R_T:+.2f}",
-                     y=1.02)
-        fig.tight_layout()
-        fig.savefig(output_dir / f"pair_{k:03d}.png", dpi=110, bbox_inches="tight")
-        plt.close(fig)
-        written += 1
-    return written
-
-
-def row_numbers(row) -> Any:
-    return row.get("numbers")
-
-
-def _plot_vt_with_cumulative(ax, toks, vt, broadcast, title) -> None:
-    ax.bar(range(len(vt)), vt,
-           color=["#2a9d8f" if v >= 0 else "#e76f51" for v in vt],
-           alpha=0.7, label="per-token v_t")
-    ax.axhline(broadcast, color="k", linestyle="--", alpha=0.7,
-               label=f"GRPO broadcast adv = {broadcast:+.2f}")
-    ax.set(title=title, xlabel="token position t", ylabel="v_t")
-    s = max(1, len(toks) // 20)
-    ax.set_xticks(range(0, len(toks), s))
-    ax.set_xticklabels([toks[i].replace("Ġ", "▁")[:6] for i in range(0, len(toks), s)],
-                       rotation=45, fontsize=7)
-
-    R = np.cumsum(vt)
-    ax2 = ax.twinx()
-    ax2.plot(range(len(R)), R, color="#264653", linewidth=2,
-             label=f"cumulative R_t  (R_T = {R[-1]:+.2f})")
-    ax2.axhline(0, color="#264653", linestyle=":", alpha=0.4)
-    ax2.set_ylabel("R_t = Σ v_{≤t}", color="#264653")
-    ax2.tick_params(axis="y", labelcolor="#264653")
-
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, loc="upper left", fontsize=8)
-
-
-def decoding_reward_stats(
-    scored: pd.DataFrame,
-) -> Tuple[Dict[str, float], Optional[Figure]]:
-    """Quantify how well total decoding reward R_T discriminates correct from
-    incorrect trajectories. Computes:
-
-    - mean / std / median of R_T per class
-    - Cohen's d (effect size)
-    - ROC AUC treating R_T as a binary classifier of correctness
-    - Mann-Whitney U statistic + p-value
-    - same metrics for R_T normalised by length (R_T / n_tokens)
-    - same metrics for fraction of tokens with v_t > 0
-
-    Produces a 2×2 figure: R_T hist, R_T boxplot, R_per_token boxplot,
-    R_T vs step (training-time trend, if step info present).
-    """
-    if len(scored) == 0:
-        return {}, None
-    correct   = scored[scored.label == "correct"]
-    incorrect = scored[scored.label == "incorrect"]
-    if len(correct) == 0 or len(incorrect) == 0:
-        return {"dr_n_correct": int(len(correct)),
-                "dr_n_incorrect": int(len(incorrect))}, None
-
-    def _summary(name: str, c: np.ndarray, i: np.ndarray) -> Dict[str, float]:
-        c, i = np.asarray(c, dtype=float), np.asarray(i, dtype=float)
-        pooled = np.sqrt((c.var(ddof=1) + i.var(ddof=1)) / 2) if len(c) > 1 and len(i) > 1 else float("nan")
-        cohens_d = (c.mean() - i.mean()) / pooled if pooled and not np.isnan(pooled) else float("nan")
-
-        # ROC AUC via Mann-Whitney U identity: AUC = U / (n_c * n_i)
-        try:
-            from scipy.stats import mannwhitneyu
-            u, p = mannwhitneyu(c, i, alternative="greater")
-            auc = float(u) / (len(c) * len(i))
-        except Exception:  # scipy missing — fall back to numpy
-            ranks = pd.Series(np.concatenate([c, i])).rank().to_numpy()
-            r_c = ranks[: len(c)].sum()
-            u = r_c - len(c) * (len(c) + 1) / 2
-            auc = float(u) / (len(c) * len(i))
-            p = float("nan")
-
-        return {
-            f"{name}_correct_mean":   float(c.mean()),
-            f"{name}_correct_std":    float(c.std(ddof=1)) if len(c) > 1 else 0.0,
-            f"{name}_incorrect_mean": float(i.mean()),
-            f"{name}_incorrect_std":  float(i.std(ddof=1)) if len(i) > 1 else 0.0,
-            f"{name}_gap":            float(c.mean() - i.mean()),
-            f"{name}_cohens_d":       float(cohens_d),
-            f"{name}_auc":            auc,
-            f"{name}_mw_p":           float(p),
-        }
-
-    metrics: Dict[str, float] = {
-        "dr_n_correct":   int(len(correct)),
-        "dr_n_incorrect": int(len(incorrect)),
+    metrics = {
+        f"rt_step{step_idx}_R_T_correct_mean":   float(correct.R_T.mean())   if len(correct)   else float("nan"),
+        f"rt_step{step_idx}_R_T_incorrect_mean": float(incorrect.R_T.mean()) if len(incorrect) else float("nan"),
+        f"rt_step{step_idx}_n_correct":          int(len(correct)),
+        f"rt_step{step_idx}_n_incorrect":        int(len(incorrect)),
     }
-    metrics.update(_summary("R_T",          correct.R_T,          incorrect.R_T))
-    metrics.update(_summary("R_per_token",  correct.R_per_token,  incorrect.R_per_token))
-    metrics.update(_summary("frac_pos",     correct.frac_positive, incorrect.frac_positive))
-    metrics["len_correct_mean"]   = float(correct.n_tokens.mean())
-    metrics["len_incorrect_mean"] = float(incorrect.n_tokens.mean())
-
-    # ── figure ────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
-
-    # (a) Histogram of R_T
-    all_R = pd.concat([correct.R_T, incorrect.R_T])
-    bins = np.linspace(float(all_R.min()), float(all_R.max()), 25)
-    axes[0, 0].hist(incorrect.R_T, bins=bins, alpha=0.6, label="incorrect", color="#e76f51")
-    axes[0, 0].hist(correct.R_T,   bins=bins, alpha=0.6, label="correct",   color="#2a9d8f")
-    axes[0, 0].axvline(0, color="k", linestyle=":", alpha=0.5)
-    axes[0, 0].set(xlabel="R_T = Σ v_t", ylabel="# rollouts",
-                   title=f"R_T distribution   |   AUC={metrics['R_T_auc']:.3f}, "
-                         f"d={metrics['R_T_cohens_d']:+.2f}")
-    axes[0, 0].legend()
-
-    # (b) Boxplot of R_T
-    parts = axes[0, 1].boxplot([incorrect.R_T, correct.R_T],
-                               tick_labels=["incorrect", "correct"], patch_artist=True)
-    for patch, color in zip(parts["boxes"], ["#e76f51", "#2a9d8f"]):
-        patch.set_facecolor(color); patch.set_alpha(0.6)
-    axes[0, 1].axhline(0, color="k", linestyle=":", alpha=0.5)
-    axes[0, 1].set(ylabel="R_T",
-                   title=f"R_T   |   gap = {metrics['R_T_gap']:+.2f}")
-
-    # (c) Boxplot of length-normalised R_T
-    parts = axes[1, 0].boxplot([incorrect.R_per_token, correct.R_per_token],
-                               tick_labels=["incorrect", "correct"], patch_artist=True)
-    for patch, color in zip(parts["boxes"], ["#e76f51", "#2a9d8f"]):
-        patch.set_facecolor(color); patch.set_alpha(0.6)
-    axes[1, 0].axhline(0, color="k", linestyle=":", alpha=0.5)
-    axes[1, 0].set(ylabel="R_T / n_tokens",
-                   title=f"length-normalised  |   AUC={metrics['R_per_token_auc']:.3f}")
-
-    # (d) R_T vs training step (does the gap grow / shrink as GRPO trains?)
-    if scored.step.max() > scored.step.min():
-        for label, sub, color in [
-            ("correct",   correct,   "#2a9d8f"),
-            ("incorrect", incorrect, "#e76f51"),
-        ]:
-            if len(sub) == 0:
-                continue
-            binned = (sub.assign(step_bin=pd.cut(sub.step, 8))
-                        .groupby("step_bin", observed=True)
-                        .R_T.agg(["mean", "count"]).reset_index())
-            x = [iv.mid for iv in binned.step_bin]
-            axes[1, 1].plot(x, binned["mean"], "o-", label=label, color=color)
-        axes[1, 1].axhline(0, color="k", linestyle=":", alpha=0.5)
-        axes[1, 1].set(xlabel="training step (binned)", ylabel="mean R_T",
-                       title="R_T trend over training")
-        axes[1, 1].legend()
-    else:
-        axes[1, 1].axis("off")
-        axes[1, 1].text(0.5, 0.5, "single training step\n(no trend to plot)",
-                        ha="center", va="center")
-
-    fig.suptitle("Decoding reward R_T as a graded surrogate for trajectory correctness",
-                 y=1.00, fontsize=12)
-    fig.tight_layout()
     return metrics, fig
+
+
+def rt_progress(df: pd.DataFrame) -> Tuple[Dict[str, float], Optional[Figure]]:
+    """Mean R_T per eval cycle, split by correctness — training-time view.
+
+    One line per class over `global_step`, with ±1σ bands. Shows whether
+    training drives correct-rollout R_T upward and how the gap between
+    classes evolves.
+    """
+    if "R_T" not in df.columns or "global_step" not in df.columns:
+        return {}, None
+    sub = df[df.R_T.notna()]
+    if len(sub) == 0:
+        return {}, None
+    grouped = (sub.groupby(["global_step", "correct"])["R_T"]
+                  .agg(["mean", "std", "count"]).reset_index())
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    for cf, col, lbl in [(True, "#2a9d8f", "correct"),
+                         (False, "#e76f51", "incorrect")]:
+        g = grouped[grouped.correct == cf].sort_values("global_step")
+        if len(g) == 0:
+            continue
+        x  = g.global_step.values
+        mu = g["mean"].values
+        sd = g["std"].fillna(0.0).values
+        ax.plot(x, mu, marker="o", color=col,
+                label=f"{lbl} (n={int(g['count'].sum())})")
+        ax.fill_between(x, mu - sd, mu + sd, color=col, alpha=0.15)
+    ax.axhline(0, color="k", linestyle=":", alpha=0.4)
+    ax.set(xlabel="global_step", ylabel="mean R_T",
+           title="R_T progress over eval cycles")
+    ax.grid(alpha=0.3); ax.legend()
+    fig.tight_layout()
+
+    overall = grouped.groupby("correct")["mean"].mean()
+    metrics: Dict[str, float] = {
+        "rt_progress_R_T_correct_mean":   float(overall.get(True,  float("nan"))),
+        "rt_progress_R_T_incorrect_mean": float(overall.get(False, float("nan"))),
+    }
+    last = grouped.global_step.max()
+    last_g = grouped[grouped.global_step == last].set_index("correct")["mean"]
+    if True in last_g.index and False in last_g.index:
+        metrics["rt_progress_final_gap"] = float(last_g[True] - last_g[False])
+    return metrics, fig
+
