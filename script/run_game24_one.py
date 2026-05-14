@@ -258,9 +258,22 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         scorer_device = (f"cuda:{args.train_device}"
                          if torch.cuda.is_available() and args.vllm_mode == "server"
                          else ("cuda" if torch.cuda.is_available() else "cpu"))
-        scorer_model = AutoModelForCausalLM.from_pretrained(
-            model_name, torch_dtype=scorer_dtype,
-        ).to(scorer_device).eval()
+        # Try FlashAttention2 for the scorer — big throughput + memory win on
+        # long-CoT batches. Falls back to default ("eager"/SDPA) if FA2 isn't
+        # installed or the model architecture doesn't support it.
+        scorer_load_kwargs = dict(torch_dtype=scorer_dtype)
+        try:
+            scorer_model = AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation="flash_attention_2",
+                **scorer_load_kwargs,
+            ).to(scorer_device).eval()
+            print("[vt-score] scorer using flash_attention_2", flush=True)
+        except (ImportError, ValueError) as e:
+            print(f"[vt-score] FA2 unavailable ({e.__class__.__name__}); "
+                  "falling back to default attn", flush=True)
+            scorer_model = AutoModelForCausalLM.from_pretrained(
+                model_name, **scorer_load_kwargs,
+            ).to(scorer_device).eval()
 
         puzzle_index = {tuple(sorted(p["numbers"])): p
                         for p in (train_puzzles + eval_puzzles + hard_probe)}

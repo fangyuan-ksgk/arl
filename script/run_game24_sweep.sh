@@ -50,7 +50,7 @@ LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 # pass entirely (no R_T fields added, no rt_*.png written). RT_PAIR_SEED
 # controls which (correct, incorrect) pair appears in each rt_step{N}.png.
 SCORE_VT="${SCORE_VT:-1}"
-VT_MICRO_BATCH="${VT_MICRO_BATCH:-8}"
+VT_MICRO_BATCH="${VT_MICRO_BATCH:-64}"   # forward batch for v_t scoring; raise on bigger GPUs
 RT_PAIR_SEED="${RT_PAIR_SEED:-0}"
 SEED="${SEED:-0}"
 
@@ -87,13 +87,18 @@ start_vllm_server() {
   local model="$1"; local max_len="$2"; local log_file="$3"
   stop_vllm_server
   echo "  [vllm] starting server  model=${model}  max_model_len=${max_len}  gpu=${VLLM_GPU}"
+  # setsid puts the server + all its EngineCore subprocesses in a fresh
+  # process group so we can SIGKILL the whole group on shutdown.
+  # --enforce-eager: skip torch.compile + CUDA graph capture. Trades ~15%
+  # decode throughput for instant startup and bulletproof reliability across
+  # cold caches / image rebuilds. Worth it for a multi-cell sweep.
   CUDA_VISIBLE_DEVICES="${VLLM_GPU}" \
-    trl vllm-serve --model "${model}" --max-model-len "${max_len}" \
+    setsid trl vllm-serve --model "${model}" --max-model-len "${max_len}" \
       --host "${VLLM_HOST}" --port "${VLLM_PORT}" \
+      --enforce-eager \
       > "${log_file}" 2>&1 &
   VLLM_PID=$!
-  echo "  [vllm] pid=${VLLM_PID}  log=${log_file}"
-  # Wait until the server is healthy.
+  echo "  [vllm] pid=${VLLM_PID} (pgid=${VLLM_PID})  log=${log_file}"
   local waited=0
   while (( waited < VLLM_STARTUP_TIMEOUT )); do
     if curl -s "http://${VLLM_HOST}:${VLLM_PORT}/health" > /dev/null 2>&1; then
@@ -108,11 +113,11 @@ start_vllm_server() {
   echo "  [vllm] !! timeout after ${VLLM_STARTUP_TIMEOUT}s"; return 1
 }
 stop_vllm_server() {
-  if [[ -n "${VLLM_PID}" ]] && kill -0 "${VLLM_PID}" 2>/dev/null; then
-    echo "  [vllm] stopping pid=${VLLM_PID}"
-    kill "${VLLM_PID}" 2>/dev/null || true
-    wait "${VLLM_PID}" 2>/dev/null || true
-  fi
+  # Single-tenant container: nuke every vllm process by command-line match.
+  # Catches the wrapper, EngineCore subprocess, and any worker. Idempotent.
+  echo "  [vllm] pkill -9 -f vllm"
+  pkill -9 -f vllm 2>/dev/null || true
+  sleep 2
   VLLM_PID=""
 }
 trap stop_vllm_server EXIT INT TERM
