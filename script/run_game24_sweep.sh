@@ -113,11 +113,23 @@ start_vllm_server() {
   echo "  [vllm] !! timeout after ${VLLM_STARTUP_TIMEOUT}s"; return 1
 }
 stop_vllm_server() {
-  # Single-tenant container: nuke every vllm process by command-line match.
-  # Catches the wrapper, EngineCore subprocess, and any worker. Idempotent.
+  # 1. Kill anything with 'vllm' in its cmdline (catches wrapper + workers).
   echo "  [vllm] pkill -9 -f vllm"
   pkill -9 -f vllm 2>/dev/null || true
   sleep 2
+  # 2. EngineCore's cmdline is bare 'python' (no 'vllm' substring) so the
+  # pkill above misses it. Reap any process still holding the target GPU.
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    local stragglers
+    stragglers=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
+                   -i "${VLLM_GPU}" 2>/dev/null \
+                 | tr -d ' ' | grep -E '^[0-9]+$' || true)
+    if [[ -n "${stragglers}" ]]; then
+      echo "  [vllm] killing GPU ${VLLM_GPU} stragglers: ${stragglers}"
+      echo "${stragglers}" | xargs -r kill -9 2>/dev/null || true
+      sleep 2
+    fi
+  fi
   VLLM_PID=""
 }
 trap stop_vllm_server EXIT INT TERM
