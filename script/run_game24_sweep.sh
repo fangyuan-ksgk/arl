@@ -44,7 +44,7 @@ MAX_STEPS="${MAX_STEPS:-1200}"
 EVAL_STEPS="${EVAL_STEPS:-200}"
 NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-4}"   # pdbs * grad_accum must be a multiple of NUM_GENERATIONS
 LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 # R_T scoring + figure generation. SCORE_VT=0 skips the post-training scoring
 # pass entirely (no R_T fields added, no rt_*.png written). RT_PAIR_SEED

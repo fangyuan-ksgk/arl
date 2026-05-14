@@ -102,6 +102,18 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     print(f"  train={len(train_puzzles)} eval={len(eval_puzzles)} probe={len(hard_probe)}",
           flush=True)
 
+    # Fail fast on the most common GRPO config error: the train *global* batch
+    # must be a multiple of num_generations because advantages are computed
+    # within each generation group. (Eval batch is pinned to num_generations
+    # downstream, so it's always valid.)
+    train_global = args.per_device_batch_size * args.grad_accum
+    if train_global % args.num_generations != 0:
+        raise ValueError(
+            f"train global batch (pdbs*grad_accum = {args.per_device_batch_size}*"
+            f"{args.grad_accum} = {train_global}) must be a multiple of "
+            f"--num-generations ({args.num_generations})."
+        )
+
     # Tokenizer (Llama needs an explicit pad token)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
@@ -135,7 +147,11 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=args.per_device_batch_size,
+        # Eval is forward-only (no activations stored), so we can pack more
+        # prompts per batch than training. 4 * num_generations = 4 whole
+        # generation groups per batch, still trivially divisible by
+        # num_generations (TRL's GRPO requirement).
+        per_device_eval_batch_size=4 * args.num_generations,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
@@ -352,8 +368,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps", type=int, default=1200)
     p.add_argument("--num-generations", type=int, default=8)
     p.add_argument("--max-completion-length", type=int, default=512)
-    p.add_argument("--per-device-batch-size", type=int, default=2)
-    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--per-device-batch-size", type=int, default=2,
+                   help="Train-side micro-batch (completions per device per "
+                        "forward pass). Eval batch is fixed at --num-generations "
+                        "internally.")
+    p.add_argument("--grad-accum", type=int, default=4,
+                   help="Train global batch = pdbs * num_processes * grad_accum, "
+                        "and must be a multiple of --num-generations.")
     p.add_argument("--learning-rate", type=float, default=5e-6)
     # Periodic evaluation (rollouts → eval_rollout.jsonl)
     p.add_argument("--eval-steps", type=int, default=200,
