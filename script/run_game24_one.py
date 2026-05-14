@@ -96,7 +96,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     puzzles = build_puzzle_pool(max_n=9)
     easy, medium, hard = bucket_by_difficulty(puzzles, easy_min=8, hard_max=2)
     train_puzzles, eval_puzzles, hard_probe = make_splits(
-        easy, medium, hard, eval_frac=0.10, probe_frac=0.40,
+        easy, medium, hard, eval_frac=0.20, probe_frac=0.40,
     )
     train_ds, eval_ds, _probe_ds = build_datasets(train_puzzles, eval_puzzles, hard_probe)
     print(f"  train={len(train_puzzles)} eval={len(eval_puzzles)} probe={len(hard_probe)}",
