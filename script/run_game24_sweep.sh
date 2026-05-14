@@ -113,23 +113,19 @@ start_vllm_server() {
   echo "  [vllm] !! timeout after ${VLLM_STARTUP_TIMEOUT}s"; return 1
 }
 stop_vllm_server() {
-  # 1. Kill anything with 'vllm' in its cmdline (catches wrapper + workers).
-  echo "  [vllm] pkill -9 -f vllm"
+  # Three-stage nuke. EngineCore is stubborn: its cmdline is bare 'python'
+  # (so pkill -f vllm misses it) and its comm 'VLLM::EngineCore' is 16 chars
+  # which exceeds pkill's 15-char comm match. Match by ps + awk instead.
+  echo "  [vllm] stopping server"
   pkill -9 -f vllm 2>/dev/null || true
-  sleep 2
-  # 2. EngineCore's cmdline is bare 'python' (no 'vllm' substring) so the
-  # pkill above misses it. Reap any process still holding the target GPU.
+  ps -ef | grep 'VLLM::EngineCore' | grep -v grep \
+    | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
   if command -v nvidia-smi >/dev/null 2>&1; then
-    local stragglers
-    stragglers=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader \
-                   -i "${VLLM_GPU}" 2>/dev/null \
-                 | tr -d ' ' | grep -E '^[0-9]+$' || true)
-    if [[ -n "${stragglers}" ]]; then
-      echo "  [vllm] killing GPU ${VLLM_GPU} stragglers: ${stragglers}"
-      echo "${stragglers}" | xargs -r kill -9 2>/dev/null || true
-      sleep 2
-    fi
+    nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+      | tr -d ' ' | grep -E '^[0-9]+$' \
+      | xargs -r kill -9 2>/dev/null || true
   fi
+  sleep 2
   VLLM_PID=""
 }
 trap stop_vllm_server EXIT INT TERM

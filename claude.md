@@ -48,6 +48,8 @@ the current environment's torch headers, not a fresh torch pulled into an isolat
 | torch version changes after vllm install | vllm 0.17.x upgrades torch | Use `vllm==0.11.0` |
 | torch loses cu128 after vllm install | vllm pulled cu126 torch wheel | Pin vllm to 0.11.0 (cu128-safe) or reinstall torch with `--index-url .../cu128 --no-deps` |
 | `ImportError: flash_attn_2_cuda` after any pip install | pip silently upgraded torch | Rebuild flash_attn from source after settling all other packages |
+| vLLM server won't die from `pkill -f vllm`; orphan `VLLM::EngineCore` survives | EngineCore cmdline is bare `python`; comm `VLLM::EngineCore` exceeds pkill's 15-char limit | Hardened stop: `pkill -9 -f vllm; ps -ef \| grep 'VLLM::EngineCore' \| grep -v grep \| awk '{print $2}' \| xargs -r kill -9; nvidia-smi --query-compute-apps=pid --format=csv,noheader \| xargs -r kill -9` |
+| vLLM `EngineCore` pegs CPU at 99 %, never allocates GPU | torch.compile / CUDA-graph capture stalled on cold cache | Launch with `--enforce-eager` (skips compile + graph capture; ~15 % decode throughput cost) |
 
 ## TRL GRPOTrainer Modes
 
