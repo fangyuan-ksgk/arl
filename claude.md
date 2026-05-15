@@ -48,8 +48,9 @@ the current environment's torch headers, not a fresh torch pulled into an isolat
 | torch version changes after vllm install | vllm 0.17.x upgrades torch | Use `vllm==0.11.0` |
 | torch loses cu128 after vllm install | vllm pulled cu126 torch wheel | Pin vllm to 0.11.0 (cu128-safe) or reinstall torch with `--index-url .../cu128 --no-deps` |
 | `ImportError: flash_attn_2_cuda` after any pip install | pip silently upgraded torch | Rebuild flash_attn from source after settling all other packages |
-| vLLM server won't die from `pkill -f vllm`; orphan `VLLM::EngineCore` survives | EngineCore cmdline is bare `python`; comm `VLLM::EngineCore` exceeds pkill's 15-char limit | Hardened stop: `pkill -9 -f vllm; ps -ef \| grep 'VLLM::EngineCore' \| grep -v grep \| awk '{print $2}' \| xargs -r kill -9; nvidia-smi --query-compute-apps=pid --format=csv,noheader \| xargs -r kill -9` |
+| vLLM server won't die from `pkill -f vllm`; orphan `VLLM::EngineCore` survives | EngineCore cmdline is bare `python`; comm `VLLM::EngineCore` is 16 chars, exceeding pkill's 15-char comm match | **Golden line:** `ps -ef \| grep 'VLLM::EngineCore' \| grep -v grep \| awk '{print $2}' \| xargs kill -9` |
 | vLLM `EngineCore` pegs CPU at 99 %, never allocates GPU | torch.compile / CUDA-graph capture stalled on cold cache | Launch with `--enforce-eager` (skips compile + graph capture; ~15 % decode throughput cost) |
+| `trl vllm-serve` hangs at "Waiting for application startup" after repeated kill/restart cycles | Leaked CUDA contexts from orphan EngineCores deadlock vLLM's NCCL init even though `nvidia-smi` shows GPU free | **Restart the container.** `vllm serve` may still work while `trl vllm-serve` doesn't — the trl path stresses NCCL setup more. |
 
 ## TRL GRPOTrainer Modes
 
@@ -75,3 +76,53 @@ trainer.train()
 
 veRL's reward API (`compute_score`) receives only text — it **cannot** support model-dependent
 rewards like MBE. Stay on TRL for any reward that needs hidden states.
+
+## vLLM `--max-model-len` vs `max_completion_length` (silent truncation)
+
+vLLM has two independent caps:
+
+- `--max-model-len` (server, hard ceiling on `prompt_len + gen_len`)
+- `SamplingParams.max_tokens` (per-request, set by TRL from `max_completion_length`)
+
+Effective generation cap on every request:
+
+```
+effective_max_new_tokens = min(max_tokens, max_model_len - prompt_len)
+```
+
+If you launch vLLM with `--max-model-len LEN` and the trainer with
+`max_completion_length=LEN`, the server silently caps generation at
+`LEN - prompt_len`. For Game-of-24 the chat-templated prompt is ~130
+tokens, so `LEN=512` actually yields ~382 effective new tokens.
+
+### Why this materially changes GRPO dynamics
+
+The Game-of-24 reward is gated on the `####` answer marker:
+
+- truncated rollout (no `####`)        → 0
+- formatted but wrong (`####` present) → 0.2
+- formatted and correct                → 1.2
+
+With a tight effective cap, almost every rollout in early training
+truncates to 0. Within-group advantages collapse, and the only
+non-degenerate signal is "be brief enough to emit `####`". GRPO
+optimizes that proxy first, pulling CoT length **down** before
+correctness improves. Observable in `eval_df` as falling `pct_truncated`
+*and* falling mean `n_cot_tokens` over training.
+
+With the cap loose enough that most rollouts fit, the within-group
+reward distribution spans all three levels from step 0. Format and
+correctness gradients fire simultaneously, GRPO discovers
+"longer CoT → more often correct", and length **grows** — eventually
+saturating whatever cap is left.
+
+### Fix
+
+Do **not** pass `--max-model-len` to `trl vllm-serve` unless you
+explicitly want it tighter than the model's native context. Let vLLM
+fall back to the model's native window and let `max_completion_length`
+(per-request) be the only effective cap. Applied in
+`script/run_game24_sweep.sh::start_vllm_server` (2026-05-15).
+
+Runs in `logs/game24_sweep1/` were collected under the buggy regime
+(`--max-model-len LEN`) and are **not** comparable to clean baselines.

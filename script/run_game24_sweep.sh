@@ -86,14 +86,19 @@ VLLM_PID=""
 start_vllm_server() {
   local model="$1"; local max_len="$2"; local log_file="$3"
   stop_vllm_server
-  echo "  [vllm] starting server  model=${model}  max_model_len=${max_len}  gpu=${VLLM_GPU}"
+  echo "  [vllm] starting server  model=${model}  max_model_len=<model default>  gpu=${VLLM_GPU}"
   # setsid puts the server + all its EngineCore subprocesses in a fresh
   # process group so we can SIGKILL the whole group on shutdown.
   # --enforce-eager: skip torch.compile + CUDA graph capture. Trades ~15%
   # decode throughput for instant startup and bulletproof reliability across
   # cold caches / image rebuilds. Worth it for a multi-cell sweep.
+  # NOTE: --max-model-len intentionally omitted so vLLM uses the model's
+  # native context window. Capping it to LEN here would silently truncate
+  # generation to (LEN - prompt_len) ≈ LEN - 130 regardless of the
+  # max_completion_length the trainer sends per request, which materially
+  # changes GRPO dynamics (see analysis 2026-05-15).
   CUDA_VISIBLE_DEVICES="${VLLM_GPU}" \
-    setsid trl vllm-serve --model "${model}" --max-model-len "${max_len}" \
+    setsid trl vllm-serve --model "${model}" \
       --host "${VLLM_HOST}" --port "${VLLM_PORT}" \
       --enforce-eager \
       > "${log_file}" 2>&1 &
