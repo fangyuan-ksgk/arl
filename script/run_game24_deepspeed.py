@@ -247,16 +247,34 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     # ------- Save trained policy for R_T scoring -------------------------
     # R_T here is computed against the *trained* policy (information-gain
     # interpretation), not the base model. The policy is sharded under
-    # ZeRO-3, so we can't use it directly for raw forward passes. Save a
-    # consolidated full-rank copy now (HF Trainer's `save_model` handles
-    # the gather across ranks) and reload it on each rank after we free
-    # the training engine.
+    # ZeRO-3, so we can't use it directly for raw forward passes.
+    #
+    # Note: we deliberately avoid `trainer.save_model()` here because the
+    # accelerate yaml flag `zero3_save_16bit_model: true` does not reliably
+    # propagate into the DeepSpeed engine's runtime config across versions
+    # — when it doesn't, save_model() leaves a pile of zero_pp_rank_*.pt
+    # files instead of a model.safetensors, and reloading fails. Instead
+    # we use the documented HF pattern: `accelerator.get_state_dict()`
+    # explicitly gathers the full state dict across ranks, and we save it
+    # via `unwrap_model().save_pretrained(state_dict=...)`.
     trained_ckpt_dir = out_dir / "trained_for_vt"
     if args.eval_steps > 0 and args.score_vt:
         if is_main:
             print(f"  saving trained policy → {trained_ckpt_dir} "
-                  "(consolidated bf16, used as R_T scorer)", flush=True)
-        trainer.save_model(str(trained_ckpt_dir))
+                  "(gathering ZeRO-3 shards, used as R_T scorer)", flush=True)
+        # Collective op — must be called on every rank.
+        full_sd = trainer.accelerator.get_state_dict(trainer.model_wrapped)
+        if is_main:
+            unwrapped = trainer.accelerator.unwrap_model(trainer.model_wrapped)
+            unwrapped.save_pretrained(
+                trained_ckpt_dir,
+                state_dict=full_sd,
+                safe_serialization=True,
+            )
+            tokenizer.save_pretrained(trained_ckpt_dir)
+            print(f"  saved {sum(t.numel() for t in full_sd.values())/1e6:.1f}M "
+                  f"parameters as safetensors", flush=True)
+        del full_sd
 
     # ------- Merge per-rank shards into canonical files (rank 0) ---------
     _barrier()
