@@ -6,3 +6,4 @@ pip install flash-attn-3 --extra-index-url https://download.pytorch.org/whl/cu12
 # -> then 
 pip install datasets seaborn matplotlib hf_transfer 
 pip install "trl[vllm]"
+pip3 install deepspeed

@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""
+DeepSpeed ZeRO-3 variant of ``run_game24_one.py``.
+
+Differences from the single-GPU script
+--------------------------------------
+1. Must be launched under ``accelerate launch --config_file configs/zero3.yaml``.
+   We refuse to run if no distributed launcher env vars are present.
+2. ``RolloutLogger`` writes **rank-suffixed** JSONL files
+   (``rollouts.jsonl.r{R}`` / ``eval_rollout.jsonl.r{R}``) to avoid the
+   concurrent-append race that a single shared path would cause under DDP.
+   After training, rank 0 concatenates them into canonical
+   ``rollouts.jsonl`` / ``eval_rollout.jsonl``.
+3. R_T scoring is **sharded**: each rank scores ``eval_rows[rank::world]``
+   independently using its own scorer-model copy, writes a rank-local
+   partial JSONL, then rank 0 merges into the final augmented file.
+4. All non-scoring post-train work (diagnostics, figures, metrics.json) runs
+   on rank 0 only; other ranks block on ``dist.barrier()`` until rank 0
+   finishes so the launcher exits cleanly.
+
+Launch
+------
+::
+
+    # GPU 0 → vLLM server
+    CUDA_VISIBLE_DEVICES=0 trl vllm-serve \\
+      --model Qwen/Qwen3-0.6B --host 0.0.0.0 --port 8000 --enforce-eager &
+
+    # GPUs 1,2 → ZeRO-3 training
+    CUDA_VISIBLE_DEVICES=1,2 accelerate launch \\
+      --config_file configs/zero3.yaml \\
+      script/run_game24_deepspeed.py \\
+      --model Qwen/Qwen3-0.6B \\
+      --output-root output/zero3_smoketest \\
+      --max-steps 30 --eval-steps 30 \\
+      --num-generations 8 --max-completion-length 1024 \\
+      --per-device-batch-size 2 --grad-accum 4 \\
+      --learning-rate 5e-6 \\
+      --vllm-mode server --vllm-server-port 8000
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def slug(model_name: str) -> str:
+    return model_name.replace("/", "__").replace(" ", "_")
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+def _rank_world() -> tuple[int, int]:
+    rank = int(os.environ.get("RANK", "0"))
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    return rank, world
+
+
+def _under_distributed_launcher() -> bool:
+    return (
+        "ACCELERATE_USE_DEEPSPEED" in os.environ
+        or "ACCELERATE_USE_FSDP" in os.environ
+        or "LOCAL_RANK" in os.environ
+    )
+
+
+def _barrier() -> None:
+    """Best-effort barrier; works under torch.distributed and is a no-op otherwise."""
+    try:
+        import torch.distributed as dist
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Worker
+# ---------------------------------------------------------------------------
+def run_one(args: argparse.Namespace) -> Dict[str, Any]:
+    import numpy as np
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+    from trl import GRPOConfig, GRPOTrainer
+
+    from src.game24utils import (
+        build_puzzle_pool, bucket_by_difficulty, make_splits,
+        build_datasets, to_chat,
+        correctness_reward, format_reward,
+        RolloutLogger,
+    )
+    from src.game24diagnostics import (
+        load_rollouts,
+        d1_length_diversity, coverage_probe, d3_pass_rate_by_bucket,
+        rt_dynamics, rt_progress,
+    )
+
+    if not _under_distributed_launcher():
+        raise RuntimeError(
+            "run_game24_deepspeed.py must be launched via `accelerate launch "
+            "--config_file configs/zero3.yaml` (or another DDP launcher). "
+            "For single-GPU runs, use run_game24_one.py instead."
+        )
+
+    rank, world = _rank_world()
+    is_main = rank == 0
+
+    model_name = args.model
+    out_dir = Path(args.output_root) / slug(model_name)
+    if is_main:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    _barrier()
+
+    # Canonical (merged) paths — used by all post-train diagnostics.
+    rollout_log = out_dir / "rollouts.jsonl"
+    eval_rollout_log = out_dir / "eval_rollout.jsonl"
+    # Per-rank shards written live during training.
+    rollout_shard = out_dir / f"rollouts.jsonl.r{rank}"
+    eval_shard    = out_dir / f"eval_rollout.jsonl.r{rank}"
+    # Truncate this rank's shards.
+    rollout_shard.write_text("")
+    eval_shard.write_text("")
+    if is_main:
+        rollout_log.write_text("")
+        eval_rollout_log.write_text("")
+    _barrier()
+
+    if is_main:
+        print(f"\n[run_one][rank{rank}/{world}] model={model_name}  "
+              f"output={out_dir}", flush=True)
+
+    # Reproducible split — same on every rank.
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
+    puzzles = build_puzzle_pool(max_n=9)
+    easy, medium, hard = bucket_by_difficulty(puzzles, easy_min=8, hard_max=2)
+    train_puzzles, eval_puzzles, hard_probe = make_splits(
+        easy, medium, hard, eval_frac=0.20, probe_frac=0.40,
+    )
+    train_ds, eval_ds, _probe_ds = build_datasets(train_puzzles, eval_puzzles, hard_probe)
+    if is_main:
+        print(f"  train={len(train_puzzles)} eval={len(eval_puzzles)} "
+              f"probe={len(hard_probe)}", flush=True)
+
+    # Train global batch divisibility check (must include num_processes here).
+    train_global = args.per_device_batch_size * args.grad_accum * world
+    if train_global % args.num_generations != 0:
+        raise ValueError(
+            f"train global batch (pdbs*grad_accum*world = "
+            f"{args.per_device_batch_size}*{args.grad_accum}*{world} = "
+            f"{train_global}) must be a multiple of "
+            f"--num-generations ({args.num_generations})."
+        )
+
+    # Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        if is_main:
+            print(f"  set pad_token = eos_token ({tokenizer.eos_token!r})", flush=True)
+
+    # Rank-scoped logger so the appends never collide across ranks.
+    rollout_logger = RolloutLogger(rollout_shard, eval_shard, tokenizer)
+
+    class EvalFlagCallback(TrainerCallback):
+        def __init__(self, logger): self.logger = logger
+        def on_prediction_step(self, args, state, control, **kw):
+            self.logger.in_eval = True
+            self.logger.global_step = state.global_step
+        def on_step_begin(self, args, state, control, **kw):
+            self.logger.in_eval = False
+            self.logger.global_step = state.global_step
+        def on_evaluate(self, args, state, control, **kw):
+            self.logger.in_eval = False
+
+    # ------- Train --------------------------------------------------------
+    config_kwargs = dict(
+        output_dir=str(out_dir / "grpo"),
+        num_generations=args.num_generations,
+        max_completion_length=args.max_completion_length,
+        per_device_train_batch_size=args.per_device_batch_size,
+        per_device_eval_batch_size=args.num_generations,
+        gradient_accumulation_steps=args.grad_accum,
+        learning_rate=args.learning_rate,
+        max_steps=args.max_steps,
+        logging_steps=10,
+        bf16=torch.cuda.is_available(),
+        save_strategy="no",
+        report_to="none",
+        use_vllm=True,
+        vllm_mode=args.vllm_mode,
+    )
+    if args.vllm_mode == "server":
+        config_kwargs["vllm_server_host"] = args.vllm_server_host
+        config_kwargs["vllm_server_port"] = args.vllm_server_port
+    else:
+        raise ValueError(
+            "deepspeed variant requires --vllm-mode server (colocate puts "
+            "vLLM on the training GPUs, which conflicts with ZeRO-3 sharding)."
+        )
+
+    if args.eval_steps > 0:
+        config_kwargs["eval_strategy"] = "steps"
+        config_kwargs["eval_steps"] = args.eval_steps
+        config_kwargs["eval_on_start"] = True
+
+    config = GRPOConfig(**config_kwargs)
+
+    t0 = time.time()
+    # Under DeepSpeed, do NOT set device_map — let DS init the model on `meta`
+    # and shard params via zero3_init.
+    model_load_kwargs = dict(
+        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    )
+    model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs)
+
+    trainer = GRPOTrainer(
+        model=model,
+        reward_funcs=[correctness_reward, format_reward, rollout_logger],
+        args=config,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds if args.eval_steps > 0 else None,
+        processing_class=tokenizer,
+        callbacks=[EvalFlagCallback(rollout_logger)],
+    )
+    trainer.train()
+    train_time = time.time() - t0
+    if is_main:
+        print(f"  training done in {train_time:.0f}s", flush=True)
+
+    # ------- Merge per-rank shards into canonical files (rank 0) ---------
+    _barrier()
+    if is_main:
+        def _merge_shards(canonical: Path, pattern: str) -> int:
+            n = 0
+            with canonical.open("w") as out:
+                for r in range(world):
+                    shard = out_dir / pattern.format(r=r)
+                    if not shard.exists():
+                        continue
+                    for line in shard.read_text().splitlines():
+                        if line.strip():
+                            out.write(line + "\n")
+                            n += 1
+            return n
+
+        n_train = _merge_shards(rollout_log,      "rollouts.jsonl.r{r}")
+        n_eval  = _merge_shards(eval_rollout_log, "eval_rollout.jsonl.r{r}")
+        print(f"  merged shards → rollouts.jsonl ({n_train} rows), "
+              f"eval_rollout.jsonl ({n_eval} rows)", flush=True)
+    _barrier()
+
+    # ------- Cheap diagnostics (rank 0 only) ------------------------------
+    metrics: Dict[str, Any] = {
+        "model": model_name,
+        "train_seconds": train_time,
+        "diag_source": "eval" if args.eval_steps > 0 else "train",
+        "world_size": world,
+    }
+    if is_main:
+        diag_path = eval_rollout_log if args.eval_steps > 0 else rollout_log
+        diag_puzzles = eval_puzzles if args.eval_steps > 0 else train_puzzles
+        df = load_rollouts(diag_path)
+        if len(df) and "global_step" in df.columns:
+            df["step"] = df["global_step"].astype(int)
+        print(f"  diagnostics on {len(df)} rollouts from {diag_path.name}", flush=True)
+        metrics["n_rollouts"] = int(len(df))
+
+        for name, fn in [
+            ("d1",        lambda: d1_length_diversity(df)),
+            ("coverage",  lambda: coverage_probe(df, diag_puzzles)),
+            ("d3",        lambda: d3_pass_rate_by_bucket(df, diag_puzzles)),
+        ]:
+            m, fig = fn()
+            metrics.update(m)
+            if fig is not None:
+                fig.savefig(out_dir / f"{name}.png", dpi=120, bbox_inches="tight")
+                fig.clear()
+
+    # ------- Sharded R_T scoring -----------------------------------------
+    # Every rank still has the policy model + DeepSpeed engine loaded. Free
+    # them BEFORE building the scorer model on each rank, otherwise we
+    # double the per-GPU footprint.
+    if args.eval_steps > 0 and args.score_vt:
+        from src.velocity import compute_vt_batched
+
+        del trainer
+        del model
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        # All ranks read the merged eval log (rank 0 wrote it; barrier above
+        # guarantees it's flushed).
+        eval_rows = [json.loads(l) for l in eval_rollout_log.read_text().splitlines()
+                     if l.strip()]
+        if is_main:
+            print(f"\n[vt-score] sharding {len(eval_rows)} rollouts over "
+                  f"{world} ranks ({(len(eval_rows)+world-1)//world} per rank)",
+                  flush=True)
+
+        # Each rank takes a strided slice — preserves a uniform distribution
+        # over eval cycles instead of giving one rank "all the late steps".
+        my_indices = list(range(rank, len(eval_rows), world))
+        my_rows    = [eval_rows[i] for i in my_indices]
+
+        puzzle_index = {tuple(sorted(p["numbers"])): p
+                        for p in (train_puzzles + eval_puzzles + hard_probe)}
+        prompts, completions, refs, valid = [], [], [], []
+        for row in my_rows:
+            key = tuple(sorted(row["numbers"]))
+            puzzle = puzzle_index.get(key)
+            if puzzle is None or not row.get("completion"):
+                valid.append(False); continue
+            prompts.append(tokenizer.apply_chat_template(
+                to_chat(puzzle)["prompt"], tokenize=False, add_generation_prompt=True))
+            completions.append(row["completion"])
+            refs.append(puzzle["solutions"][0])
+            valid.append(True)
+
+        # Local scorer copy. Each rank owns one full model — small models
+        # only; for bigger scorers refactor to sharded inference later.
+        scorer_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        # Logical device on this rank under CUDA_VISIBLE_DEVICES mask.
+        local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
+        scorer_device = (f"cuda:{local_rank}"
+                         if torch.cuda.is_available() else "cpu")
+        scorer_load_kwargs = dict(torch_dtype=scorer_dtype)
+        try:
+            scorer_model = AutoModelForCausalLM.from_pretrained(
+                model_name, attn_implementation="flash_attention_2",
+                **scorer_load_kwargs,
+            ).to(scorer_device).eval()
+            if is_main:
+                print("[vt-score] scorer using flash_attention_2", flush=True)
+        except (ImportError, ValueError) as e:
+            if is_main:
+                print(f"[vt-score] FA2 unavailable ({e.__class__.__name__}); "
+                      "falling back to default attn", flush=True)
+            scorer_model = AutoModelForCausalLM.from_pretrained(
+                model_name, **scorer_load_kwargs,
+            ).to(scorer_device).eval()
+
+        if is_main:
+            print(f"[vt-score] scoring {sum(valid)}/{len(my_rows)} on rank0 "
+                  f"(micro_batch={args.vt_micro_batch}) ...", flush=True)
+        t_vt = time.time()
+        scored = compute_vt_batched(
+            prompts, completions, refs, scorer_model, tokenizer,
+            micro_batch_size=args.vt_micro_batch,
+        )
+
+        N_PTS = args.vt_resample_pts
+        grid = np.linspace(0.0, 1.0, N_PTS)
+        scored_iter = iter(scored)
+        out_records: List[Dict[str, Any]] = []
+        for gidx, row, ok in zip(my_indices, my_rows, valid):
+            if not ok:
+                row["R_T"] = None
+                row["R_per_token"] = None
+                row["cumR_resampled"] = None
+            else:
+                sc = next(scored_iter)
+                vt = np.asarray(sc["vt"], dtype=float)
+                R_T = float(sc["R_T"]) if not np.isnan(sc["R_T"]) else None
+                row["R_T"] = R_T
+                row["R_per_token"] = (float(sc["R_per_token"])
+                                      if not np.isnan(sc["R_per_token"]) else None)
+                if len(vt):
+                    R = np.cumsum(vt)
+                    x = np.linspace(0.0, 1.0, len(R))
+                    row["cumR_resampled"] = np.interp(grid, x, R).tolist()
+                else:
+                    row["cumR_resampled"] = None
+            out_records.append({"_gidx": gidx, "row": row})
+
+        # Write this rank's scored slice as ``eval_rollout.jsonl.scored.r{R}``
+        # with the original global index inlined so rank 0 can reassemble in
+        # the right order.
+        scored_shard = out_dir / f"eval_rollout.jsonl.scored.r{rank}"
+        with scored_shard.open("w") as f:
+            for rec in out_records:
+                f.write(json.dumps(rec) + "\n")
+
+        # Drop the scorer before the barrier so peak memory doesn't hold
+        # while waiting for the slowest rank.
+        del scorer_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _barrier()
+
+        # Rank 0 merges per-rank scored shards back into eval_rollout.jsonl
+        # preserving original order, then writes figures + metrics.
+        if is_main:
+            scored_by_idx: Dict[int, Dict[str, Any]] = {}
+            for r in range(world):
+                p = out_dir / f"eval_rollout.jsonl.scored.r{r}"
+                if not p.exists():
+                    continue
+                for line in p.read_text().splitlines():
+                    if not line.strip():
+                        continue
+                    rec = json.loads(line)
+                    scored_by_idx[int(rec["_gidx"])] = rec["row"]
+            merged = [scored_by_idx[i] for i in range(len(eval_rows))
+                      if i in scored_by_idx]
+
+            tmp = eval_rollout_log.with_suffix(".jsonl.tmp")
+            with tmp.open("w") as f:
+                for row in merged:
+                    f.write(json.dumps(row) + "\n")
+            tmp.replace(eval_rollout_log)
+            print(f"[vt-score] done in {time.time()-t_vt:.0f}s "
+                  f"(merged {len(merged)}/{len(eval_rows)} rows from {world} ranks)",
+                  flush=True)
+
+            R_Ts = np.array([r["R_T"] for r in merged if r["R_T"] is not None])
+            if R_Ts.size:
+                metrics["vt_R_T_mean"]   = float(R_Ts.mean())
+                metrics["vt_R_T_median"] = float(np.median(R_Ts))
+
+            # ------- R_T figures ----------------------------------------
+            df_rt = load_rollouts(eval_rollout_log)
+            if len(df_rt):
+                df_rt["step"] = df_rt["global_step"].astype(int)
+
+                m, fig = rt_progress(df_rt)
+                metrics.update(m)
+                if fig is not None:
+                    fig.savefig(out_dir / "rt_progress.png", dpi=120, bbox_inches="tight")
+                    fig.clear()
+
+                rt_dir = out_dir / "rt_steps"; rt_dir.mkdir(exist_ok=True)
+                n_written = 0
+                for step in sorted(df_rt.global_step.dropna().unique()):
+                    m, fig = rt_dynamics(df_rt, int(step), pair_seed=args.rt_pair_seed)
+                    metrics.update(m)
+                    if fig is not None:
+                        fig.savefig(rt_dir / f"rt_step{int(step)}.png",
+                                    dpi=120, bbox_inches="tight")
+                        fig.clear()
+                        n_written += 1
+                print(f"[rt-figs] wrote rt_progress.png + {n_written} per-step "
+                      f"figures → {rt_dir}", flush=True)
+
+    _barrier()
+    if is_main:
+        (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+        print(f"  metrics → {out_dir / 'metrics.json'}", flush=True)
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", required=True)
+    p.add_argument("--output-root", default="output/game24_sweep")
+    p.add_argument("--max-steps", type=int, default=1200)
+    p.add_argument("--num-generations", type=int, default=8)
+    p.add_argument("--max-completion-length", type=int, default=512)
+    p.add_argument("--per-device-batch-size", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=4)
+    p.add_argument("--learning-rate", type=float, default=5e-6)
+    p.add_argument("--eval-steps", type=int, default=200)
+    p.add_argument("--vllm-mode", choices=["server"], default="server",
+                   help="Only 'server' is supported under DeepSpeed (colocate "
+                        "would put vLLM on the training GPUs).")
+    p.add_argument("--vllm-server-host", default="0.0.0.0")
+    p.add_argument("--vllm-server-port", type=int, default=8000)
+    p.add_argument("--score-vt", action="store_true", default=True)
+    p.add_argument("--no-score-vt", dest="score_vt", action="store_false")
+    p.add_argument("--vt-micro-batch", type=int, default=8)
+    p.add_argument("--vt-resample-pts", type=int, default=100)
+    p.add_argument("--rt-pair-seed", type=int, default=0)
+    p.add_argument("--seed", type=int, default=0)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+    run_one(args)
+
+
+if __name__ == "__main__":
+    main()
