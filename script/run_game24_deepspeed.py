@@ -225,7 +225,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     # Under DeepSpeed, do NOT set device_map — let DS init the model on `meta`
     # and shard params via zero3_init.
     model_load_kwargs = dict(
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs)
 
@@ -242,6 +242,20 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     train_time = time.time() - t0
     if is_main:
         print(f"  training done in {train_time:.0f}s", flush=True)
+
+    # ------- Save trained policy for R_T scoring -------------------------
+    # R_T here is computed against the *trained* policy (information-gain
+    # interpretation), not the base model. The policy is sharded under
+    # ZeRO-3, so we can't use it directly for raw forward passes. Save a
+    # consolidated full-rank copy now (HF Trainer's `save_model` handles
+    # the gather across ranks) and reload it on each rank after we free
+    # the training engine.
+    trained_ckpt_dir = out_dir / "trained_for_vt"
+    if args.eval_steps > 0 and args.score_vt:
+        if is_main:
+            print(f"  saving trained policy → {trained_ckpt_dir} "
+                  "(consolidated bf16, used as R_T scorer)", flush=True)
+        trainer.save_model(str(trained_ckpt_dir))
 
     # ------- Merge per-rank shards into canonical files (rank 0) ---------
     _barrier()
@@ -334,17 +348,30 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
             refs.append(puzzle["solutions"][0])
             valid.append(True)
 
-        # Local scorer copy. Each rank owns one full model — small models
-        # only; for bigger scorers refactor to sharded inference later.
+        try:
+            from transformers.integrations.deepspeed import (
+                unset_hf_deepspeed_config,
+            )
+            unset_hf_deepspeed_config()
+        except ImportError:
+            pass
+
         scorer_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
         # Logical device on this rank under CUDA_VISIBLE_DEVICES mask.
         local_rank = int(os.environ.get("LOCAL_RANK", str(rank)))
         scorer_device = (f"cuda:{local_rank}"
                          if torch.cuda.is_available() else "cpu")
-        scorer_load_kwargs = dict(torch_dtype=scorer_dtype)
+        # R_T is measured against the TRAINED policy (information-gain
+        # interpretation), so we load from the consolidated checkpoint we
+        # saved right after `trainer.train()`, not from the base HF hub id.
+        scorer_src = str(trained_ckpt_dir)
+        if is_main:
+            print(f"[vt-score] loading trained policy from {scorer_src} "
+                  "as R_T scorer", flush=True)
+        scorer_load_kwargs = dict(dtype=scorer_dtype)
         try:
             scorer_model = AutoModelForCausalLM.from_pretrained(
-                model_name, attn_implementation="flash_attention_2",
+                scorer_src, attn_implementation="flash_attention_2",
                 **scorer_load_kwargs,
             ).to(scorer_device).eval()
             if is_main:
@@ -354,7 +381,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[vt-score] FA2 unavailable ({e.__class__.__name__}); "
                       "falling back to default attn", flush=True)
             scorer_model = AutoModelForCausalLM.from_pretrained(
-                model_name, **scorer_load_kwargs,
+                scorer_src, **scorer_load_kwargs,
             ).to(scorer_device).eval()
 
         if is_main:
@@ -460,6 +487,15 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
                 print(f"[rt-figs] wrote rt_progress.png + {n_written} per-step "
                       f"figures → {rt_dir}", flush=True)
 
+        # Drop the transient trained-policy checkpoint unless --keep-ckpt.
+        # We've already extracted R_T into eval_rollout.jsonl; the weights
+        # served only as the scorer and aren't needed downstream.
+        if is_main and not args.keep_ckpt and trained_ckpt_dir.exists():
+            import shutil
+            shutil.rmtree(trained_ckpt_dir, ignore_errors=True)
+            print(f"  removed transient checkpoint {trained_ckpt_dir.name} "
+                  "(pass --keep-ckpt to retain)", flush=True)
+
     _barrier()
     if is_main:
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -488,6 +524,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vllm-server-port", type=int, default=8000)
     p.add_argument("--score-vt", action="store_true", default=True)
     p.add_argument("--no-score-vt", dest="score_vt", action="store_false")
+    p.add_argument("--keep-ckpt", action="store_true", default=False,
+                   help="Retain the transient trained-policy checkpoint "
+                        "(<out_dir>/trained_for_vt) used as the R_T scorer. "
+                        "By default it is deleted after R_T scoring completes.")
     p.add_argument("--vt-micro-batch", type=int, default=8)
     p.add_argument("--vt-resample-pts", type=int, default=100)
     p.add_argument("--rt-pair-seed", type=int, default=0)

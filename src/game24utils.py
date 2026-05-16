@@ -19,6 +19,7 @@ import itertools
 import json
 import random
 import re
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -50,7 +51,12 @@ def safe_eval(expr: str) -> Optional[float]:
     if not expr or any(c not in _ALLOWED for c in expr):
         return None
     try:
-        return eval(expr, {"__builtins__": {}}, {})  # noqa: S307 — sandboxed
+        # Suppress SyntaxWarning that Python's compiler emits for malformed
+        # model outputs like "24(2+5)" before they get caught as TypeError.
+        # The except below already classifies these as unparseable → None.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            return eval(expr, {"__builtins__": {}}, {})  # noqa: S307 — sandboxed
     except Exception:
         return None
 

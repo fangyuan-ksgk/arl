@@ -182,7 +182,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     # In server mode, pin training to --train-device so it never lands on the
     # GPU(s) running the vLLM server.
     model_load_kwargs = dict(
-        torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
 
     _under_distributed_launcher = (
@@ -271,7 +271,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         # Try FlashAttention2 for the scorer — big throughput + memory win on
         # long-CoT batches. Falls back to default ("eager"/SDPA) if FA2 isn't
         # installed or the model architecture doesn't support it.
-        scorer_load_kwargs = dict(torch_dtype=scorer_dtype)
+        scorer_load_kwargs = dict(dtype=scorer_dtype)
         try:
             scorer_model = AutoModelForCausalLM.from_pretrained(
                 model_name, attn_implementation="flash_attention_2",
