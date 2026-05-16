@@ -147,11 +147,13 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_batch_size,
-        # Eval is forward-only (no activations stored), so we can pack more
-        # prompts per batch than training. 4 * num_generations = 4 whole
-        # generation groups per batch, still trivially divisible by
-        # num_generations (TRL's GRPO requirement).
-        per_device_eval_batch_size=4 * args.num_generations,
+        # Eval forward materializes [batch, seq, vocab] logits + softmax
+        # intermediates in `entropy_from_logits`; at vocab≈151k that tensor
+        # dominates memory and does NOT shrink relative to train just because
+        # backward is skipped. Use one generation-group per forward — the
+        # smallest value that still satisfies TRL's eval_batch % num_generations
+        # == 0 requirement.
+        per_device_eval_batch_size=args.num_generations,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,

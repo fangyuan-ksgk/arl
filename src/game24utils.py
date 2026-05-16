@@ -58,7 +58,9 @@ def safe_eval(expr: str) -> Optional[float]:
 def verify_24(numbers: Sequence[int], expr: str) -> bool:
     """True iff `expr` uses each integer in `numbers` exactly once and evaluates to 24."""
     val = safe_eval(expr)
-    if val is None or abs(val - TARGET) > _EPS:
+    if not isinstance(val, (int, float)) or isinstance(val, bool):
+        return False
+    if abs(val - TARGET) > _EPS:
         return False
     used = [int(x) for x in re.findall(r"\d+", expr)]
     return sorted(used) == sorted(numbers)

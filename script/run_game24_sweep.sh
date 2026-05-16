@@ -37,7 +37,7 @@ Qwen/Qwen3-4B \
 meta-llama/Llama-3.2-3B-Instruct}"
 
 # CoT-budget sweep. Each length runs the full model list end-to-end.
-LENGTHS="${LENGTHS:-512 1024 2048 3096}"
+LENGTHS="${LENGTHS:-1024 2048}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-output/game24_sweep}"
 MAX_STEPS="${MAX_STEPS:-1200}"
@@ -50,7 +50,7 @@ LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 # pass entirely (no R_T fields added, no rt_*.png written). RT_PAIR_SEED
 # controls which (correct, incorrect) pair appears in each rt_step{N}.png.
 SCORE_VT="${SCORE_VT:-1}"
-VT_MICRO_BATCH="${VT_MICRO_BATCH:-64}"   # forward batch for v_t scoring; raise on bigger GPUs
+VT_MICRO_BATCH="${VT_MICRO_BATCH:-8}"   # forward batch for v_t scoring; raise on bigger GPUs
 RT_PAIR_SEED="${RT_PAIR_SEED:-0}"
 SEED="${SEED:-0}"
 
