@@ -120,23 +120,24 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
 
     model_name = args.model
     out_dir = Path(args.output_root) / slug(model_name)
-    if is_main:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    _barrier()
+    # All ranks mkdir; exist_ok=True makes this race-safe. We can't rely on
+    # `_barrier()` here because torch.distributed isn't initialized yet —
+    # accelerate spins up the process group lazily, around model/trainer
+    # construction, not at script entry.
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Canonical (merged) paths — used by all post-train diagnostics.
     rollout_log = out_dir / "rollouts.jsonl"
     eval_rollout_log = out_dir / "eval_rollout.jsonl"
-    # Per-rank shards written live during training.
+    # Per-rank shards written live during training. Each rank owns its own
+    # path so the appends never collide.
     rollout_shard = out_dir / f"rollouts.jsonl.r{rank}"
     eval_shard    = out_dir / f"eval_rollout.jsonl.r{rank}"
-    # Truncate this rank's shards.
     rollout_shard.write_text("")
     eval_shard.write_text("")
     if is_main:
         rollout_log.write_text("")
         eval_rollout_log.write_text("")
-    _barrier()
 
     if is_main:
         print(f"\n[run_one][rank{rank}/{world}] model={model_name}  "
