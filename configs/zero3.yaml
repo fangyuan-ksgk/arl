@@ -3,6 +3,12 @@ distributed_type: DEEPSPEED
 deepspeed_config:
   zero_stage: 3
   zero3_init_flag: true
+  # Gather sharded bf16 params on save so trainer.save_model() writes a
+  # consolidated model.safetensors that AutoModelForCausalLM.from_pretrained
+  # can reload. Without this, save_model() leaves a pile of zero_pp_rank_*.pt
+  # files + a zero_to_fp32.py recovery script, and reloading fails with
+  # "no file named pytorch_model.bin, model.safetensors, ..."
+  zero3_save_16bit_model: true
   gradient_accumulation_steps: 4
   gradient_clipping: 1.0
   offload_optimizer_device: none
