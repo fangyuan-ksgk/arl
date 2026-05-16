@@ -184,7 +184,15 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     model_load_kwargs = dict(
         torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
-    if args.vllm_mode == "server" and torch.cuda.is_available():
+
+    _under_distributed_launcher = (
+        "ACCELERATE_USE_DEEPSPEED" in os.environ
+        or "ACCELERATE_USE_FSDP" in os.environ
+        or "LOCAL_RANK" in os.environ
+    )
+    if (args.vllm_mode == "server"
+            and torch.cuda.is_available()
+            and not _under_distributed_launcher):
         model_load_kwargs["device_map"] = {"": f"cuda:{args.train_device}"}
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs)
 
