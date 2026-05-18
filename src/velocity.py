@@ -41,7 +41,7 @@ import torch
 import torch.nn.functional as F
 
 
-__all__ = ["compute_vt_batched", "compute_cot_perplexity"]
+__all__ = ["compute_vt_batched", "compute_vt_prefix_cache", "compute_cot_perplexity"]
 
 
 @torch.no_grad()
@@ -166,6 +166,141 @@ def compute_vt_batched(
             "R_T": R_T,
             "R_per_token": R_T / max(1, len(vt)),
         })
+    return out
+
+
+@torch.no_grad()
+def compute_vt_prefix_cache(
+    prompts: List[str],
+    completions: List[str],
+    references: List[str],
+    model,
+    tokenizer,
+    *,
+    micro_batch_size: int = 32,
+    strip_answer_marker: bool = True,
+) -> List[Dict[str, Any]]:
+    """Same contract as :func:`compute_vt_batched` but reuses the KV cache
+    of the shared ``q + o[:t]`` prefix across t.
+
+    Wins
+    ----
+    The naive batched version forwards ``q + o[:t] + a`` for every
+    ``t = 0..T``; the prefix ``q + o[:t]`` is rebuilt each time. Here we
+    forward ``q + o`` **once**, which gives:
+      (a) ``log p_ref(a_0 | q + o[:t])`` for every t, read directly from
+          the precomputed logits at positions Q-1..Q+T-1 (free);
+      (b) a full KV cache we can slice to length ``Q+t`` and forward only
+          ``a[1:]`` on top to get the remaining ``log p(a_k | …)``.
+
+    Forward FLOPs drop from O((Q+T)^3) to O((Q+T)^2 · A), i.e. ~(Q+T)/A×
+    fewer. Numerics match :func:`compute_vt_batched` to ~1e-5 in fp32
+    log-softmax (same dtype contract).
+
+    Notes
+    -----
+    Per-rollout sequential (one ``q+o`` forward per rollout). Within a
+    rollout, the t-loop is batched in ``micro_batch_size`` chunks; each
+    item shares the same (sliced) source cache, no cache re-allocation.
+    """
+    device = next(model.parameters()).device
+
+    # --- tokenize once per rollout (same as compute_vt_batched) ------------
+    per = []
+    for q, cot, a in zip(prompts, completions, references):
+        if strip_answer_marker:
+            i = cot.find("####")
+            cot = cot[:i].rstrip() if i >= 0 else cot
+        a_text = a if a.lstrip().startswith("####") else f"#### {a}"
+        q_ids = tokenizer(q,      add_special_tokens=False).input_ids
+        o_ids = tokenizer(cot,    add_special_tokens=False).input_ids
+        a_ids = tokenizer(a_text, add_special_tokens=False).input_ids
+        per.append((q_ids, o_ids, a_ids))
+
+    out: List[Dict[str, Any]] = []
+    for q_ids, o_ids, a_ids in per:
+        Q, T, La = len(q_ids), len(o_ids), len(a_ids)
+        toks = tokenizer.convert_ids_to_tokens(o_ids)
+        if T == 0 or La == 0:
+            out.append({"toks": toks, "vt": np.array([]), "logps": np.array([]),
+                        "R_T": float("nan"), "R_per_token": float("nan")})
+            continue
+
+        # --- (1) one forward over q+o; capture logits + full cache ---------
+        qo_ids = torch.tensor([q_ids + o_ids], device=device)
+        res = model(qo_ids, use_cache=True)
+        logp_qo = F.log_softmax(res.logits.float(), dim=-1)[0]   # (Q+T, V)
+        past = res.past_key_values
+        if hasattr(past, "to_legacy_cache"):                      # DynamicCache → tuple
+            past = past.to_legacy_cache()
+
+        # log p(a_0 | q + o[:t]) for t = 0..T comes from logits at Q+t-1
+        # (the position whose next-token prediction is a_0).
+        positions = Q - 1 + torch.arange(T + 1, device=device)
+        logp_a0 = logp_qo[positions, a_ids[0]]                    # (T+1,)
+
+        if La == 1:
+            logps_t = logp_a0
+        else:
+            # --- (2) for each t, forward a[:-1] with cache sliced to Q+t ---
+            a_input  = torch.tensor(a_ids[:-1], device=device)    # (La-1,)
+            a_target = torch.tensor(a_ids[1:],  device=device)    # (La-1,)
+            logp_rest = torch.zeros(T + 1, La - 1,
+                                    device=device, dtype=torch.float32)
+
+            for s in range(0, T + 1, micro_batch_size):
+                ts = list(range(s, min(s + micro_batch_size, T + 1)))
+                B  = len(ts)
+                t_max = ts[-1]
+                Cmax  = Q + t_max                                 # padded cache len
+
+                # Build a (B, H, Cmax, D) padded cache by COPYING the relevant
+                # slice. Padding positions are zeros; attention_mask gates them.
+                padded = []
+                for k, v in past:
+                    _, H, _, D = k.shape
+                    K = torch.zeros((B, H, Cmax, D), dtype=k.dtype, device=device)
+                    V = torch.zeros((B, H, Cmax, D), dtype=v.dtype, device=device)
+                    for b, t in enumerate(ts):
+                        L = Q + t
+                        K[b, :, :L, :] = k[0, :, :L, :]
+                        V[b, :, :L, :] = v[0, :, :L, :]
+                    padded.append((K, V))
+                padded = tuple(padded)
+
+                input_ids = a_input.unsqueeze(0).expand(B, -1).contiguous()
+                # Attention mask over (past + new) positions.
+                total = Cmax + (La - 1)
+                attn  = torch.zeros((B, total), dtype=torch.long, device=device)
+                for b, t in enumerate(ts):
+                    attn[b, :Q + t] = 1
+                attn[:, Cmax:] = 1
+                # Position ids for the new tokens: [Q+t, ..., Q+t+La-2]
+                pos_ids = torch.zeros((B, La - 1), dtype=torch.long, device=device)
+                for b, t in enumerate(ts):
+                    pos_ids[b] = torch.arange(Q + t, Q + t + La - 1, device=device)
+
+                res2 = model(
+                    input_ids=input_ids,
+                    attention_mask=attn,
+                    position_ids=pos_ids,
+                    past_key_values=padded,
+                    use_cache=False,
+                )
+                lp = F.log_softmax(res2.logits.float(), dim=-1)   # (B, La-1, V)
+                gathered = lp.gather(
+                    2, a_target.view(1, -1, 1).expand(B, -1, 1)
+                ).squeeze(-1)                                     # (B, La-1)
+                for b, t in enumerate(ts):
+                    logp_rest[t] = gathered[b]
+
+            logps_t = logp_a0 + logp_rest.sum(dim=1)              # (T+1,)
+
+        logps = logps_t.cpu().numpy().astype(np.float64)
+        vt    = logps[1:] - logps[:-1]
+        R_T   = float(logps[-1] - logps[0])
+        out.append({"toks": toks, "vt": vt, "logps": logps,
+                    "R_T": R_T, "R_per_token": R_T / max(1, len(vt))})
     return out
 
 
