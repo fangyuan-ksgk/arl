@@ -130,7 +130,11 @@ def main() -> None:
         prompts.append(tokenizer.apply_chat_template(
             to_chat(puzzle)["prompt"], tokenize=False, add_generation_prompt=True))
         completions.append(row["completion"])
-        refs.append(sols[0])
+        refs.append(sols[0]) # -> Issue 1. Only the first correct answer is used for velocity reward computation (wrong)
+                             #    A dumb fix : take the correct answer with max decoding reward
+                             #    A request: when mode is not producing the correct answer, record p(current answer | cot + query) for reference
+                             #    I suspect the delta between p(correct answer | cot + query) - p(current answer | cot + query) is meaningful
+                             #    
         valid.append(True)
 
     n_score = sum(valid)
