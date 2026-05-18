@@ -93,16 +93,14 @@ VLLM_PID=""
 start_vllm_server() {
   local model="$1"; local max_len="$2"; local log_file="$3"
   stop_vllm_server
-  echo "  [vllm] starting server  model=${model}  max_model_len=${max_len}  gpu=${VLLM_GPU}"
-  # --max-model-len is set to the current CoT budget by design (control
-  # group for a paired experiment). Note: this caps prompt+completion to
-  # ${max_len} tokens, so the actual completion budget is slightly less
-  # than --max-completion-length once the ~100-token Game-24 prompt is
-  # accounted for. That truncation is part of the controlled comparison.
+  echo "  [vllm] starting server  model=${model}  (max-model-len: model default)  gpu=${VLLM_GPU}"
+  # NOTE: previously we pinned --max-model-len to the CoT budget (${max_len}).
+  # That capped prompt+completion together, which truncated long-CoT runs
+  # below --max-completion-length. For the len=2048 sweep we let the server
+  # use the model's native context window so completion budget is honoured.
   CUDA_VISIBLE_DEVICES="${VLLM_GPU}" \
     setsid trl vllm-serve --model "${model}" \
       --host "${VLLM_HOST}" --port "${VLLM_PORT}" \
-      --max-model-len "${max_len}" \
       --enforce-eager \
       > "${log_file}" 2>&1 &
   VLLM_PID=$!
