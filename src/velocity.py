@@ -16,18 +16,24 @@ is ``R_T = Σ_t v_t = log p_ref(a | q, o) - log p_ref(a | q)``.
 Implementation
 --------------
 A naive computation requires ``T + 1`` serial forward passes per rollout
-(one per ``t``). This module vectorizes across both ``t`` and rollouts by
-packing every answer-conditioned sequence into a single right-padded batch
-and running it through the model in length-sorted micro-batches.
+(one per ``t``). Two layers of vectorization make this tractable:
 
-Same FLOPs as the serial loop, ~5–20× wall-clock speedup on GPU due to
-batched matmuls. Log-softmax is computed in fp32 even when weights are
-bf16, removing the dominant source of batched-vs-serial drift.
+1. **Shared-prefix KV cache.** Forward ``q + o`` once per rollout, capture
+   the full cache, and reuse it for every ``t`` by slicing to length
+   ``Q + t``. ``log p(a_0 | q + o[:t])`` is then a free read from the
+   already-computed logits at position ``Q + t - 1``; only ``a[1:]`` needs
+   a second forward, batched across ``t``.
+2. **fp32 reduction.** Log-softmax in fp32 even when weights are bf16,
+   removing the dominant source of micro-batch round-off (~1e-1 → ~1e-5).
+
+Forward FLOPs drop from O((Q+T)³) to O((Q+T)² · A), i.e. ~(Q+T)/A× fewer
+than the rebuild-prefix-each-t baseline. ~2× wall clock at Q+T ≈ 500,
+A ≈ 20 on Qwen3-1.7B.
 
 Public API
 ----------
 - ``compute_vt_batched(prompts, completions, references, model, tokenizer, *,
-                       micro_batch_size=16, strip_answer_marker=True)``
+                       micro_batch_size=32, strip_answer_marker=True)``
 - ``compute_cot_perplexity(prompts, completions, model, tokenizer, *,
                            micro_batch_size=4)``  — cheaper side-quest:
   one forward per rollout, returns per-CoT-token log-probability.
@@ -53,10 +59,17 @@ def compute_vt_batched(
     model,
     tokenizer,
     *,
-    micro_batch_size: int = 16,
+    micro_batch_size: int = 32,
     strip_answer_marker: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Vectorized decoding-velocity computation.
+    """Vectorized decoding-velocity computation (shared-prefix KV cache).
+
+    For each rollout, forwards ``q + o`` once to obtain the full KV cache,
+    then for every ``t = 0..T`` slices the cache to length ``Q + t`` and
+    forwards only ``a[1:]`` on top. ``log p(a_0 | q + o[:t])`` is read
+    directly from the first-pass logits at position ``Q + t - 1`` (free).
+    Forward FLOPs: O((Q+T)² · A) vs the rebuild-prefix baseline's
+    O((Q+T)³) — ~2× wall clock at Q+T ≈ 500, A ≈ 20 on Qwen3-1.7B.
 
     Parameters
     ----------
@@ -76,8 +89,8 @@ def compute_vt_batched(
         HuggingFace ``AutoModelForCausalLM`` and matching tokenizer. The
         model must already be on its target device and in ``.eval()`` mode.
     micro_batch_size
-        How many ``(rollout, t)`` sequences to forward at once. Tune to
-        saturate GPU memory; lower if you hit OOM on long CoTs.
+        How many ``t`` slices to forward at once **within a rollout**.
+        Tune to saturate GPU memory; lower if you hit OOM on long CoTs.
 
     Returns
     -------
@@ -92,121 +105,8 @@ def compute_vt_batched(
         }
     """
     device = next(model.parameters()).device
-    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id or 0
 
     # --- tokenize once per rollout -----------------------------------------
-    per = []
-    for q, cot, a in zip(prompts, completions, references):
-        if strip_answer_marker:
-            i = cot.find("####")
-            cot = cot[:i].rstrip() if i >= 0 else cot
-        a_text = a if a.lstrip().startswith("####") else f"#### {a}"
-        q_ids = tokenizer(q,      add_special_tokens=False).input_ids
-        o_ids = tokenizer(cot,    add_special_tokens=False).input_ids
-        a_ids = tokenizer(a_text, add_special_tokens=False).input_ids
-        per.append((q_ids, o_ids, a_ids))
-
-    # --- enqueue every (rollout_i, t) sequence -----------------------------
-    # Each item = (rollout_idx, t, full_ids, answer_start, La)
-    queue = []
-    n_logps: List[int] = []                # T+1 per rollout (0 if degenerate)
-    for i, (q_ids, o_ids, a_ids) in enumerate(per):
-        T, La = len(o_ids), len(a_ids)
-        n_logps.append(T + 1 if (T > 0 and La > 0) else 0)
-        for t in range(n_logps[i]):
-            ids = q_ids + o_ids[:t] + a_ids
-            queue.append((i, t, ids, len(q_ids) + t, La))
-
-    # Length-sort the queue so each micro-batch is near-homogeneous.
-    # Cuts padding overhead from ~50 % to <5 % when rollouts vary in length.
-    queue.sort(key=lambda item: len(item[2]))
-
-    logps_buf = [np.full(n, np.nan, dtype=np.float64) for n in n_logps]
-
-    # --- micro-batched forward passes --------------------------------------
-    for s in range(0, len(queue), micro_batch_size):
-        chunk = queue[s:s + micro_batch_size]
-        max_len = max(len(item[2]) for item in chunk)
-        B = len(chunk)
-        input_ids = torch.full((B, max_len), pad_id, dtype=torch.long, device=device)
-        attn      = torch.zeros((B, max_len), dtype=torch.long, device=device)
-        for b, (_, _, ids, _, _) in enumerate(chunk):
-            L = len(ids)
-            input_ids[b, :L] = torch.tensor(ids, device=device)
-            attn[b, :L] = 1
-        # fp32 softmax even if weights are bf16: removes the dominant source
-        # of batched-vs-serial drift (~1e-1 → ~1e-3).
-        log_probs = F.log_softmax(
-            model(input_ids=input_ids, attention_mask=attn).logits.float(),
-            dim=-1,
-        )                                                  # (B, max_len, V)
-        for b, (i, t, ids, ans_start, La) in enumerate(chunk):
-            # Token a[k] (at position ans_start + k) is predicted by the
-            # logits at position ans_start + k - 1.
-            pos  = torch.arange(ans_start - 1, ans_start - 1 + La, device=device)
-            toks = torch.tensor(ids[ans_start:ans_start + La], device=device)
-            logps_buf[i][t] = log_probs[b, pos, toks].sum().item()
-
-    # --- assemble per-rollout results --------------------------------------
-    out: List[Dict[str, Any]] = []
-    for i, (q_ids, o_ids, a_ids) in enumerate(per):
-        if n_logps[i] == 0:
-            out.append({
-                "toks": [], "vt": np.array([]), "logps": np.array([]),
-                "R_T": float("nan"), "R_per_token": float("nan"),
-            })
-            continue
-        lp = logps_buf[i]
-        vt = lp[1:] - lp[:-1]
-        toks = tokenizer.convert_ids_to_tokens(o_ids)
-        R_T = float(lp[-1] - lp[0])
-        out.append({
-            "toks": toks,
-            "vt": vt,
-            "logps": lp,
-            "R_T": R_T,
-            "R_per_token": R_T / max(1, len(vt)),
-        })
-    return out
-
-
-@torch.no_grad()
-def compute_vt_prefix_cache(
-    prompts: List[str],
-    completions: List[str],
-    references: List[str],
-    model,
-    tokenizer,
-    *,
-    micro_batch_size: int = 32,
-    strip_answer_marker: bool = True,
-) -> List[Dict[str, Any]]:
-    """Same contract as :func:`compute_vt_batched` but reuses the KV cache
-    of the shared ``q + o[:t]`` prefix across t.
-
-    Wins
-    ----
-    The naive batched version forwards ``q + o[:t] + a`` for every
-    ``t = 0..T``; the prefix ``q + o[:t]`` is rebuilt each time. Here we
-    forward ``q + o`` **once**, which gives:
-      (a) ``log p_ref(a_0 | q + o[:t])`` for every t, read directly from
-          the precomputed logits at positions Q-1..Q+T-1 (free);
-      (b) a full KV cache we can slice to length ``Q+t`` and forward only
-          ``a[1:]`` on top to get the remaining ``log p(a_k | …)``.
-
-    Forward FLOPs drop from O((Q+T)^3) to O((Q+T)^2 · A), i.e. ~(Q+T)/A×
-    fewer. Numerics match :func:`compute_vt_batched` to ~1e-5 in fp32
-    log-softmax (same dtype contract).
-
-    Notes
-    -----
-    Per-rollout sequential (one ``q+o`` forward per rollout). Within a
-    rollout, the t-loop is batched in ``micro_batch_size`` chunks; each
-    item shares the same (sliced) source cache, no cache re-allocation.
-    """
-    device = next(model.parameters()).device
-
-    # --- tokenize once per rollout (same as compute_vt_batched) ------------
     per = []
     for q, cot, a in zip(prompts, completions, references):
         if strip_answer_marker:
@@ -304,6 +204,10 @@ def compute_vt_prefix_cache(
         out.append({"toks": toks, "vt": vt, "logps": logps,
                     "R_T": R_T, "R_per_token": R_T / max(1, len(vt))})
     return out
+
+
+# Back-compat alias: prior code called the KV-cached path explicitly.
+compute_vt_prefix_cache = compute_vt_batched
 
 
 @torch.no_grad()
