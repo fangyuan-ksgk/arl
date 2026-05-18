@@ -39,6 +39,7 @@ from typing import Any, Dict, List
 import numpy as np
 import torch
 import torch.nn.functional as F
+from transformers import DynamicCache
 
 
 __all__ = ["compute_vt_batched", "compute_vt_prefix_cache", "compute_cot_perplexity"]
@@ -266,7 +267,8 @@ def compute_vt_prefix_cache(
                         K[b, :, :L, :] = k[0, :, :L, :]
                         V[b, :, :L, :] = v[0, :, :L, :]
                     padded.append((K, V))
-                padded = tuple(padded)
+                # HF ≥4.36 wants a Cache object, not a legacy tuple.
+                padded_cache = DynamicCache.from_legacy_cache(tuple(padded))
 
                 input_ids = a_input.unsqueeze(0).expand(B, -1).contiguous()
                 # Attention mask over (past + new) positions.
@@ -284,7 +286,7 @@ def compute_vt_prefix_cache(
                     input_ids=input_ids,
                     attention_mask=attn,
                     position_ids=pos_ids,
-                    past_key_values=padded,
+                    past_key_values=padded_cache,
                     use_cache=False,
                 )
                 lp = F.log_softmax(res2.logits.float(), dim=-1)   # (B, La-1, V)
