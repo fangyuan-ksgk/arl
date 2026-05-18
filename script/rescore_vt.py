@@ -32,6 +32,12 @@ import numpy as np
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+# cuDNN's SDPA backend can fail to build an execution plan for some
+# Qwen3 / long-context bf16 shapes ("No valid execution plans built").
+# Disable it so PyTorch falls back to FlashAttention or the math backend.
+if hasattr(torch.backends.cuda, "enable_cudnn_sdp"):
+    torch.backends.cuda.enable_cudnn_sdp(False)
+
 # Repo root → sys.path so `src.*` imports resolve when run as a script.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
