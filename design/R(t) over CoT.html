@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>R(t) over CoT prefix length · step 1200</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #f1ede5;
+    --panel: #fbfaf6;
+    --ink: #14110d;
+    --ink-2: #2c2820;
+    --muted: #786f61;
+    --muted-2: #a59c8c;
+    --rule: #d9d3c7;
+    --rule-2: #ebe5d8;
+    --red: #d23b2c;
+    --red-soft: rgba(210, 59, 44, 0.12);
+    --green-soft: rgba(70, 140, 90, 0.10);
+    --term-bg: #0d0c0a;
+    --term-panel: #131210;
+    --term-ink: #d9d4cc;
+    --term-red: #ff6a5a;
+    --term-green: #95cf7a;
+    --term-amber: #e6c068;
+    --term-dim: #6f6a62;
+    --term-rule: #25231f;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  body {
+    font-family: "DM Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-feature-settings: "tnum" 1, "ss01" 1;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+  .wrap {
+    max-width: 1640px;
+    margin: 0 auto;
+    padding: 26px 32px 36px;
+  }
+
+  /* ───── header ───── */
+  .header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 24px;
+    margin-bottom: 14px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .eyebrow {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .header h1 {
+    font-size: 18px;
+    font-weight: 600;
+    margin: 0;
+    letter-spacing: -0.005em;
+  }
+  .header h1 .accent { color: var(--red); }
+  .meta {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--muted);
+    text-align: right;
+    line-height: 1.6;
+  }
+  .meta b { color: var(--ink); font-weight: 600; }
+
+  /* ───── main grid ───── */
+  .main {
+    display: grid;
+    grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+    gap: 12px;
+    align-items: stretch;
+  }
+  .left, .right {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel .panel-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--rule);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 10.5px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    background: linear-gradient(to bottom, rgba(0,0,0,0.015), transparent);
+  }
+  .panel .panel-head .right-tag { color: var(--ink); }
+
+  .chart-body {
+    flex: 1;
+    padding: 8px 10px 4px;
+    display: flex;
+  }
+  .chart-body svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    max-height: 100%;
+  }
+
+  /* ───── terminal (CoT) ───── */
+  .term {
+    background: var(--term-bg);
+    color: var(--term-ink);
+    border-color: #1d1d1f;
+  }
+  .term .panel-head {
+    background: linear-gradient(to bottom, #18171428, transparent);
+    border-bottom-color: var(--term-rule);
+    color: #847e72;
+  }
+  .term .panel-head .right-tag { color: var(--term-ink); }
+  .term-body {
+    flex: 1;
+    padding: 18px 22px 22px;
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 12.5px;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;
+    position: relative;
+  }
+  .para {
+    border-left: 2px solid transparent;
+    padding-left: 12px;
+    transition: border-color 250ms, opacity 250ms;
+    opacity: 0.45;
+  }
+  .para.visible { opacity: 1; }
+  .para.active { border-left-color: var(--term-amber); }
+  .para.done { border-left-color: #2e3a2a; opacity: 0.82; }
+  .para .head {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    font-size: 11.5px;
+    margin-bottom: 4px;
+    flex-wrap: wrap;
+  }
+  .para .pno { color: var(--term-amber); font-weight: 600; }
+  .para .tokrange { color: var(--term-dim); }
+  .para .dr { font-weight: 600; }
+  .para .dr.pos { color: var(--term-green); }
+  .para .dr.neg { color: var(--term-red); }
+  .para .body {
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--term-ink);
+    padding-left: 0;
+  }
+  .caret {
+    display: inline-block;
+    width: 7px;
+    height: 1em;
+    background: var(--term-ink);
+    vertical-align: -2px;
+    margin-left: 2px;
+    animation: blink 1s steps(2, start) infinite;
+  }
+  @keyframes blink { to { background: transparent; } }
+
+  /* ───── controls ───── */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 9px 14px;
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+  }
+  .controls button {
+    appearance: none;
+    border: 1px solid var(--rule);
+    background: #fff;
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    padding: 6px 12px;
+    border-radius: 2px;
+    cursor: pointer;
+    letter-spacing: 0.02em;
+    transition: background 120ms, color 120ms, border-color 120ms;
+  }
+  .controls button:hover { background: var(--rule-2); }
+  .controls .sep {
+    width: 1px;
+    height: 20px;
+    background: var(--rule);
+  }
+  .controls .readout {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 11px;
+    color: var(--muted);
+    min-width: 280px;
+    white-space: nowrap;
+  }
+  .controls .readout b { color: var(--ink); font-weight: 600; }
+  .controls .readout .own-r {
+    color: var(--red);
+    font-weight: 600;
+  }
+  .controls input[type="range"] {
+    flex: 1;
+    accent-color: var(--red);
+    min-width: 80px;
+  }
+  .controls .speed { display: flex; gap: 3px; }
+  .controls .speed button.active {
+    background: var(--ink);
+    color: var(--bg);
+    border-color: var(--ink);
+  }
+
+  /* ───── SVG ───── */
+  .ax-line { stroke: #14110d; stroke-width: 1; fill: none; }
+  .ax-tick { stroke: #14110d; stroke-width: 1; }
+  .ax-text { font-family: "JetBrains Mono", monospace; font-size: 10px; fill: #5a5346; }
+  .ax-title { font-family: "DM Sans", sans-serif; font-size: 11px; fill: #2c2820; }
+  .panel-title { font-family: "DM Sans", sans-serif; font-size: 12px; fill: #14110d; font-weight: 600; }
+  .zero-line { stroke: #14110d; stroke-width: 0.8; fill: none; opacity: 0.7; }
+  .grid-line { stroke: #d9d3c7; stroke-width: 0.5; opacity: 0.7; }
+  .ref-curve { fill: none; stroke: #8e867a; stroke-width: 0.7; opacity: 0.5; }
+  .own-curve { fill: none; stroke: var(--red); stroke-width: 1.8; }
+  .own-curve-glow { fill: none; stroke: var(--red); stroke-width: 4; opacity: 0.18; filter: blur(1px); }
+  .para-band-neg { fill: var(--red-soft); }
+  .para-band-pos { fill: var(--green-soft); }
+  .para-end { stroke: #6e9cd6; stroke-width: 0.8; stroke-dasharray: 2 3; opacity: 0.85; }
+  .para-end-label { font-family: "JetBrains Mono", monospace; font-size: 9.5px; fill: #5a78a3; }
+  .bar-rect { fill: #b8b1a5; }
+  .bar-rect.own { fill: var(--red); }
+  .bar-label { font-family: "JetBrains Mono", monospace; font-size: 8.5px; fill: #2c2820; }
+  .bar-label.own { fill: var(--red); font-weight: 700; }
+  .frame-rect { fill: none; stroke: #14110d; stroke-width: 1; }
+  .t-cursor { stroke: #14110d; stroke-width: 0.7; stroke-dasharray: 1 2; opacity: 0.3; }
+  .leader-dot { fill: var(--red); stroke: #fff; stroke-width: 1.4; }
+  .leader-halo { fill: var(--red); opacity: 0.15; }
+  .badge-bg { fill: #14110d; }
+  .badge-text { font-family: "JetBrains Mono", monospace; font-size: 10px; fill: #fff; font-weight: 600; }
+  .legend-text { font-family: "DM Sans", sans-serif; font-size: 10.5px; fill: var(--ink-2); }
+  .step-badge-bg { fill: #14110d; }
+  .step-badge-text { font-family: "JetBrains Mono", monospace; font-size: 9.5px; fill: #fff; letter-spacing: 0.1em; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header">
+    <div>
+      <div class="eyebrow">Active Reinforcement Learning · Game of 24 · RLVR</div>
+      <h1>R(t) reward dynamics over CoT prefix length<span class="accent"> ·</span> <span style="font-weight:500">streaming chain-of-thought</span></h1>
+    </div>
+    <div class="meta">
+      step <b>1200</b> &nbsp; idx <b>4</b> &nbsp; refs <b>32</b><br/>
+      numbers <b>{5, 6, 8, 9}</b> &nbsp; target <b>24</b>
+    </div>
+  </div>
+
+  <div class="main">
+
+    <div class="left">
+      <div class="panel">
+        <div class="panel-head">
+          <span>R(t) over 32 references</span>
+          <span class="right-tag" id="r-headtag">t = <span id="head-t">0</span> / 275</span>
+        </div>
+        <div class="chart-body">
+          <svg id="chart" viewBox="0 0 1080 640" preserveAspectRatio="xMidYMid meet"></svg>
+        </div>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="panel term">
+        <div class="panel-head">
+          <span>streaming CoT</span>
+          <span class="right-tag">idx=4 · {5,6,8,9} → 24</span>
+        </div>
+        <div class="term-body" id="cot"></div>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="controls">
+    <button id="play">▶ Play</button>
+    <button id="reset">↺ Reset</button>
+    <div class="sep"></div>
+    <div class="readout" id="readout">t = <b>0</b> / 275 &nbsp;·&nbsp; ¶<b>0</b> &nbsp;·&nbsp; R<sub>own</sub>(t) = <span class="own-r" id="own-r">+0.00</span></div>
+    <input type="range" id="scrub" min="0" max="275" step="1" value="0" />
+    <div class="speed">
+      <button data-speed="0.5">0.5×</button>
+      <button data-speed="1" class="active">1×</button>
+      <button data-speed="2">2×</button>
+      <button data-speed="4">4×</button>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ============================================================
+   DATA
+   ============================================================ */
+
+const T_MAX = 275;
+const PARA_ENDS = [51, 95, 139, 190, 275];
+const PARAGRAPHS = [
+  { tokRange: "0→51",   delta: -2.23, body: "<think>\nOkay, let's see. I need to use each of the numbers 5, 6, 8, 9 exactly once with +, -, *, or / and parentheses to get 24. Let me think of possible combinations." },
+  { tokRange: "51→95",  delta: +0.95, body: "First, maybe try adding some numbers. Let's add 9 + 8 = 17, then add 6 and 5 to reach 28, which is too much. That's not helpful." },
+  { tokRange: "95→139", delta: +2.70, body: "What if I subtract? 9 − 5 = 4, then 8 * 4 = 32, minus 6 gives 26, minus 8 again is 18. No." },
+  { tokRange: "139→190",delta: +4.97, body: "How about combining two numbers first? Maybe 8 * (9 − (5 + 6))? Let's check: 5+6=11, 9−11=−2, 8*−2=−16, nope." },
+  { tokRange: "190→275",delta: +26.98,body: "What about 6*(8 − (9−5))? 9−5=4, 8−4=4, 6*4=24! Oh! That works. Let me check the numbers: 6,8,9,5. Yes, all used once. So the expression is 6*(8 − (9 − 5)) = 24. So the final answer is" }
+];
+
+// Final R_T for 32 refs, descending. First entry is the "own (correct)".
+const REF_FINAL = [
+  { expr: "6*(8-(9-5))",    R_T: 33.2, own: true },
+  { expr: "6*((8-9)+5)",    R_T: 23.1 },
+  { expr: "(8-(9-5))*6",    R_T: 22.0 },
+  { expr: "6*((5-9)+8)",    R_T: 19.9 },
+  { expr: "((8-9)+5)*6",    R_T: 18.7 },
+  { expr: "6*(5+(8-9))",    R_T: 17.4 },
+  { expr: "((5-9)+8)*6",    R_T: 16.6 },
+  { expr: "6*(8+(5-9))",    R_T: 15.7 },
+  { expr: "6*((5+8)-9)",    R_T: 14.9 },
+  { expr: "6*(5-(9-8))",    R_T: 14.1 },
+  { expr: "6*((8+5)-9)",    R_T: 13.2 },
+  { expr: "(5-(9-8))*6",    R_T: 12.4 },
+  { expr: "((6+9)*8)/5",    R_T: 11.6 },
+  { expr: "(5+(8-9))*6",    R_T: 10.8 },
+  { expr: "((5+8)-9)*6",    R_T: 10.0 },
+  { expr: "((8+5)-9)*6",    R_T:  9.2 },
+  { expr: "(8+(5-9))*6",    R_T:  8.4 },
+  { expr: "((6+9)/5)*8",    R_T:  7.6 },
+  { expr: "8*((6+9)/5)",    R_T:  6.8 },
+  { expr: "(6+9)*(8/5)",    R_T:  6.0 },
+  { expr: "8*((9+6)/5)",    R_T:  5.2 },
+  { expr: "((9+6)/5)*8",    R_T:  4.5 },
+  { expr: "8*(5/(9+6))",    R_T:  3.4 },
+  { expr: "(8/5)*(6+9)",    R_T:  2.5 },
+  { expr: "8*(5/(6+9))",    R_T:  1.9 },
+  { expr: "(8/5)*(9+6)",    R_T:  1.4 },
+  { expr: "(8*(6+9))/5",    R_T:  0.9 },
+  { expr: "(9+6)*(8/5)",    R_T:  0.3 },
+  { expr: "8*(6+9)/5",      R_T: -0.4 },
+  { expr: "(9+6)/5*8",      R_T: -1.2 },
+  { expr: "8/(6+9)*5",      R_T: -2.1 },
+  { expr: "(9+6)/(5/8)",    R_T: -3.8 },
+];
+
+/* ============================================================
+   GENERATE 32 TRAJECTORIES
+   ============================================================ */
+
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = seed;
+    t = Math.imul(t ^ t >>> 15, t | 1);
+    t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function baseline(t) {
+  const x = t / T_MAX;
+  if (x < 0.08) return -28 * (x / 0.08);
+  if (x < 0.20) return -28 + 18 * ((x - 0.08) / 0.12);
+  if (x < 0.72) return -10 + Math.sin(x * 18) * 4 + Math.cos(x * 11) * 2;
+  return -10 + 5 * ((x - 0.72) / 0.28);
+}
+
+function genCurve(seed, R_T) {
+  const rng = mulberry32(seed);
+  const arr = new Float32Array(T_MAX + 1);
+  arr[0] = 0;
+  let drift = 0;
+  for (let i = 1; i <= T_MAX; i++) {
+    drift = drift * 0.92 + (rng() - 0.5) * 1.6;
+    arr[i] = baseline(i) + drift;
+  }
+  const offset = R_T - arr[T_MAX];
+  for (let i = 0; i <= T_MAX; i++) {
+    const w = Math.pow(i / T_MAX, 1.7);
+    arr[i] += offset * w;
+  }
+  return arr;
+}
+
+function genOwnCurve(R_T) {
+  const rng = mulberry32(101);
+  const arr = new Float32Array(T_MAX + 1);
+  arr[0] = 0;
+  let drift = 0;
+  for (let i = 1; i <= T_MAX; i++) {
+    drift = drift * 0.9 + (rng() - 0.5) * 2.2;
+    const x = i / T_MAX;
+    let base = baseline(i);
+    if (x > 0.69) {
+      const k = (x - 0.69) / 0.31;
+      base += 12 * k + 8 * Math.sin(k * 14) * k;
+    }
+    arr[i] = base + drift * 1.1;
+  }
+  const offset = R_T - arr[T_MAX];
+  for (let i = 0; i <= T_MAX; i++) {
+    const w = Math.pow(i / T_MAX, 2.0);
+    arr[i] += offset * w;
+  }
+  return arr;
+}
+
+const CURVES = REF_FINAL.map((r, i) =>
+  r.own ? genOwnCurve(r.R_T) : genCurve(i * 7 + 3, r.R_T)
+);
+
+/* ============================================================
+   SVG LAYOUT  (viewBox 1080 x 640)
+   ============================================================ */
+
+const svgNS = "http://www.w3.org/2000/svg";
+const chart = document.getElementById("chart");
+
+const L = {
+  l: { x0: 56, y0: 38, x1: 760, y1: 560 },   // line chart
+  r: { x0: 820, y0: 38, x1: 1052, y1: 560 }, // bar chart
+  yMin: -45, yMax: 36,
+  tMin: 0, tMax: T_MAX,
+  rMin: -8, rMax: 36,
+};
+
+function xL(t) { return L.l.x0 + (t - L.tMin) / (L.tMax - L.tMin) * (L.l.x1 - L.l.x0); }
+function yL(v) { return L.l.y1 - (v - L.yMin) / (L.yMax - L.yMin) * (L.l.y1 - L.l.y0); }
+function xR(v) { return L.r.x0 + (v - L.rMin) / (L.rMax - L.rMin) * (L.r.x1 - L.r.x0); }
+
+function el(name, attrs) {
+  const n = document.createElementNS(svgNS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+/* --- paragraph bands (background, drawn first) --- */
+function drawParaBands() {
+  const starts = [0, ...PARA_ENDS];
+  PARAGRAPHS.forEach((p, i) => {
+    const x0 = xL(starts[i]);
+    const x1 = xL(starts[i + 1]);
+    const cls = p.delta >= 0 ? "para-band-pos" : "para-band-neg";
+    chart.appendChild(el("rect", {
+      x: x0, y: L.l.y0,
+      width: x1 - x0, height: L.l.y1 - L.l.y0,
+      class: cls
+    }));
+  });
+}
+
+/* --- left axes/grid --- */
+function drawAxesLeft() {
+  // y gridlines
+  for (let v = -40; v <= 30; v += 10) {
+    const y = yL(v);
+    chart.appendChild(el("line", { x1: L.l.x0, x2: L.l.x1, y1: y, y2: y, class: "grid-line" }));
+  }
+  // frame
+  chart.appendChild(el("rect", {
+    x: L.l.x0, y: L.l.y0,
+    width: L.l.x1 - L.l.x0, height: L.l.y1 - L.l.y0,
+    class: "frame-rect"
+  }));
+  // y ticks
+  for (let v = -40; v <= 30; v += 10) {
+    const y = yL(v);
+    chart.appendChild(el("line", { x1: L.l.x0 - 4, x2: L.l.x0, y1: y, y2: y, class: "ax-tick" }));
+    const t = el("text", { x: L.l.x0 - 8, y: y + 3.5, "text-anchor": "end", class: "ax-text" });
+    t.textContent = v;
+    chart.appendChild(t);
+  }
+  // y axis label
+  const yl = el("text", {
+    x: 14, y: (L.l.y0 + L.l.y1) / 2,
+    "text-anchor": "middle", class: "ax-title",
+    transform: `rotate(-90, 14, ${(L.l.y0 + L.l.y1) / 2})`
+  });
+  yl.textContent = "cum R(t)";
+  chart.appendChild(yl);
+  // x ticks
+  for (let v = 0; v <= 250; v += 50) {
+    const x = xL(v);
+    chart.appendChild(el("line", { x1: x, x2: x, y1: L.l.y1, y2: L.l.y1 + 4, class: "ax-tick" }));
+    const t = el("text", { x: x, y: L.l.y1 + 15, "text-anchor": "middle", class: "ax-text" });
+    t.textContent = v;
+    chart.appendChild(t);
+  }
+  const xl = el("text", {
+    x: (L.l.x0 + L.l.x1) / 2, y: L.l.y1 + 34,
+    "text-anchor": "middle", class: "ax-title"
+  });
+  xl.textContent = "CoT prefix length  t";
+  chart.appendChild(xl);
+  // zero line
+  chart.appendChild(el("line", {
+    x1: L.l.x0, x2: L.l.x1, y1: yL(0), y2: yL(0), class: "zero-line"
+  }));
+
+  // step badge top-right
+  const bx = L.l.x1 - 92, by = L.l.y0 + 8;
+  chart.appendChild(el("rect", { x: bx, y: by, width: 84, height: 18, rx: 2, class: "step-badge-bg" }));
+  const bt = el("text", { x: bx + 42, y: by + 12, "text-anchor": "middle", class: "step-badge-text" });
+  bt.textContent = "STEP 1200 · idx 4";
+  chart.appendChild(bt);
+}
+
+/* --- right axes/frame --- */
+function drawAxesRight() {
+  // x gridlines (vertical)
+  for (let v = -5; v <= 35; v += 5) {
+    const x = xR(v);
+    chart.appendChild(el("line", { x1: x, x2: x, y1: L.r.y0, y2: L.r.y1, class: "grid-line" }));
+  }
+  chart.appendChild(el("rect", {
+    x: L.r.x0, y: L.r.y0,
+    width: L.r.x1 - L.r.x0, height: L.r.y1 - L.r.y0,
+    class: "frame-rect"
+  }));
+  for (let v = -5; v <= 35; v += 10) {
+    const x = xR(v);
+    chart.appendChild(el("line", { x1: x, x2: x, y1: L.r.y1, y2: L.r.y1 + 4, class: "ax-tick" }));
+    const t = el("text", { x: x, y: L.r.y1 + 15, "text-anchor": "middle", class: "ax-text" });
+    t.textContent = v;
+    chart.appendChild(t);
+  }
+  const xl = el("text", {
+    x: (L.r.x0 + L.r.x1) / 2, y: L.r.y1 + 34,
+    "text-anchor": "middle", class: "ax-title"
+  });
+  xl.textContent = "R(t) — live, sorted by final R_T";
+  chart.appendChild(xl);
+  chart.appendChild(el("line", {
+    x1: xR(0), x2: xR(0), y1: L.r.y0, y2: L.r.y1, class: "zero-line"
+  }));
+}
+
+/* --- paragraph end dotted lines + labels --- */
+const paraLines = [];
+function buildParaLines() {
+  PARA_ENDS.forEach((pe, i) => {
+    const ln = el("line", {
+      x1: xL(pe), x2: xL(pe),
+      y1: L.l.y0, y2: L.l.y1,
+      class: "para-end",
+      opacity: 0
+    });
+    chart.appendChild(ln);
+    const lbl = el("text", {
+      x: xL(pe) - 3, y: L.l.y0 + 12,
+      "text-anchor": "end",
+      class: "para-end-label",
+      opacity: 0
+    });
+    lbl.textContent = `¶${i}`;
+    chart.appendChild(lbl);
+    paraLines.push({ t: pe, node: ln, label: lbl });
+  });
+}
+
+/* --- curves --- */
+const curvePaths = [];
+let ownGlow, ownPath;
+function buildCurves() {
+  // refs first (in arr order)
+  REF_FINAL.forEach((r, i) => {
+    if (r.own) return;
+    const p = el("path", { class: "ref-curve", d: "" });
+    chart.appendChild(p);
+    curvePaths[i] = p;
+  });
+  // own glow + own line on top
+  ownGlow = el("path", { class: "own-curve-glow", d: "" });
+  chart.appendChild(ownGlow);
+  ownPath = el("path", { class: "own-curve", d: "" });
+  chart.appendChild(ownPath);
+  curvePaths[0] = ownPath;
+}
+
+function pathForCurve(curve, tEnd) {
+  if (tEnd <= 0) return `M ${xL(0).toFixed(1)} ${yL(curve[0]).toFixed(1)}`;
+  let d = `M ${xL(0).toFixed(1)} ${yL(curve[0]).toFixed(1)}`;
+  for (let i = 1; i <= tEnd; i++) {
+    d += ` L${xL(i).toFixed(1)} ${yL(curve[i]).toFixed(1)}`;
+  }
+  return d;
+}
+
+/* --- cursor + leader dot + badge --- */
+let tCursor, leaderHalo, leaderDot, badgeGroup, badgeBg, badgeText;
+function buildCursor() {
+  tCursor = el("line", {
+    x1: xL(0), x2: xL(0), y1: L.l.y0, y2: L.l.y1, class: "t-cursor"
+  });
+  chart.appendChild(tCursor);
+
+  leaderHalo = el("circle", { cx: xL(0), cy: yL(0), r: 9, class: "leader-halo" });
+  chart.appendChild(leaderHalo);
+
+  leaderDot = el("circle", { cx: xL(0), cy: yL(0), r: 4, class: "leader-dot" });
+  chart.appendChild(leaderDot);
+
+  badgeGroup = el("g", { transform: `translate(${xL(0) + 10}, ${yL(0) - 24})` });
+  badgeBg = el("rect", { x: 0, y: 0, width: 78, height: 20, rx: 2, class: "badge-bg" });
+  badgeText = el("text", { x: 39, y: 13.5, "text-anchor": "middle", class: "badge-text" });
+  badgeText.textContent = "R(t) = +0.0";
+  badgeGroup.appendChild(badgeBg);
+  badgeGroup.appendChild(badgeText);
+  chart.appendChild(badgeGroup);
+}
+
+/* --- legend top-left of line chart --- */
+function drawLegend() {
+  const lx = L.l.x0 + 10, ly = L.l.y0 + 8, lw = 240, lh = 46;
+  chart.appendChild(el("rect", {
+    x: lx, y: ly, width: lw, height: lh, rx: 2,
+    fill: "rgba(255,253,247,0.92)", stroke: "#d9d3c7", "stroke-width": 1
+  }));
+  chart.appendChild(el("line", { x1: lx + 10, x2: lx + 38, y1: ly + 15, y2: ly + 15, stroke: "#d23b2c", "stroke-width": 1.8 }));
+  const ot = el("text", { x: lx + 46, y: ly + 18, class: "legend-text" });
+  ot.textContent = "own (correct): 6·(8 − (9 − 5))";
+  chart.appendChild(ot);
+  chart.appendChild(el("line", { x1: lx + 10, x2: lx + 38, y1: ly + 32, y2: ly + 32, stroke: "#8e867a", "stroke-width": 0.7, opacity: 0.7 }));
+  const rt = el("text", { x: lx + 46, y: ly + 35, class: "legend-text" });
+  rt.textContent = "31 reference rollouts";
+  chart.appendChild(rt);
+}
+
+/* --- bars (right panel) --- */
+const barRects = [];
+function buildBars() {
+  const n = REF_FINAL.length;
+  const slot = (L.r.y1 - L.r.y0) / n;
+  const barH = Math.max(4, slot * 0.72);
+  const order = REF_FINAL
+    .map((r, i) => ({ ...r, i }))
+    .sort((a, b) => b.R_T - a.R_T);
+  order.forEach((r, row) => {
+    const y = L.r.y0 + row * slot + (slot - barH) / 2;
+    const rect = el("rect", {
+      x: xR(0), y: y, width: 0, height: barH,
+      class: r.own ? "bar-rect own" : "bar-rect"
+    });
+    chart.appendChild(rect);
+    barRects[r.i] = { rect, y, h: barH };
+    const lbl = el("text", {
+      x: L.r.x0 - 6, y: y + barH * 0.82,
+      "text-anchor": "end",
+      class: r.own ? "bar-label own" : "bar-label"
+    });
+    lbl.textContent = r.expr + (r.own ? " ← own" : "");
+    chart.appendChild(lbl);
+  });
+  // panel title for bar panel
+  const tit = el("text", {
+    x: (L.r.x0 + L.r.x1) / 2, y: L.r.y0 - 12,
+    "text-anchor": "middle", class: "panel-title"
+  });
+  tit.textContent = "final R_T, sorted";
+  chart.appendChild(tit);
+}
+
+/* ============================================================
+   INIT
+   ============================================================ */
+drawParaBands();
+drawAxesLeft();
+drawAxesRight();
+buildParaLines();
+buildCurves();
+drawLegend();
+buildCursor();
+buildBars();
+
+/* ============================================================
+   STREAMING TERMINAL
+   ============================================================ */
+const cot = document.getElementById("cot");
+
+const paraNodes = PARAGRAPHS.map((p, i) => {
+  const wrap = document.createElement("div");
+  wrap.className = "para";
+  const startTok = i === 0 ? 0 : PARA_ENDS[i - 1];
+  const endTok = PARA_ENDS[i];
+
+  const head = document.createElement("div");
+  head.className = "head";
+  const pno = document.createElement("span"); pno.className = "pno"; pno.textContent = `[¶${i}]`;
+  const tr  = document.createElement("span"); tr.className = "tokrange"; tr.textContent = `tok ${startTok}→${endTok}`;
+  const dr  = document.createElement("span");
+  dr.className = "dr " + (p.delta >= 0 ? "pos" : "neg");
+  const sign = p.delta >= 0 ? "+" : "";
+  dr.textContent = `ΔR_own = ${sign}${p.delta.toFixed(2)}`;
+  head.appendChild(pno);
+  head.appendChild(tr);
+  head.appendChild(dr);
+
+  const body = document.createElement("div");
+  body.className = "body";
+  const text = document.createTextNode("");
+  const caret = document.createElement("span");
+  caret.className = "caret";
+  caret.style.display = "none";
+  body.appendChild(text);
+  body.appendChild(caret);
+
+  wrap.appendChild(head);
+  wrap.appendChild(body);
+  cot.appendChild(wrap);
+
+  return { wrap, head, body, text, caret, startTok, endTok, full: p.body, delta: p.delta };
+});
+
+function updateTerminal(t) {
+  for (let i = 0; i < paraNodes.length; i++) {
+    const p = paraNodes[i];
+    if (t <= p.startTok) {
+      p.wrap.classList.remove("visible", "active", "done");
+      p.text.nodeValue = "";
+      p.caret.style.display = "none";
+      continue;
+    }
+    p.wrap.classList.add("visible");
+    const tokSpan = p.endTok - p.startTok;
+    const tokIn = Math.min(t - p.startTok, tokSpan);
+    const frac = tokIn / tokSpan;
+    const nChars = Math.floor(frac * p.full.length);
+    p.text.nodeValue = p.full.slice(0, nChars);
+    const isActive = (t > p.startTok && t < p.endTok);
+    p.caret.style.display = isActive ? "inline-block" : "none";
+    p.wrap.classList.toggle("active", isActive);
+    p.wrap.classList.toggle("done", t >= p.endTok);
+  }
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+const readout = document.getElementById("readout");
+const ownR    = document.getElementById("own-r");
+const headT   = document.getElementById("head-t");
+
+function paraIndexFor(t) {
+  for (let i = 0; i < PARA_ENDS.length; i++) {
+    if (t < PARA_ENDS[i]) return i;
+  }
+  return PARA_ENDS.length - 1;
+}
+
+function render(t) {
+  t = Math.max(0, Math.min(T_MAX, t));
+  const tFloor = Math.floor(t);
+
+  // curves
+  for (let i = 0; i < CURVES.length; i++) {
+    const d = pathForCurve(CURVES[i], tFloor);
+    curvePaths[i].setAttribute("d", d);
+  }
+  // own glow mirrors own path
+  ownGlow.setAttribute("d", ownPath.getAttribute("d"));
+
+  // paragraph end markers (appear once crossed)
+  for (const pl of paraLines) {
+    const op = tFloor >= pl.t ? 0.85 : 0;
+    pl.node.setAttribute("opacity", op);
+    pl.label.setAttribute("opacity", op);
+  }
+
+  // t cursor
+  tCursor.setAttribute("x1", xL(t));
+  tCursor.setAttribute("x2", xL(t));
+
+  // leader dot + halo + badge
+  const ownVal = CURVES[0][tFloor];
+  const dotX = xL(t);
+  const dotY = yL(ownVal);
+  leaderDot.setAttribute("cx", dotX);
+  leaderDot.setAttribute("cy", dotY);
+  leaderHalo.setAttribute("cx", dotX);
+  leaderHalo.setAttribute("cy", dotY);
+
+  // badge position: prefer above-right, flip near right edge or top
+  let bx = dotX + 12, by = dotY - 28;
+  if (bx + 78 > L.l.x1 - 4) bx = dotX - 12 - 78;
+  if (by < L.l.y0 + 4) by = dotY + 12;
+  badgeGroup.setAttribute("transform", `translate(${bx}, ${by})`);
+  const sign = ownVal >= 0 ? "+" : "−";
+  badgeText.textContent = `R(t) = ${sign}${Math.abs(ownVal).toFixed(1)}`;
+
+  // bars
+  for (let i = 0; i < CURVES.length; i++) {
+    const v = CURVES[i][tFloor];
+    const bar = barRects[i];
+    if (v >= 0) {
+      bar.rect.setAttribute("x", xR(0));
+      bar.rect.setAttribute("width", Math.max(0.5, xR(v) - xR(0)));
+    } else {
+      bar.rect.setAttribute("x", xR(v));
+      bar.rect.setAttribute("width", Math.max(0.5, xR(0) - xR(v)));
+    }
+  }
+
+  // terminal
+  updateTerminal(tFloor);
+
+  // readouts
+  const pi = paraIndexFor(tFloor);
+  const sgn = ownVal >= 0 ? "+" : "−";
+  readout.innerHTML = `t = <b>${tFloor}</b> / ${T_MAX} &nbsp;·&nbsp; ¶<b>${pi}</b> &nbsp;·&nbsp; R<sub>own</sub>(t) = <span class="own-r" id="own-r">${sgn}${Math.abs(ownVal).toFixed(2)}</span>`;
+  headT.textContent = tFloor;
+
+  if (document.activeElement !== scrub) scrub.value = tFloor;
+}
+
+/* ============================================================
+   PLAYBACK
+   ============================================================ */
+const scrub = document.getElementById("scrub");
+const playBtn = document.getElementById("play");
+const resetBtn = document.getElementById("reset");
+const speedBtns = document.querySelectorAll(".speed button");
+
+let t = 0;
+let playing = false;
+let speed = 1;
+let lastFrame = null;
+const BASE_TPS = 18;
+
+function tick(now) {
+  if (!playing) { lastFrame = null; return; }
+  if (lastFrame == null) lastFrame = now;
+  const dt = (now - lastFrame) / 1000;
+  lastFrame = now;
+  t += dt * BASE_TPS * speed;
+  if (t >= T_MAX) {
+    t = T_MAX;
+    render(t);
+    // pause then auto-loop
+    playing = false;
+    playBtn.textContent = "▶ Play";
+    setTimeout(() => {
+      if (!playing) {
+        t = 0;
+        playing = true;
+        playBtn.textContent = "⏸ Pause";
+        lastFrame = null;
+        requestAnimationFrame(tick);
+      }
+    }, 2400);
+    return;
+  }
+  render(t);
+  if (playing) requestAnimationFrame(tick);
+}
+
+playBtn.addEventListener("click", () => {
+  if (t >= T_MAX) t = 0;
+  playing = !playing;
+  playBtn.textContent = playing ? "⏸ Pause" : "▶ Play";
+  if (playing) { lastFrame = null; requestAnimationFrame(tick); }
+});
+
+resetBtn.addEventListener("click", () => {
+  playing = false;
+  playBtn.textContent = "▶ Play";
+  t = 0;
+  render(t);
+});
+
+scrub.addEventListener("input", () => {
+  t = +scrub.value;
+  render(t);
+});
+
+speedBtns.forEach(b => {
+  b.addEventListener("click", () => {
+    speedBtns.forEach(x => x.classList.remove("active"));
+    b.classList.add("active");
+    speed = parseFloat(b.dataset.speed);
+  });
+});
+
+render(0);
+
+setTimeout(() => {
+  if (!playing && t === 0) {
+    playing = true;
+    playBtn.textContent = "⏸ Pause";
+    requestAnimationFrame(tick);
+  }
+}, 700);
+</script>
+</body>
+</html>
