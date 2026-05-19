@@ -15,6 +15,7 @@ so it imports fast and is easy to unit-test.
 
 from __future__ import annotations
 
+import ast
 import itertools
 import json
 import random
@@ -82,26 +83,61 @@ _TEMPLATES = (
 _OPS = ("+", "-", "*", "/")
 
 
-def enumerate_solutions(numbers: Tuple[int, ...], max_solutions: int = 50) -> List[str]:
-    """All distinct (string-canonical) expressions over `numbers` that evaluate to 24."""
-    sols: set[str] = set()
+def _ast_key(expr: str) -> Optional[str]:
+    """Canonical AST dump of `expr`, used for dedup. None if unparseable."""
+    try:
+        return ast.dump(ast.parse(expr, mode="eval").body)
+    except Exception:
+        return None
+
+
+def enumerate_solutions(
+    numbers: Tuple[int, ...],
+    max_solutions: Optional[int] = None,
+) -> List[str]:
+    """All distinct AST-canonical expressions over `numbers` that evaluate to 24.
+
+    Brute-forces every (permutation × op-triple × bracket-template) candidate,
+    filters by `verify_24`, and de-duplicates by AST canonical form so that
+    parenthesization-only and chain-direction-only differences (e.g.
+    `((3*8)+1)-1` and `3*8+1-1`) collapse to a single solution. Operand
+    order remains significant — `8*(1+1+1)` and `(1+1+1)*8` are distinct.
+
+    `max_solutions` is an optional safety cap (default: no cap). The candidate
+    space is bounded (≤ 24 perms × 64 op-triples × 5 templates = 7680), so
+    enumeration is cheap; the cap exists only to defend pathological callers.
+    """
+    by_ast: Dict[str, str] = {}   # ast_key -> representative source string
     for perm in set(itertools.permutations(numbers)):
         a, b, c, d = perm
         for op1, op2, op3 in itertools.product(_OPS, repeat=3):
             for tmpl in _TEMPLATES:
                 expr = tmpl.format(a=a, b=b, c=c, d=d, o1=op1, o2=op2, o3=op3)
-                if verify_24(list(numbers), expr):
-                    sols.add(expr)
-                    if len(sols) >= max_solutions:
-                        return list(sols)
-    return list(sols)
+                if not verify_24(list(numbers), expr):
+                    continue
+                k = _ast_key(expr)
+                if k is None or k in by_ast:
+                    continue
+                by_ast[k] = expr
+                if max_solutions is not None and len(by_ast) >= max_solutions:
+                    return list(by_ast.values())
+    return list(by_ast.values())
 
 
 # ---------------------------------------------------------------------------
 # 2. Puzzle pool + difficulty bucketing
 # ---------------------------------------------------------------------------
-def build_puzzle_pool(max_n: int = 9, max_solutions: int = 50) -> List[Dict[str, Any]]:
-    """Enumerate all solvable 4-tuples drawn from {1, ..., max_n} with replacement."""
+def build_puzzle_pool(
+    max_n: int = 9,
+    max_solutions: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Enumerate all solvable 4-tuples drawn from {1, ..., max_n} with replacement.
+
+    `max_solutions=None` (default) returns true AST-canonical solution counts
+    per puzzle. Pass an int to cap (legacy behaviour). Note: switching from
+    the previous capped string-dedup to uncapped AST-dedup changes the
+    `n_solutions` distribution → re-tune `bucket_by_difficulty` thresholds.
+    """
     pool: List[Dict[str, Any]] = []
     for tup in itertools.combinations_with_replacement(range(1, max_n + 1), 4):
         sols = enumerate_solutions(tup, max_solutions=max_solutions)
