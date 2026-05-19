@@ -595,7 +595,6 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"  metrics → {out_dir / 'metrics.json'}", flush=True)
     else:
         # Wait for rank 0 to finish all post-processing and writing metrics
-        import time
         for _ in range(7200):
             if (out_dir / "metrics.json").exists():
                 break
