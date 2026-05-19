@@ -94,28 +94,36 @@ class WeightSyncExt:
 
 
 # ---------------------------------------------------------------------------
+# Pydantic request models — must live at module scope so FastAPI/Pydantic v2
+# can build TypeAdapters for them (forward refs don't resolve from inside a
+# function body).
+# ---------------------------------------------------------------------------
+class InitReq(BaseModel):
+    host: str
+    port: int
+    world_size: int
+    client_device_uuid: str
+
+
+class UpdateReq(BaseModel):
+    name: str
+    dtype: str
+    shape: List[int]
+
+
+class GenReq(BaseModel):
+    prompts: List[str]
+    max_tokens: int = 32
+    temperature: float = 0.0
+    top_p: float = 1.0
+    n: int = 1
+
+
+# ---------------------------------------------------------------------------
 # HTTP layer
 # ---------------------------------------------------------------------------
 def build_app(llm: LLM) -> FastAPI:
     app = FastAPI()
-
-    class InitReq(BaseModel):
-        host: str
-        port: int
-        world_size: int
-        client_device_uuid: str
-
-    class UpdateReq(BaseModel):
-        name: str
-        dtype: str
-        shape: List[int]
-
-    class GenReq(BaseModel):
-        prompts: List[str]
-        max_tokens: int = 32
-        temperature: float = 0.0
-        top_p: float = 1.0
-        n: int = 1
 
     @app.get("/health/")
     def health():
