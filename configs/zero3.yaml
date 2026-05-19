@@ -9,7 +9,10 @@ deepspeed_config:
   # files + a zero_to_fp32.py recovery script, and reloading fails with
   # "no file named pytorch_model.bin, model.safetensors, ..."
   zero3_save_16bit_model: true
-  gradient_accumulation_steps: auto
+  # NOTE: must match --grad-accum on the trainer command line. The accelerate
+  # wrapper does not translate "auto" here, so keep it numeric and pass the
+  # same number via --grad-accum.
+  gradient_accumulation_steps: 4
   gradient_clipping: 1.0
   offload_optimizer_device: none
   offload_param_device: none

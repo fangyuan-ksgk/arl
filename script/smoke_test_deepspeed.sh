@@ -36,7 +36,7 @@ export EVAL_STEPS="${EVAL_STEPS:-0}"        # skip eval; we only care about hand
 export OUTPUT_ROOT="${OUTPUT_ROOT:-output/game24_smoke_ds}"
 export NUM_GENERATIONS="${NUM_GENERATIONS:-8}"
 export PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
-export GRAD_ACCUM="${GRAD_ACCUM:-2}"        # smaller batch for a quick step
+export GRAD_ACCUM="${GRAD_ACCUM:-4}"        # MUST match configs/zero3.yaml
 export SCORE_VT="${SCORE_VT:-0}"            # skip Vt scoring on smoke
 export KEEP_CKPT="${KEEP_CKPT:-0}"
 
