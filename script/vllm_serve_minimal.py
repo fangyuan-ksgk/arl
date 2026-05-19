@@ -16,9 +16,20 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 
 # Required so vLLM workers can be spawned with CUDA initialized in the parent.
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+# Make sure the directory containing THIS file is importable both in the
+# parent process and in any spawned EngineCore subprocesses, so that
+# `worker_extension_cls="vllm_serve_minimal.WeightSyncExt"` resolves.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+os.environ["PYTHONPATH"] = (
+    _HERE + os.pathsep + os.environ.get("PYTHONPATH", "")
+).rstrip(os.pathsep)
 
 import uvicorn
 from fastapi import FastAPI
@@ -169,7 +180,7 @@ def main() -> None:
         # NOTE: the dotted path must be importable from the worker process.
         # When invoking via `python script/vllm_serve_minimal.py ...` from the
         # repo root, the `script` package is on PYTHONPATH automatically.
-        worker_extension_cls="script.vllm_serve_minimal.WeightSyncExt",
+        worker_extension_cls="vllm_serve_minimal.WeightSyncExt",
     )
 
     uvicorn.run(build_app(llm), host=args.host, port=args.port, log_level="info")
