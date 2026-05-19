@@ -31,6 +31,7 @@ os.environ["PYTHONPATH"] = (
     _HERE + os.pathsep + os.environ.get("PYTHONPATH", "")
 ).rstrip(os.pathsep)
 
+import threading
 from typing import List, Optional
 
 import uvicorn
@@ -131,11 +132,23 @@ def build_app(llm: LLM) -> FastAPI:
 
     @app.post("/init_communicator/")
     def init(req: InitReq = Body(...)):
-        llm.collective_rpc(
-            "init_communicator",
-            args=(req.host, req.port, req.world_size, req.client_device_uuid),
-        )
-        return {"status": "ok"}
+        # The worker's init_communicator does a blocking NCCL rendezvous that
+        # can only complete once the client (caller) also joins the
+        # StatelessProcessGroup. So we MUST return the HTTP response
+        # immediately and let the rendezvous finish in the background.
+        def _run():
+            try:
+                llm.collective_rpc(
+                    "init_communicator",
+                    args=(req.host, req.port, req.world_size,
+                          req.client_device_uuid),
+                )
+            except Exception as e:  # surface to server stderr; client will see hang
+                print(f"[init_communicator background] {type(e).__name__}: {e}",
+                      flush=True)
+
+        threading.Thread(target=_run, daemon=True).start()
+        return {"status": "scheduled"}
 
     @app.post("/update_named_param/")
     def update(req: UpdateReq = Body(...)):
