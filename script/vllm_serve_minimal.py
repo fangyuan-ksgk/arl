@@ -31,8 +31,10 @@ os.environ["PYTHONPATH"] = (
     _HERE + os.pathsep + os.environ.get("PYTHONPATH", "")
 ).rstrip(os.pathsep)
 
+from typing import List, Optional
+
 import uvicorn
-from fastapi import FastAPI
+from fastapi import Body, FastAPI
 from pydantic import BaseModel
 from vllm import LLM, SamplingParams
 
@@ -106,10 +108,10 @@ def build_app(llm: LLM) -> FastAPI:
     class UpdateReq(BaseModel):
         name: str
         dtype: str
-        shape: list[int]
+        shape: List[int]
 
     class GenReq(BaseModel):
-        prompts: list[str]
+        prompts: List[str]
         max_tokens: int = 32
         temperature: float = 0.0
         top_p: float = 1.0
@@ -120,7 +122,7 @@ def build_app(llm: LLM) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/init_communicator/")
-    def init(req: InitReq):
+    def init(req: InitReq = Body(...)):
         llm.collective_rpc(
             "init_communicator",
             args=(req.host, req.port, req.world_size, req.client_device_uuid),
@@ -128,7 +130,7 @@ def build_app(llm: LLM) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/update_named_param/")
-    def update(req: UpdateReq):
+    def update(req: UpdateReq = Body(...)):
         llm.collective_rpc(
             "update_named_param",
             args=(req.name, req.dtype, tuple(req.shape)),
@@ -141,7 +143,7 @@ def build_app(llm: LLM) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/generate/")
-    def generate(req: GenReq):
+    def generate(req: GenReq = Body(...)):
         sp = SamplingParams(
             max_tokens=req.max_tokens,
             temperature=req.temperature,
