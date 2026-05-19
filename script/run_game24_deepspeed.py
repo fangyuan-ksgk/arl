@@ -109,12 +109,9 @@ def _under_distributed_launcher() -> bool:
 
 def _barrier() -> None:
     """Best-effort barrier; works under torch.distributed and is a no-op otherwise."""
-    try:
-        import torch.distributed as dist
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-    except Exception:
-        pass
+    import torch.distributed as dist
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -316,10 +313,11 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
                     shard = out_dir / pattern.format(r=r)
                     if not shard.exists():
                         continue
-                    for line in shard.read_text().splitlines():
-                        if line.strip():
-                            out.write(line + "\n")
-                            n += 1
+                    with shard.open("r") as f_in:
+                        for line in f_in:
+                            if line.strip():
+                                out.write(line.strip() + "\n")
+                                n += 1
             return n
 
         n_train = _merge_shards(rollout_log,      "rollouts.jsonl.r{r}")
@@ -355,6 +353,8 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
                 fig.savefig(out_dir / f"{name}.png", dpi=120, bbox_inches="tight")
                 fig.clear()
 
+    _barrier()
+
     # ------- Sharded R_T scoring -----------------------------------------
     # Every rank still has the policy model + DeepSpeed engine loaded. Free
     # them BEFORE building the scorer model on each rank, otherwise we
@@ -371,8 +371,11 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
 
         # All ranks read the merged eval log (rank 0 wrote it; barrier above
         # guarantees it's flushed).
-        eval_rows = [json.loads(l) for l in eval_rollout_log.read_text().splitlines()
-                     if l.strip()]
+        eval_rows = []
+        with eval_rollout_log.open("r") as f_in:
+            for l in f_in:
+                if l.strip():
+                    eval_rows.append(json.loads(l))
         if is_main:
             print(f"\n[vt-score] sharding {len(eval_rows)} rollouts over "
                   f"{world} ranks ({(len(eval_rows)+world-1)//world} per rank)",
@@ -532,7 +535,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
                 p = out_dir / f"eval_rollout.jsonl.scored.r{r}"
                 if not p.exists():
                     continue
-                for line in p.read_text().splitlines():
+                for line in p.open("r"):
                     if not line.strip():
                         continue
                     rec = json.loads(line)
@@ -587,10 +590,17 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
             print(f"  removed transient checkpoint {trained_ckpt_dir.name} "
                   "(pass --keep-ckpt to retain)", flush=True)
 
-    _barrier()
     if is_main:
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
         print(f"  metrics → {out_dir / 'metrics.json'}", flush=True)
+    else:
+        # Wait for rank 0 to finish all post-processing and writing metrics
+        import time
+        for _ in range(7200):
+            if (out_dir / "metrics.json").exists():
+                break
+            time.sleep(5)
+
     return metrics
 
 

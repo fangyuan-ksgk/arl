@@ -33,7 +33,8 @@ from matplotlib.path import Path as MplPath
 
 
 __all__ = ["VizCtx", "prepare", "plot_R_t_static", "print_paragraphs",
-           "make_animation", "plot_lifecycle_river",
+           "make_animation", "make_pair_animation",
+           "make_pair_animation_from_vt", "plot_lifecycle_river",
            "plot_solution_coverage_dynamics",
            "plot_prefix_sharing_dynamics",
            "plot_R_t_correctness_dynamics"]
@@ -290,6 +291,386 @@ def make_animation(
         return []
 
     anim = FuncAnimation(fig, _update, frames=frames,
+                         interval=interval_ms, blit=False)
+    plt.close(fig)
+    if save_path:
+        anim.save(save_path, writer="pillow", fps=fps)
+    return anim
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# (3b) paired success/failure streaming animation
+# ────────────────────────────────────────────────────────────────────────────
+def make_pair_animation(
+    ctx_correct: VizCtx,
+    ctx_incorrect: VizCtx,
+    *,
+    save_path: Optional[str] = None,
+    fps: int = 10,
+    max_frames: int = 200,
+    interval_ms: int = 60,
+    column_titles: Tuple[str, str] = ("✓ correct rollout", "✗ incorrect rollout"),
+    figsize: Tuple[float, float] = (20, 9),
+):
+    """Co-presented streaming animation for one success and one failure rollout.
+
+    Two-column layout, each column mirroring :func:`make_animation`:
+    streaming cumR(t) curves + live R(t) bars on top, paragraph reveal below.
+    The two rollouts can have different CoT lengths; we drive both columns
+    with a shared normalised progress φ ∈ [0, 1] and map φ → t per side.
+    """
+    ctxs = (ctx_correct, ctx_incorrect)
+    Ts   = tuple(c.T for c in ctxs)
+
+    # Shared normalised frame schedule.
+    n_frames = min(max_frames, max(Ts) + 1)
+    phis     = np.linspace(0.0, 1.0, n_frames)
+
+    fig = plt.figure(figsize=figsize, facecolor="white")
+    gs  = fig.add_gridspec(
+        2, 4, height_ratios=[3, 5], width_ratios=[3, 2, 3, 2],
+        hspace=0.22, wspace=0.22,
+    )
+    axes_curve = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[0, 2])]
+    axes_bar   = [fig.add_subplot(gs[0, 1]), fig.add_subplot(gs[0, 3])]
+    axes_txt   = [fig.add_subplot(gs[1, 0:2]), fig.add_subplot(gs[1, 2:4])]
+
+    # Per-column static setup (curves, bars, paragraph dividers).
+    per_col: List[Dict[str, Any]] = []
+    for col, (ctx, ax, ax_bar, ax_txt, title) in enumerate(zip(
+        ctxs, axes_curve, axes_bar, axes_txt, column_titles
+    )):
+        cums, T = ctx.cums, ctx.T
+        ymin = min(c.min() for c in cums); ymax = max(c.max() for c in cums)
+        char_end = [0] + [b for _, b in ctx.offsets]
+
+        lines = []
+        for i, c in enumerate(cums):
+            is_own = (i == ctx.own_idx)
+            (ln,) = ax.plot([], [], color="C3" if is_own else "0.65",
+                            lw=2 if is_own else 1,
+                            alpha=1.0 if is_own else 0.5,
+                            label=ctx.own_label if is_own else None)
+            lines.append(ln)
+        for t in ctx.para_tok:
+            ax.axvline(t, color="0.55", ls=":", lw=0.8, alpha=0.7,
+                       label="paragraph end" if t == ctx.para_tok[0] else None)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set_xlim(0, T); ax.set_ylim(ymin - 1, ymax + 1)
+        ax.set_xlabel("CoT prefix length t"); ax.set_ylabel("cum R(t)")
+        ax.set_title(f"{title}  ·  step={ctx.row['global_step']} "
+                     f"idx={ctx.row['idx']}", fontsize=10)
+        ax.legend(loc="upper left", fontsize=8)
+        cursor = ax.axvline(0, color="k", lw=1, alpha=0.4)
+
+        rank_of = {int(i): r for r, i in enumerate(ctx.order_final)}
+        bars = ax_bar.barh(
+            range(len(ctx.scored)), [0] * len(ctx.scored),
+            color=["C3" if i == ctx.own_idx else "0.7" for i in ctx.order_final])
+        ax_bar.invert_yaxis()
+        ax_bar.set_yticks(range(len(ctx.scored)))
+        ax_bar.set_yticklabels(
+            [ctx.refs[i] + (" ←own" if i == ctx.own_idx else "")
+             for i in ctx.order_final], fontsize=6)
+        ax_bar.set_xlim(min(ymin - 1, -1), ymax + 1)
+        ax_bar.axvline(0, color="k", lw=0.5)
+        ax_bar.set_xlabel("R(t) — live")
+        ax_bar.set_title(f"live R(t) · {len(ctx.refs)} refs (rows fixed in "
+                         f"final-R_T order)", fontsize=9)
+
+        per_col.append({
+            "ctx": ctx, "lines": lines, "cursor": cursor, "bars": bars,
+            "rank_of": rank_of, "ax_txt": ax_txt, "char_end": char_end,
+            "T": T,
+        })
+
+    WRAP, HEAD_COLOR, BODY_COLOR, BG = 70, "#1a7f37", "#000000", "#ffffff"
+
+    def _render_paragraphs(slot):
+        ctx     = slot["ctx"]
+        ax_txt  = slot["ax_txt"]
+        char_end = slot["char_end"]
+        t        = slot["t"]
+
+        ax_txt.clear(); ax_txt.set_facecolor(BG); ax_txt.axis("off")
+        ax_txt.set_xlim(0, 1); ax_txt.set_ylim(0, 1)
+        y, dy = 0.97, 0.038
+        k_now    = max(0, bisect.bisect_right(ctx.para_tok_starts, t) - 1)
+        char_now = char_end[min(t, len(char_end) - 1)]
+        for k in range(k_now + 1):
+            a, b = ctx.para_char_ranges[k]
+            is_partial = (k == k_now and char_now < b)
+            body = ctx.cot_used[a:char_now] if is_partial else ctx.cot_used[a:b]
+            body = body.strip()
+            if not body and not is_partial:
+                continue
+            header = (f"[¶{k}] tok {ctx.para_tok_starts[k]:>3}→"
+                      f"{ctx.para_tok_ends[k]:<3}    "
+                      f"ΔR_own={ctx.delta_R[k]:+.2f}")
+            ax_txt.text(0.01, y, header, color=HEAD_COLOR, family="monospace",
+                        fontsize=10, fontweight="bold",
+                        transform=ax_txt.transAxes, va="top")
+            y -= dy
+            wrapped = textwrap.wrap(body, width=WRAP) or [""]
+            if is_partial and wrapped:
+                wrapped[-1] = wrapped[-1] + "▌"
+            for line in wrapped:
+                ax_txt.text(0.03, y, line, color=BODY_COLOR, family="monospace",
+                            fontsize=9, transform=ax_txt.transAxes, va="top")
+                y -= dy
+                if y < 0.02:
+                    ax_txt.text(0.03, y, "…", color=BODY_COLOR,
+                                family="monospace", fontsize=9,
+                                transform=ax_txt.transAxes, va="top")
+                    return
+            y -= 0.012
+
+    def _update(phi):
+        for slot in per_col:
+            ctx, T = slot["ctx"], slot["T"]
+            t = int(round(phi * T))
+            slot["t"] = t
+            cums = ctx.cums
+            vals = np.empty(len(cums))
+            for i, (ln, c) in enumerate(zip(slot["lines"], cums)):
+                tt = min(t, len(c) - 1)
+                ln.set_data(range(tt + 1), c[: tt + 1])
+                vals[i] = c[tt]
+            slot["cursor"].set_xdata([t, t])
+            for i, v in enumerate(vals):
+                slot["bars"][slot["rank_of"][i]].set_width(v)
+            _render_paragraphs(slot)
+        return []
+
+    anim = FuncAnimation(fig, _update, frames=phis,
+                         interval=interval_ms, blit=False)
+    plt.close(fig)
+    if save_path:
+        anim.save(save_path, writer="pillow", fps=fps)
+    return anim
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# (3c) vt-sidecar paired animation: no scorer model required
+# ────────────────────────────────────────────────────────────────────────────
+def _trim_for_anim(completion: str) -> str:
+    """Same answer-marker stripping rule as ``prepare``."""
+    i = completion.find("####")
+    return completion[:i].rstrip() if i >= 0 else completion
+
+
+def make_pair_animation_from_vt(
+    vt_row_correct: Dict[str, Any],
+    completion_correct: str,
+    vt_row_incorrect: Dict[str, Any],
+    completion_incorrect: str,
+    *,
+    save_path: Optional[str] = None,
+    fps: int = 10,
+    max_frames: int = 200,
+    interval_ms: int = 60,
+    column_titles: Tuple[str, str] = ("✓ correct rollout", "✗ incorrect rollout"),
+    figsize: Tuple[float, float] = (20, 9),
+    short_ref_chars: int = 22,
+):
+    """Side-by-side success/failure animation driven by the vt sidecar.
+
+    Consumes two rows from ``eval_rollout_vt.jsonl`` (per-ref
+    ``cumR_resampled_per_ref`` arrays, on a fixed 100-pt grid in [0, 1])
+    plus the corresponding ``completion`` strings from
+    ``eval_rollout.jsonl``. No scorer model required.
+
+    Each column shows
+      • streaming cumR(φ) curves for every reference (own ref highlighted),
+      • live R(φ) bars in fixed final-R_T order,
+      • paragraph-by-paragraph reveal of the rollout text.
+
+    The two rollouts share a normalised progress φ ∈ [0, 1] so they stay
+    co-aligned even when their CoT lengths differ.
+    """
+    cols: List[Dict[str, Any]] = []
+    for vt_row, completion, title in (
+        (vt_row_correct, completion_correct, column_titles[0]),
+        (vt_row_incorrect, completion_incorrect, column_titles[1]),
+    ):
+        cums_raw = vt_row.get("cumR_resampled_per_ref") or []
+        R_T = vt_row.get("R_T_per_ref") or []
+        cums = [np.asarray(c, dtype=float) for c in cums_raw if c]
+        if not cums:
+            raise ValueError(
+                f"vt row idx={vt_row.get('idx')} has no usable "
+                f"cumR_resampled_per_ref entries"
+            )
+        keep = [i for i, c in enumerate(cums_raw) if c]
+        refs = [vt_row["refs"][i] for i in keep]
+        R_T_arr = np.asarray([R_T[i] for i in keep], dtype=float)
+
+        own_idx_global = vt_row.get("own_ref_idx", -1)
+        own_idx = (keep.index(own_idx_global)
+                   if own_idx_global is not None and own_idx_global in keep
+                   else int(np.argmax(R_T_arr)))
+        order_final = np.argsort(R_T_arr)[::-1]
+
+        cot = _trim_for_anim(completion)
+        splits = list(re.finditer(r"\n\s*\n", cot))
+        para_char_ranges, prev = [], 0
+        for m in splits:
+            para_char_ranges.append((prev, m.start())); prev = m.end()
+        para_char_ranges.append((prev, len(cot)))
+        # paragraph end as a fraction of total chars (drives both the
+        # vertical paragraph-divider line and which paragraphs to reveal)
+        L = max(len(cot), 1)
+        para_phi_ends = [b / L for _, b in para_char_ranges]
+        # ΔR_own per paragraph, computed on the resampled grid via
+        # nearest-neighbour lookup at the paragraph boundary fractions.
+        own_cum = cums[own_idx]
+        n_grid  = len(own_cum)
+        def _cum_at(phi):
+            j = min(int(round(phi * (n_grid - 1))), n_grid - 1)
+            return float(own_cum[j])
+        para_phi_starts = [0.0] + para_phi_ends[:-1]
+        delta_R = [_cum_at(e) - _cum_at(s)
+                   for s, e in zip(para_phi_starts, para_phi_ends)]
+
+        own_label = (
+            f"own ({'correct' if vt_row['correct'] else 'wrong'}): "
+            f"{vt_row['expr']}"
+        )
+
+        cols.append({
+            "vt_row": vt_row, "title": title,
+            "cums": cums, "R_T": R_T_arr, "refs": refs,
+            "own_idx": own_idx, "order_final": order_final,
+            "own_label": own_label,
+            "cot": cot, "para_char_ranges": para_char_ranges,
+            "para_phi_ends": para_phi_ends,
+            "para_phi_starts": para_phi_starts,
+            "delta_R": delta_R,
+        })
+
+    n_frames = min(max_frames, 200)
+    phis     = np.linspace(0.0, 1.0, n_frames)
+
+    fig = plt.figure(figsize=figsize, facecolor="white")
+    gs  = fig.add_gridspec(
+        2, 4, height_ratios=[3, 5], width_ratios=[3, 2, 3, 2],
+        hspace=0.22, wspace=0.22,
+    )
+
+    for col_i, c in enumerate(cols):
+        ax     = fig.add_subplot(gs[0, 2 * col_i])
+        ax_bar = fig.add_subplot(gs[0, 2 * col_i + 1])
+        ax_txt = fig.add_subplot(gs[1, 2 * col_i:2 * col_i + 2])
+
+        cums = c["cums"]
+        ymin = float(min(cu.min() for cu in cums))
+        ymax = float(max(cu.max() for cu in cums))
+
+        lines = []
+        n_grid = len(cums[0])
+        x_grid = np.linspace(0.0, 1.0, n_grid)
+        for i, cu in enumerate(cums):
+            is_own = (i == c["own_idx"])
+            (ln,) = ax.plot([], [], color="C3" if is_own else "0.65",
+                            lw=2 if is_own else 1,
+                            alpha=1.0 if is_own else 0.5,
+                            label=c["own_label"] if is_own else None)
+            lines.append(ln)
+        for k, phi in enumerate(c["para_phi_ends"][:-1]):
+            ax.axvline(phi, color="0.55", ls=":", lw=0.8, alpha=0.7,
+                       label="paragraph end" if k == 0 else None)
+        ax.axhline(0, color="k", lw=0.5)
+        ax.set_xlim(0, 1); ax.set_ylim(ymin - 1, ymax + 1)
+        ax.set_xlabel("normalised CoT position (φ = t / T)")
+        ax.set_ylabel("cum R(φ)")
+        ax.set_title(f"{c['title']}  ·  step={c['vt_row']['global_step']} "
+                     f"idx={c['vt_row']['idx']}", fontsize=10)
+        ax.legend(loc="upper left", fontsize=8)
+        cursor = ax.axvline(0, color="k", lw=1, alpha=0.4)
+
+        rank_of = {int(i): r for r, i in enumerate(c["order_final"])}
+        bars = ax_bar.barh(
+            range(len(cums)), [0] * len(cums),
+            color=["C3" if i == c["own_idx"] else "0.7"
+                   for i in c["order_final"]])
+        ax_bar.invert_yaxis()
+        ax_bar.set_yticks(range(len(cums)))
+        ax_bar.set_yticklabels(
+            [(c["refs"][i][:short_ref_chars]
+              + ("…" if len(c["refs"][i]) > short_ref_chars else ""))
+             + (" ←own" if i == c["own_idx"] else "")
+             for i in c["order_final"]], fontsize=6)
+        ax_bar.set_xlim(min(ymin - 1, -1), ymax + 1)
+        ax_bar.axvline(0, color="k", lw=0.5)
+        ax_bar.set_xlabel("R(φ) — live")
+        ax_bar.set_title(f"live R(φ) · {len(c['refs'])} refs (rows fixed in "
+                         f"final-R_T order)", fontsize=9)
+
+        c.update({
+            "ax": ax, "ax_bar": ax_bar, "ax_txt": ax_txt,
+            "lines": lines, "bars": bars, "rank_of": rank_of,
+            "cursor": cursor, "x_grid": x_grid, "n_grid": n_grid,
+        })
+
+    WRAP, HEAD_COLOR, BODY_COLOR, BG = 70, "#1a7f37", "#000000", "#ffffff"
+
+    def _render_paragraphs(c, phi):
+        ax_txt = c["ax_txt"]
+        ax_txt.clear(); ax_txt.set_facecolor(BG); ax_txt.axis("off")
+        ax_txt.set_xlim(0, 1); ax_txt.set_ylim(0, 1)
+        y, dy = 0.97, 0.038
+        char_now = int(round(phi * len(c["cot"])))
+        # paragraph index containing char_now
+        k_now = 0
+        for k, (a, b) in enumerate(c["para_char_ranges"]):
+            if a <= char_now <= b:
+                k_now = k; break
+            if char_now > b:
+                k_now = k
+        for k in range(k_now + 1):
+            a, b = c["para_char_ranges"][k]
+            is_partial = (k == k_now and char_now < b)
+            body = c["cot"][a:char_now] if is_partial else c["cot"][a:b]
+            body = body.strip()
+            if not body and not is_partial:
+                continue
+            header = (f"[¶{k}]  φ {c['para_phi_starts'][k]:.2f}→"
+                      f"{c['para_phi_ends'][k]:.2f}    "
+                      f"ΔR_own={c['delta_R'][k]:+.2f}")
+            ax_txt.text(0.01, y, header, color=HEAD_COLOR, family="monospace",
+                        fontsize=10, fontweight="bold",
+                        transform=ax_txt.transAxes, va="top")
+            y -= dy
+            wrapped = textwrap.wrap(body, width=WRAP) or [""]
+            if is_partial and wrapped:
+                wrapped[-1] = wrapped[-1] + "▌"
+            for line in wrapped:
+                ax_txt.text(0.03, y, line, color=BODY_COLOR, family="monospace",
+                            fontsize=9, transform=ax_txt.transAxes, va="top")
+                y -= dy
+                if y < 0.02:
+                    ax_txt.text(0.03, y, "…", color=BODY_COLOR,
+                                family="monospace", fontsize=9,
+                                transform=ax_txt.transAxes, va="top")
+                    return
+            y -= 0.012
+
+    def _update(phi):
+        for c in cols:
+            n_grid = c["n_grid"]
+            j = min(int(round(phi * (n_grid - 1))), n_grid - 1)
+            x_seg = c["x_grid"][: j + 1]
+            vals = np.empty(len(c["cums"]))
+            for i, (ln, cu) in enumerate(zip(c["lines"], c["cums"])):
+                ln.set_data(x_seg, cu[: j + 1])
+                vals[i] = cu[j]
+            c["cursor"].set_xdata([phi, phi])
+            for i, v in enumerate(vals):
+                c["bars"][c["rank_of"][i]].set_width(v)
+            _render_paragraphs(c, phi)
+        return []
+
+    anim = FuncAnimation(fig, _update, frames=phis,
                          interval=interval_ms, blit=False)
     plt.close(fig)
     if save_path:
@@ -1265,7 +1646,7 @@ def plot_R_t_correctness_dynamics(
                                  label="95% bootstrap CI over puzzles")
         ax_diff.axhline(0, color="k", linestyle=":", alpha=0.4)
         ax_diff.set(xlabel="normalised CoT position (t / T)",
-                    ylabel="mean cumR_correct − mean cumR_incorrect  (per puzzle)",
+                    ylabel="Δ cumR  (correct − incorrect)",
                     title=f"(a) Within-puzzle correctness contrast  (step={step})")
         ax_diff.legend(loc="best")
 

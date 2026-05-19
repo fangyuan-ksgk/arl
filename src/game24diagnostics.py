@@ -92,6 +92,9 @@ def d1_length_diversity(df: pd.DataFrame) -> Tuple[Dict[str, float], Figure]:
         texts = g.completion.tolist()
         if len(texts) < 2:
             continue
+        if len(texts) > 20:
+            import random
+            texts = random.sample(texts, 20)
         pairs = [_norm_edit(texts[i], texts[j])
                  for i in range(len(texts)) for j in range(i + 1, len(texts))]
         ed_rows.append({"step": step, "key": key,
