@@ -25,6 +25,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
+# --- NCCL workarounds for containerised single-host runs -------------------
+# RunPod (and most Docker hosts without --ipc=host) block CUDA-IPC handles
+# from crossing the IPC namespace, so NCCL's P2P/IPC transport sets up but
+# the first collective hangs forever. Disabling P2P forces NCCL to use SHM
+# instead -- still fully NCCL, just a different intra-node transport.
+# Override by exporting these before invoking the script.
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+
 # --- defaults (override via env) -------------------------------------------
 MODELS="${MODELS:-\
 Qwen/Qwen3-0.6B \
