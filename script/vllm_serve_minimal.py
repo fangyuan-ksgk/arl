@@ -32,6 +32,7 @@ os.environ["PYTHONPATH"] = (
 ).rstrip(os.pathsep)
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 import uvicorn
@@ -126,6 +127,10 @@ class GenReq(BaseModel):
 def build_app(llm: LLM) -> FastAPI:
     app = FastAPI()
 
+    # Single-worker executor: keeps weight-update RPCs FIFO so per-tensor
+    # broadcasts arrive in the order the client issued them.
+    rpc_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rpc")
+
     @app.get("/health/")
     def health():
         return {"status": "ok"}
@@ -152,11 +157,16 @@ def build_app(llm: LLM) -> FastAPI:
 
     @app.post("/update_named_param/")
     def update(req: UpdateReq = Body(...)):
-        llm.collective_rpc(
+        # Same deadlock pattern as init_communicator: the worker's
+        # broadcast(recv) cannot complete until the client also calls
+        # broadcast(send), which it can't do until this HTTP returns.
+        # Schedule on the single-worker pool so calls stay FIFO.
+        rpc_pool.submit(
+            llm.collective_rpc,
             "update_named_param",
             args=(req.name, req.dtype, tuple(req.shape)),
         )
-        return {"status": "ok"}
+        return {"status": "scheduled"}
 
     @app.post("/close_communicator/")
     def close():
