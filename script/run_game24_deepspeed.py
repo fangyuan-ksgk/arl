@@ -42,6 +42,7 @@ Launch
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import random
@@ -49,7 +50,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -58,6 +59,35 @@ if str(REPO_ROOT) not in sys.path:
 
 def slug(model_name: str) -> str:
     return model_name.replace("/", "__").replace(" ", "_")
+
+
+def _canon_expr(expr: str) -> str:
+    """AST-canonicalize so '(5*5- (2 - 1))' == '(5*5)-(2-1)'."""
+    try:
+        return ast.dump(ast.parse(expr, mode="eval").body)
+    except Exception:
+        return expr
+
+
+def _build_refs(puzzle: Dict[str, Any], own_expr: str) -> Tuple[List[str], int, int]:
+    """Return (refs, n_canonical, own_idx).
+
+    ``refs[:n_canonical]`` are the puzzle's enumerated 24-solutions. If
+    ``own_expr`` is non-empty and AST-distinct from all of them it is
+    appended as ``refs[-1]`` and ``own_idx`` points at it; otherwise
+    ``own_idx`` is the matching canonical index (or -1 if no own_expr).
+    """
+    sols = list(puzzle["solutions"])
+    n_can = len(sols)
+    refs = list(sols)
+    if not own_expr:
+        return refs, n_can, -1
+    own_canon = _canon_expr(own_expr)
+    own_idx = next((i for i, s in enumerate(sols) if _canon_expr(s) == own_canon), None)
+    if own_idx is None:
+        refs.append(own_expr)
+        own_idx = len(refs) - 1
+    return refs, n_can, own_idx
 
 
 # ---------------------------------------------------------------------------
@@ -355,17 +385,27 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
 
         puzzle_index = {tuple(sorted(p["numbers"])): p
                         for p in (train_puzzles + eval_puzzles + hard_probe)}
-        prompts, completions, refs, valid = [], [], [], []
+        # For each scored row we score against EVERY canonical 24-solution
+        # for the puzzle (plus the rollout's own \boxed{} expr if it's not
+        # in that set). Canonical R_T = max_s R_T(rollout → s); R_T_own
+        # exposes the own-expr score for delta-vs-correct analysis.
+        prompts, completions, refs_flat = [], [], []
+        valid: List[bool] = []
+        row_n_can: List[int] = []   # # canonical refs scored for this row
+        row_own_idx: List[int] = [] # own_idx into row's ref slice, -1 if N/A
         for row in my_rows:
             key = tuple(sorted(row["numbers"]))
             puzzle = puzzle_index.get(key)
-            if puzzle is None or not row.get("completion"):
-                valid.append(False); continue
-            prompts.append(tokenizer.apply_chat_template(
-                to_chat(puzzle)["prompt"], tokenize=False, add_generation_prompt=True))
-            completions.append(row["completion"])
-            refs.append(puzzle["solutions"][0])
-            valid.append(True)
+            if puzzle is None or not row.get("completion") or not puzzle["solutions"]:
+                valid.append(False); row_n_can.append(0); row_own_idx.append(-1)
+                continue
+            refs, n_can, own_idx = _build_refs(puzzle, row.get("expr") or "")
+            prompt = tokenizer.apply_chat_template(
+                to_chat(puzzle)["prompt"], tokenize=False, add_generation_prompt=True)
+            prompts.extend([prompt] * len(refs))
+            completions.extend([row["completion"]] * len(refs))
+            refs_flat.extend(refs)
+            valid.append(True); row_n_can.append(n_can); row_own_idx.append(own_idx)
 
         try:
             from transformers.integrations.deepspeed import (
@@ -404,36 +444,68 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
             ).to(scorer_device).eval()
 
         if is_main:
-            print(f"[vt-score] scoring {sum(valid)}/{len(my_rows)} on rank0 "
+            print(f"[vt-score] scoring {sum(valid)}/{len(my_rows)} rollouts on rank0 "
+                  f"against {len(refs_flat)} (rollout, ref) pairs "
                   f"(micro_batch={args.vt_micro_batch}) ...", flush=True)
         t_vt = time.time()
         scored = compute_vt_batched(
-            prompts, completions, refs, scorer_model, tokenizer,
+            prompts, completions, refs_flat, scorer_model, tokenizer,
             micro_batch_size=args.vt_micro_batch,
         )
 
         N_PTS = args.vt_resample_pts
         grid = np.linspace(0.0, 1.0, N_PTS)
-        scored_iter = iter(scored)
+        cursor = 0
         out_records: List[Dict[str, Any]] = []
-        for gidx, row, ok in zip(my_indices, my_rows, valid):
+        for gidx, row, ok, n_can, own_idx in zip(
+            my_indices, my_rows, valid, row_n_can, row_own_idx,
+        ):
             if not ok:
                 row["R_T"] = None
                 row["R_per_token"] = None
                 row["cumR_resampled"] = None
-            else:
-                sc = next(scored_iter)
-                vt = np.asarray(sc["vt"], dtype=float)
-                R_T = float(sc["R_T"]) if not np.isnan(sc["R_T"]) else None
-                row["R_T"] = R_T
-                row["R_per_token"] = (float(sc["R_per_token"])
-                                      if not np.isnan(sc["R_per_token"]) else None)
+                row["R_T_per_ref"] = None
+                row["R_T_own"] = None
+                row["best_ref_idx"] = None
+                out_records.append({"_gidx": gidx, "row": row})
+                continue
+            n_refs = n_can + (1 if own_idx >= n_can else 0)
+            chunk = scored[cursor:cursor + n_refs]
+            cursor += n_refs
+
+            # canonical (puzzle-correct) R_Ts
+            R_T_can = [float(s["R_T"]) if not np.isnan(s["R_T"]) else None
+                       for s in chunk[:n_can]]
+            valid_can = [(i, v) for i, v in enumerate(R_T_can) if v is not None]
+            if valid_can:
+                best_i, best_R = max(valid_can, key=lambda x: x[1])
+                best = chunk[best_i]
+                vt = np.asarray(best["vt"], dtype=float)
+                row["R_T"] = best_R
+                row["R_per_token"] = (float(best["R_per_token"])
+                                      if not np.isnan(best["R_per_token"]) else None)
                 if len(vt):
                     R = np.cumsum(vt)
                     x = np.linspace(0.0, 1.0, len(R))
                     row["cumR_resampled"] = np.interp(grid, x, R).tolist()
                 else:
                     row["cumR_resampled"] = None
+                row["best_ref_idx"] = best_i
+            else:
+                row["R_T"] = None
+                row["R_per_token"] = None
+                row["cumR_resampled"] = None
+                row["best_ref_idx"] = None
+
+            row["R_T_per_ref"] = R_T_can
+            if 0 <= own_idx < n_can:
+                row["R_T_own"] = R_T_can[own_idx]
+            elif own_idx >= n_can:
+                own_sc = chunk[own_idx]
+                row["R_T_own"] = (float(own_sc["R_T"])
+                                  if not np.isnan(own_sc["R_T"]) else None)
+            else:
+                row["R_T_own"] = None
             out_records.append({"_gidx": gidx, "row": row})
 
         # Write this rank's scored slice as ``eval_rollout.jsonl.scored.r{R}``
