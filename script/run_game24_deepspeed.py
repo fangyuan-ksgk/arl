@@ -255,7 +255,10 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
     model_load_kwargs = dict(
         dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     )
+    print(f"[rank{rank}] loading base model {model_name} ...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(model_name, **model_load_kwargs)
+    print(f"[rank{rank}] base model loaded in {time.time()-t0:.1f}s; "
+          f"building GRPOTrainer (will NCCL-handshake vLLM server) ...", flush=True)
 
     trainer = GRPOTrainer(
         model=model,
@@ -266,6 +269,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         processing_class=tokenizer,
         callbacks=[EvalFlagCallback(rollout_logger)],
     )
+    print(f"[rank{rank}] GRPOTrainer ready; starting trainer.train() ...", flush=True)
     trainer.train()
     train_time = time.time() - t0
     if is_main:
