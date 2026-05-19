@@ -9,7 +9,7 @@ deepspeed_config:
   # files + a zero_to_fp32.py recovery script, and reloading fails with
   # "no file named pytorch_model.bin, model.safetensors, ..."
   zero3_save_16bit_model: true
-  gradient_accumulation_steps: 4
+  gradient_accumulation_steps: auto
   gradient_clipping: 1.0
   offload_optimizer_device: none
   offload_param_device: none
