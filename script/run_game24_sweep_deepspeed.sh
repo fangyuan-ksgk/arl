@@ -107,10 +107,13 @@ start_vllm_server() {
   # That capped prompt+completion together, which truncated long-CoT runs
   # below --max-completion-length. For the len=2048 sweep we let the server
   # use the model's native context window so completion budget is honoured.
+  # NOTE: --enforce-eager was previously set defensively. Removing it lets
+  # vLLM capture CUDA graphs, which on H100 typically gives 2-5x decode
+  # speedup. Weight syncs still work because the NCCL broadcast writes
+  # in-place into vLLM's fixed weight buffers (graphs remain valid).
   CUDA_VISIBLE_DEVICES="${VLLM_GPU}" \
     setsid trl vllm-serve --model "${model}" \
       --host "${VLLM_HOST}" --port "${VLLM_PORT}" \
-      --enforce-eager \
       > "${log_file}" 2>&1 &
   VLLM_PID=$!
   echo "  [vllm] pid=${VLLM_PID} (pgid=${VLLM_PID})  log=${log_file}"

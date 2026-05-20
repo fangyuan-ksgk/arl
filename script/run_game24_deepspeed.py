@@ -216,6 +216,32 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         def on_evaluate(self, args, state, control, **kw):
             self.logger.in_eval = False
 
+    class StepTimerCallback(TrainerCallback):
+        """Append one JSON line per training step to out_dir/step_times.jsonl.
+        Rank-0 only. Useful for cross-config wall-time comparison without
+        having to grep tqdm output."""
+        def __init__(self, path: Path, rank: int):
+            self.path = path
+            self.rank = rank
+            self.t0 = None
+            self.fh = None
+            if rank == 0:
+                self.fh = path.open("w", buffering=1)  # line-buffered
+        def on_step_begin(self, args, state, control, **kw):
+            if self.fh is None: return
+            self.t0 = time.time()
+        def on_step_end(self, args, state, control, **kw):
+            if self.fh is None or self.t0 is None: return
+            dt = time.time() - self.t0
+            self.fh.write(json.dumps({
+                "step": int(state.global_step),
+                "step_time_s": round(dt, 4),
+                "epoch": float(state.epoch) if state.epoch is not None else None,
+            }) + "\n")
+        def on_train_end(self, args, state, control, **kw):
+            if self.fh is not None:
+                self.fh.close()
+
     # ------- Train --------------------------------------------------------
     config_kwargs = dict(
         output_dir=str(out_dir / "grpo"),
@@ -267,7 +293,10 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         train_dataset=train_ds,
         eval_dataset=eval_ds if args.eval_steps > 0 else None,
         processing_class=tokenizer,
-        callbacks=[EvalFlagCallback(rollout_logger)],
+        callbacks=[
+            EvalFlagCallback(rollout_logger),
+            StepTimerCallback(out_dir / "step_times.jsonl", rank),
+        ],
     )
     print(f"[rank{rank}] GRPOTrainer ready; starting trainer.train() ...", flush=True)
     trainer.train()
