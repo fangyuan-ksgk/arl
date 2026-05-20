@@ -64,7 +64,7 @@ TRAIN_GPUS="${TRAIN_GPUS:-1,2}"
 # Number of training processes — must equal the count of TRAIN_GPUS and the
 # `num_processes` entry in the accelerate yaml.
 NUM_PROCESSES="${NUM_PROCESSES:-$(awk -F, '{print NF}' <<< "${TRAIN_GPUS}")}"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/zero3.yaml}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/ddp.yaml}"
 
 # pdbs × grad_accum × num_processes must be a multiple of NUM_GENERATIONS.
 EFFECTIVE_BATCH=$((PER_DEVICE_BATCH_SIZE * GRAD_ACCUM * NUM_PROCESSES))

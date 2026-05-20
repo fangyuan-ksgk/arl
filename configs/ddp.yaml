@@ -1,0 +1,18 @@
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+mixed_precision: bf16
+num_processes: 2
+use_cpu: false
+
+# DDP: each rank holds a full copy of the model. Suitable for models that
+# comfortably fit on one GPU (≲ a few B params with bf16 + Adam states).
+# For larger models or tighter VRAM, switch to configs/zero2.yaml or
+# configs/zero3.yaml.
+
+# --- Launch reference (informational, ignored by YAML parser) ---
+# Terminal A: CUDA_VISIBLE_DEVICES=0 trl vllm-serve \
+#   --model Qwen/Qwen3-0.6B --host 0.0.0.0 --port 8000
+# Terminal B: CUDA_VISIBLE_DEVICES=1,2 \
+#   NCCL_CUMEM_ENABLE=0 NCCL_P2P_DISABLE=1 \
+#   accelerate launch --config_file configs/ddp.yaml \
+#     --num_processes 2 script/run_game24_deepspeed.py ...
