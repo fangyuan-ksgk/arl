@@ -29,8 +29,10 @@ export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,ENV}"
 
 # --- smoke-test scope ------------------------------------------------------
-export MODELS="${MODEL:-Qwen/Qwen3-0.6B}"
-export LENGTHS="${LEN:-1024}"
+# Accept either singular (MODEL/LEN) or plural (MODELS/LENGTHS) overrides;
+# plural matches the names used by the sweep script and is easy to copy-paste.
+export MODELS="${MODELS:-${MODEL:-Qwen/Qwen3-0.6B}}"
+export LENGTHS="${LENGTHS:-${LEN:-1024}}"
 export MAX_STEPS="${MAX_STEPS:-5}"
 export EVAL_STEPS="${EVAL_STEPS:-0}"        # skip eval; we only care about handshake + 1 step
 export OUTPUT_ROOT="${OUTPUT_ROOT:-output/game24_smoke_ds}"
