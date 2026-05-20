@@ -7,21 +7,21 @@
 \usepackage{url}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{subcaption}
 
-\title{Decoding-Velocity Reward: \\ A Principled Per-Token Signal for GRPO}
+\title{Predictive-Velocity Reward}
 
 \author{Fangyuan Yu \\
-Thoughtworks \\
 % \texttt{fangyuan.yu18@gmail.com} \\
 \And
 Shuang Wu \\
-Thoughtworks \\
+\And
+Xin Su \\
 \And
 Runyan Tan \\
-Thoughtworks \\
 \And
 Phillip Howard \\
-Thoughtworks \\
 }
 
 
@@ -43,27 +43,90 @@ four interlocking weaknesses: long, redundant chains of thought; the absence
 of a principled per-token reward; a learning-signal collapse when the base
 model has near-zero pass@\(K\); and a tendency to indiscriminately penalise
 every token of a failed trajectory. We propose the
-\emph{decoding-velocity reward}, a dense per-token signal derived via
-potential-based reward shaping from the change in answer-decoding likelihood.
+\emph{predictive-velocity reward}, a dense per-token signal derived via
+potential-based reward shaping from the change in answer-prediction likelihood.
 The trajectory-level sum of velocities telescopes \emph{exactly} into the
 \emph{information gain} contributed by the chain of thought,
 \(\log p_\theta(a \mid q, o) - \log p_\theta(a \mid q)\), giving every emitted
-token an explicit incentive to advance decoding of the answer. We argue that this
+token an explicit incentive to advance prediction of the answer. We argue that this
 formulation directly mitigates redundancy, lifts the per-token signal,
 and rehabilitates failed trajectories without inducing mode collapse.
 \end{abstract}
 
 \section{Introduction}
 
-Reinforcement learning with verifiable rewards has driven recent progress on
-reasoning-heavy benchmarks, with Group Relative Policy Optimization
-(GRPO)~\citep{shao2024deepseekmath, deepseek2025r1} emerging as the de-facto
-algorithm. Despite its empirical success, the algorithm carries
-several structural flaws that become increasingly visible as chain-of-thought
-(CoT) sequences grow longer and tasks grow harder. We identify four such
-drawbacks (Section~\ref{sec:problem}) and propose a single, mathematically
-clean modification of the reward (Section~\ref{sec:method}) that addresses
-three of them outright and lays the groundwork for tackling the fourth.
+Reinforcement learning with verifiable rewards (RLVR) has driven recent
+progress on coding, mathematics, and multi-step
+reasoning~\citep{deepseek2025r1, kimi2025k15} by training language
+models to search over long chains of thought (CoT). Much of that length
+is redundant: \citet{li2025stepentropy} show that \(80\%\) of
+intermediate steps can be pruned with minor accuracy loss on math
+benchmarks. The wasted tokens are paid for in inference latency, in API
+spend, and --- when a hard token budget is enforced --- in raw
+accuracy, because rollouts get truncated before the answer is emitted.
+
+The cause lies in how the dominant algorithm assigns credit. Group
+Relative Policy Optimization (GRPO)~\citep{shao2024deepseekmath,
+deepseek2025r1} and its variants~\citep{yu2025dapo, liu2025drgrpo}
+grant a single sequence-level reward to each rollout from an external
+verifier and use the group-relative advantage to upweight winners.
+Because every token in a sequence inherits the same advantage, the
+gradient cannot penalise redundant reasoning inside a successful
+trajectory, nor reinforce useful sub-reasoning that happens to sit
+inside a failed one. Length drift, latent-diversity collapse, and the
+zero-pass@\(K\) dead zone all follow from this single coarse-grained
+credit assignment (Section~\ref{sec:problem}).
+
+What would a \emph{principled} per-token reward look like? Two
+properties suffice: (i) at each step, the reward should measure how
+much the emitted token advances predictability of the correct answer;
+and (ii) accumulated over the trajectory, the per-token rewards should
+recover a quantity that directly expresses how predictable the answer
+has become given the CoT. The acid test is self-sufficiency: a
+principled reward should suffice on its own to train the policy,
+without being combined with an external reward through a hand-tuned
+weight. Process reward
+models~\citep{lightman2023letsverify, wang2024mathshepherd,
+cui2025prime, setlur2024rewardingprogress} fail this test --- their
+step-level scores are noisy predictions from a separately trained
+verifier, are not derivable from the policy itself, and are deployed as
+auxiliary regularisers stacked on top of the outcome reward.
+
+We propose the \emph{predictive-velocity reward}, a per-token signal read
+off the policy itself. The sequence-level reward is the information
+gain the CoT confers on predicting the reference answer,
+\(r(a, o, q) = \log p_\theta(a \mid q, o) - \log p_\theta(a \mid q)\),
+and its per-token decomposition is the change in answer-prediction
+log-likelihood induced by each emitted token,
+\(v_t = \log p_\theta(a \mid q, o_{1:t}) - \log p_\theta(a \mid q, o_{1:t-1})\).
+The \(v_t\) telescope \emph{exactly} into \(r\), so optimising the
+per-token signal is a strict decomposition of an information-theoretic
+objective rather than a heuristic surrogate: tokens that advance answer
+prediction earn positive credit, neutral tokens earn zero, and tokens
+that degrade prediction are penalised --- with no external reward model,
+no length coefficient, and no change to the verifier.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item We trace four interlocking GRPO pathologies --- CoT
+        redundancy, the absence of a per-token signal, the
+        zero-pass@\(K\) dead zone, and indiscriminate trajectory-level
+        credit --- to a single cause, the sparse outcome reward
+        (Section~\ref{sec:problem}).
+  \item We define the \emph{predictive-velocity reward}, the unique
+        per-token decomposition of CoT information gain, computable
+        from the policy alone (Section~\ref{sec:method}).
+  \item We complement the reward with an \emph{answer buffer} and a
+        \emph{prefix buffer} --- diversifying the target the CoT is
+        graded against and the starting point from which it is built
+        --- and a \emph{per-token advantage} rule that favours the
+        shortest trajectory among those of maximum information gain.
+  \item On Game of 24 across \(\{0.6,1.7,4\}\)B model scales and
+        \(\{512,1024\}\)-token CoT budgets we document the baseline
+        GRPO pathologies the method targets and establish the
+        diagnostic battery on which it will be evaluated
+        (Section~\ref{subsec:baseline-diag}).
+\end{itemize}
 
 \section{The Four Drawbacks of GRPO}
 \label{sec:problem}
@@ -71,7 +134,12 @@ three of them outright and lays the groundwork for tackling the fourth.
 \paragraph{(D1) CoT redundancy.}
 Reasoning models routinely emit thousands of CoT tokens for problems that, in
 principle, require only a few. Much of the chain is filler that neither
-constrains the answer distribution nor verifies intermediate computation.
+constrains the answer distribution nor verifies intermediate computation:
+\citet{li2025stepentropy} show that on math benchmarks across DeepSeek-R1-7B,
+14B and Qwen3-8B, roughly \(80\%\) of \emph{low-entropy} intermediate
+reasoning steps can be pruned with only minor accuracy loss, while random or
+high-entropy pruning collapses performance --- a direct empirical lower bound
+on how much of the chain is informationally redundant.
 Practitioners have addressed this with explicit length penalties or
 short-answer bonuses, but such auxiliary rewards are fundamentally
 unprincipled: a hand-tuned length term is a separate objective bolted onto the
@@ -79,19 +147,6 @@ correctness reward and almost always trades against accuracy, forcing
 brittle coefficient sweeps to balance the two. What is missing is a
 \emph{single} reward whose structure already prices the cost of additional
 tokens against their contribution to solving the problem.
-
-A striking side-symptom makes the severity of redundancy concrete: under a
-\emph{fixed} CoT token budget \(T_{\max}\), larger models in the same family
-can underperform smaller ones on the same task, simply because their
-characteristic CoT exceeds \(T_{\max}\) and is truncated before the answer
-is emitted. Equivalently, holding accuracy fixed, the CoT budget required
-grows super-linearly with model scale even when the underlying problem does
-not. We document this size--budget inversion empirically on Game of 24 in
-Section~\ref{sec:exp}; it is, in effect, a scale-dependent
-manifestation of D1: the larger the model, the more of its emitted chain is
-filler whose only effect is to push the answer past the budget cliff. A
-principled reward should therefore tighten as model scale increases, not
-require a larger \(T_{\max}\) to compensate.
 
 \paragraph{(D2) No principled per-token signal.}
 The reward in GRPO is sparse and trajectory-level. Every intermediate token
@@ -112,7 +167,7 @@ discards genuinely useful sub-trajectories that happened to terminate badly,
 reinforces filler tokens that happened to ride along with success, and is a
 poor model of how credit propagates through reasoning.
 
-\section{Method: Decoding-Velocity Reward}
+\section{Method: Predictive-Velocity Reward}
 \label{sec:method}
 
 \subsection{Setup and Notation}
@@ -136,7 +191,7 @@ r(a, o, q)
 \end{equation}
 Adopting the convention \(r(a, q) := \log p_\theta(a \mid q)\) for the
 no-CoT case, \(r(a, o, q)\) measures \emph{how much the CoT helps} the policy
-decode the answer. This is a more principled target than the raw decoding
+predict the answer. This is a more principled target than the raw answer-prediction
 likelihood \(\log p_\theta(a \mid q, o)\): the latter is satisfied by any
 prefix that merely \emph{correlates} with \(a\), whereas
 Equation~\ref{eq:rseq} rewards the CoT's \emph{causal contribution} (Section~\ref{subsec:buys}).
@@ -189,7 +244,7 @@ evaluating the information-gain reward, replacing
 \(\log p_\theta(a \mid q, o)\) in Equations~\ref{eq:rseq} and \ref{eq:rvel}
 with
 \(\mathbb{E}_{a \sim \mathrm{unif}(\mathcal{A}_q)}\!\bigl[\log p_\theta(a \mid q, o)\bigr]\).
-This encourages the policy to learn a \emph{general} CoT that decodes the
+This encourages the policy to learn a \emph{general} CoT that predicts the
 class of correct answers, rather than overfitting to any one of them. The
 buffer is built online from the model's own successful rollouts and grows
 monotonically over training; until a query has at least one entry in
@@ -200,7 +255,7 @@ monotonically over training; until a query has at least one entry in
 
 Symmetric to the answer buffer of Section~\ref{subsec:buffer}, we maintain a
 \emph{prefix buffer} \(\mathcal{P}_q\) per query, recording CoT prefixes the
-model has produced so far that score highly under the decoding objective
+model has produced so far that score highly under the answer-prediction objective
 \emph{relative to other prefixes of the same length}:
 \begin{equation}
 \mathcal{P}_q \;:=\; \{\, o_{1:t} \;\mid\; 1 \le t < T \,\},
@@ -263,46 +318,24 @@ target of optimisation.
 \label{subsec:buys}
 
 \paragraph{D1 -- CoT redundancy is priced at every scale.}
-Redundancy is captured at \emph{both} granularities by the same equation.
-A redundant CoT contributes zero information gain over the direct-answer
-baseline, since \(\log p_\theta(a \mid q, o) \approx \log p_\theta(a \mid q)\)
-makes \(r(a, o, q) \approx 0\). Symmetrically, a redundant token contributes
-zero \emph{velocity}, since
-\(\log p_\theta(a \mid q, o_{1:t}) \approx \log p_\theta(a \mid q, o_{1:t-1})\)
-makes \(v(a, o_{1:t}, q) \approx 0\). The reward thus aligns with the
-predictive target at the sequence level and prices each token by its
-\emph{marginal} contribution to that target -- without an auxiliary length
-penalty, and without any coefficient to tune.
 
-\paragraph{D2 -- The per-token signal is exactly the sequence-level reward.}
-By Equation~\ref{eq:telescope}, assigning the per-token reward
-\(v(a, o_{1:t}, q)\) is \emph{exactly} equivalent, in trajectory return, to
-assigning the sequence-level reward \(r(a, o, q)\). The per-token signal is
-therefore not a heuristic surrogate but a strict decomposition of the
-sequence-level objective: principled in form and aligned in content with
-what we ultimately optimise.
+\paragraph{D2 -- Per-token rewards accumulate to the predictive
+likelihood.} By Equation~\ref{eq:telescope}, the per-token velocities
+sum exactly to \(\log p_\theta(a \mid q, o) - \log p_\theta(a \mid q)\)
+--- the gain in answer predictability conferred by the CoT. The
+per-token signal is therefore principled by construction: it is not a
+heuristic surrogate but the unique decomposition of an
+information-theoretic, policy-internal target.
 
-\paragraph{D3 -- Toward learning, not just sharpening (hypothesis).}
-We hypothesise -- and intend to validate experimentally -- that the dense
-per-token velocity signal helps the model \emph{learn new behaviours}
-rather than merely \emph{sharpen} the distribution it already places mass on.
-Vanilla GRPO can only reweight existing trajectories; in the zero-pass@\(K\)
-regime it has nothing to reweight. The velocity reward, by contrast, scores
-\emph{every} token of \emph{every} rollout against the reference answer, so
-non-zero gradients exist even when the group contains no successful
-trajectory. Whether this is sufficient to lift the model off zero-pass@\(K\)
-tasks is an open empirical question that we leave to Section~\ref{sec:exp}.
+\paragraph{D3 -- Learning from failure trajectories.}
 
-\paragraph{D4 -- Credit follows contribution, not outcome.}
-Failed trajectories contain tokens whose local velocity is positive --
-locally, they advanced decoding of the reference answer -- and these are
-rewarded. Successful trajectories contain tokens whose local velocity is
-zero or negative -- they did not contribute, or actively dragged the
-decoding likelihood backward -- and these are discouraged. Credit attaches
-to a token by its \emph{measured contribution}, not by the eventual outcome
-of the trajectory it happens to belong to. This eliminates the
-``discriminate every token of a failure, accept every token of a success''
-pathology of vanilla GRPO at its source.
+\paragraph{D4 -- Explicit diversity encouragement via prefix and answer
+caching.} The answer buffer \(\mathcal{A}_q\)
+(Section~\ref{subsec:buffer}) and the prefix buffer \(\mathcal{P}_q\)
+(Section~\ref{subsec:prefix}) diversify, respectively, the target the
+CoT is graded against and the starting point from which it is built;
+together they act as an explicit anti-mode-collapse pressure on top of
+the velocity reward.
 
 \section{Experiments}
 \label{sec:exp}
@@ -314,44 +347,193 @@ experiments that will populate this section.
 \label{subsec:rq}
 
 The Experiments section is organised around three head-to-head comparisons
-between vanilla GRPO and GRPO augmented with the decoding-velocity reward
+between vanilla GRPO and GRPO augmented with the predictive-velocity reward
 (plus the answer buffer \(\mathcal{A}_q\) and prefix buffer \(\mathcal{P}_q\)
 of Section~\ref{sec:method}). Each question targets one of the drawbacks
 that the method is designed to address.
 
-\paragraph{(RQ1) Does the velocity reward shorten the CoT without hurting
-accuracy?}
-This is the causal test for \textbf{D1}. Under a matched training budget and
-a fixed token cap \(T_{\max}\), we compare mean CoT length and pass-rate
-trajectories between the two algorithms. The hypothesis is that the
-velocity reward, by pricing redundant tokens at zero per-token contribution,
-drives the emitted chain to a substantially shorter steady state while
-preserving (or improving) accuracy --- something a hand-tuned length
-penalty achieves only by trading against correctness.
+\begin{itemize}
+  \item \textbf{(RQ1, targets D1)} Does the velocity reward shorten the
+        CoT without hurting accuracy under a matched \(T_{\max}\)?
+  \item \textbf{(RQ2, targets D3)} Does it break the zero-pass@\(K\)
+        dead zone, where vanilla GRPO has no positive trajectory to
+        reweight?
+  \item \textbf{(RQ3, targets the prefix buffer)} Does
+        \(\mathcal{P}_q\) raise the number of distinct correct
+        solutions per puzzle relative to vanilla GRPO?
+\end{itemize}
 
-\paragraph{(RQ2) Does the velocity reward break the zero-pass@\(K\) dead
-zone?}
-This is the test for \textbf{D3}. We isolate the hardest difficulty bucket
-on which vanilla GRPO records pass-rate \(\approx 0\) for the entire
-training run, and ask whether the dense per-token signal --- combined with
-the answer buffer that injects known-correct trajectories into the group
---- enables non-trivial learning where GRPO is structurally stuck. The
-hypothesis is that the velocity reward provides gradient even when no
-sampled trajectory is correct, because \(v_t\) is computed against a
-reference answer rather than against the group.
+\subsection{Baseline GRPO diagnostics on Game of 24}
+\label{subsec:baseline-diag}
 
-\paragraph{(RQ3) Does the prefix buffer increase solution diversity?}
-This probes the answer/prefix-buffer design rather than a specific GRPO
-drawback. We measure the number of distinct correct expressions per puzzle
-emitted by the trained policy under temperature sampling, and compare
-against vanilla GRPO. We expect the prefix buffer \(\mathcal{P}_q\), by
-randomly priming rollouts with previously discovered correct prefixes, to
-keep multiple solution modes simultaneously near the top of the logit
-ranking, rather than letting GRPO collapse onto a single canonical CoT per
-puzzle. We are explicit that an LLM cannot store \(K\) genuinely
-independent responses to a single prompt without something like a
-prefix-conditioning mechanism: \(\mathcal{P}_q\) is precisely that
-mechanism, and RQ3 is the empirical check that it works.
+Before reporting velocity-reward results we characterise what
+\emph{vanilla} GRPO does on Game of 24, swept across model scale
+\(\{\text{Qwen3-0.6B},\,\text{Qwen3-1.7B},\,\text{Qwen3-4B}\}\) and CoT
+budget \(T_{\max}\in\{512,\,1024\}\). All six runs share the same prompt
+template, verifier (an expression evaluator that accepts any parenthesised
+arithmetic expression over the four input digits that evaluates to 24),
+group size \(G=8\), and 1200 GRPO update steps. Evaluation is performed
+every 200 steps on a held-out set of 84 puzzles, sampling \(G\) rollouts
+per puzzle; the diagnostics below are computed at the final step. Visual
+encoding is consistent across panels: \emph{colour} encodes model size
+(0.6B blue, 1.7B teal, 4B red) and \emph{linestyle} encodes budget (solid
+\(=512\), dashed \(=1024\)).
+
+These diagnostics serve three purposes: (i) they make the redundancy
+that motivates D1 (Section~\ref{sec:problem}) concrete on a controlled
+task --- truncation pressure at small budgets and per-cycle CoT-length
+drift; (ii) they establish a battery of measurement tools --- per-cycle
+solution coverage, within-puzzle prefix collapse, predictive-velocity
+correctness contrast --- that we will reuse when reporting
+velocity-reward results; and (iii) they expose the failure modes the
+method must improve upon.
+
+\paragraph{Truncation and accuracy (K1, Fig.~\ref{fig:k1}).}
+Accuracy rises with both model size and budget, except at
+\(T_{\max}=512\) where 0.6B and 1.7B tie at 0.408 because both saturate
+the budget.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/game24-k1.png}
+  \caption{\textbf{K1 --- Truncation and accuracy.} Mean CoT length
+  (left), structural completeness (centre), and accuracy (right) across
+  GRPO updates for each (model, budget). Dotted horizontals mark
+  \(T_{\max}\). All curves are averaged over 84 held-out puzzles \(\times\)
+  \(G=8\) rollouts.}
+  \label{fig:k1}
+\end{figure}
+
+\paragraph{Length split by correctness, and within-puzzle diversity (K2,
+Fig.~\ref{fig:k2}).}
+Stronger models need shorter CoTs to succeed, and within-puzzle
+diversity grows when the budget is lifted from 512 to 1024.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/game24-k2.png}
+  \caption{\textbf{K2 --- CoT length and diversity.} Mean CoT length
+  (left), mean length of \emph{correct} rollouts only (centre), and
+  unique correct CoTs per puzzle out of \(G=8\) (right).}
+  \label{fig:k2}
+\end{figure}
+
+\paragraph{pass@1 and pass@8 (K3, Fig.~\ref{fig:k3}).}
+The pass@8\(-\)pass@1 gap shrinks with model size --- larger models
+concentrate on fewer solution templates, the empirical target for the
+prefix buffer \(\mathcal{P}_q\) (RQ3).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/game24-k3.png}
+  \caption{\textbf{K3 --- pass@1 and pass@8.} pass@8 \(-\) pass@1 quantifies
+  the head-room left by single-shot sampling.}
+  \label{fig:k3}
+\end{figure}
+
+\paragraph{Solution-coverage dynamics (K4, Fig.~\ref{fig:k4}).}
+Solution coverage is overall poor: cumulative coverage saturates below
+\(25\%\) of canonical solutions for every config, only about a third of
+the \(G\) rollouts emit distinct solutions in any given cycle, and the
+novel fraction monotonically declines from step 200 onwards --- the
+mode collapse that motivates \(\mathcal{P}_q\).
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\linewidth]{figures/game24-k4.png}
+  \caption{\textbf{K4 --- Solution-coverage dynamics.} Per-cycle diversity
+  (left), cumulative coverage of canonical \(=24\) solutions (centre),
+  and per-cycle novel fraction (right).}
+  \label{fig:k4}
+\end{figure}
+
+\paragraph{Within-puzzle prefix collapse (K5, Fig.~\ref{fig:k5}).}
+At the other end of a rollout, heavy within-puzzle prefix sharing is
+observed: top-1 prefix share falls with model size and budget but
+every config stays far above the \(1/G=0.125\) floor of an uncollapsed
+policy.
+
+\begin{figure}[t]
+  \centering
+  \begin{subfigure}[t]{0.55\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-k5.png}
+    \caption{\textbf{K5 --- Within-puzzle 120-character prefix collapse.}
+    Mean fraction of the \(G\) rollouts for a puzzle that share the
+    most-common 120-character CoT prefix. Higher \(=\) more
+    prefix-collapsed.}
+    \label{fig:k5}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.43\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-k6.png}
+    \caption{\textbf{K6 --- Predictive-velocity correctness contrast at the
+    final step.} Mean \(R_T\) of correct (green) vs. incorrect (orange)
+    rollouts per configuration. Correct rollouts are scored against
+    their own emitted expression; incorrect rollouts against the
+    best-matching canonical \(=24\)-solution.}
+    \label{fig:k6}
+  \end{subfigure}
+  \caption{K5 and K6 diagnostics at the final GRPO step.}
+  \label{fig:k5k6}
+\end{figure}
+
+\paragraph{Predictive-velocity correctness contrast (K6,
+Fig.~\ref{fig:k6}).}
+\(R_T\) is generally a useful signal that separates correct from
+incorrect rollouts; the gap shrinks as the policy gets stronger, where
+\(R_T\) acts mainly as a compaction pressure (RQ1) rather than as a
+discriminator.
+
+\paragraph{Per-prefix-position correctness contrast (K7,
+Fig.~\ref{fig:k7}).}
+The within-puzzle \(\Delta R_t = \overline{R_t}_{\text{correct}} -
+\overline{R_t}_{\text{incorrect}}\) curves are dominated by late-CoT
+tokens (\(\tau \gtrsim 0.7\)); at smaller scales and tighter budgets
+the early-CoT contrast dips sharply negative before recovering --- the
+temporal signature of the K5 prefix collapse.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=0.85\linewidth]{figures/game24-k7.png}
+  \caption{\textbf{K7 --- Per-prefix-position \(R_t\) correctness
+  contrast at the final GRPO step.} Within-puzzle \(\Delta R_t\)
+  averaged over puzzles with mixed correctness, one curve per
+  (model, budget). Colour encodes model size, linestyle encodes
+  budget; the dotted horizontal marks \(\Delta R_t = 0\).}
+  \label{fig:k7}
+\end{figure}
+
+\paragraph{Summary.}
+The baseline sweep documents (i) truncation-induced accuracy flattening
+under a tight 512-token budget (K1), (ii) compaction of correct
+rollouts with model scale even without
+any length pressure (K2), (iii) latent diversity that shrinks as models
+get stronger (K3), (iv) early saturation of solution coverage and
+near-zero novelty by mid-training (K4), (v) high but scale-dependent
+within-puzzle prefix collapse (K5), (vi) a usable but
+competence-dependent \(R_T\) correctness contrast (K6), and (vii) a
+late-CoT-dominated \(\Delta R_t\) trajectory whose early-position sign
+flips track prefix collapse (K7). Sections
+\ref{subsec:main-results}--\ref{subsec:diagnostics} will revisit each of
+these panels under GRPO + predictive-velocity reward.
+
+\subsection{Main Results}
+\label{subsec:main-results}
+\textit{TBD.} Accuracy and CoT-length curves over training steps for
+baseline GRPO versus GRPO + predictive-velocity reward.
+
+\subsection{Ablations}
+\textit{TBD.} Effect of: (a)~the size and diversity of the reference-answer
+set; (b)~replacing the velocity reward with the raw answer-prediction likelihood (to
+confirm the camping problem); (c)~co-existence with length penalties (to
+verify they become redundant).
+
+\subsection{Diagnostics}
+\label{subsec:diagnostics}
+\textit{TBD.} Per-token reward attribution, redundancy measurements
+(distinct-\(n\), self-BLEU on CoTs), and the zero-pass@\(K\) recovery
+experiment.
 
 \subsection{Setup}
 
@@ -419,26 +601,68 @@ equivalent answers) is sourced, how
 pass versus per-token recomputation), and how the velocity signal is
 integrated with the GRPO group-relative baseline.
 
-\subsection{Main Results}
-\textit{TBD.} Accuracy and CoT-length curves over training steps for
-baseline GRPO versus GRPO + decoding-velocity reward.
-
-\subsection{Ablations}
-\textit{TBD.} Effect of: (a)~the size and diversity of the reference-answer
-set; (b)~replacing the velocity reward with the raw decoding likelihood (to
-confirm the camping problem); (c)~co-existence with length penalties (to
-verify they become redundant).
-
-\subsection{Diagnostics}
-\textit{TBD.} Per-token reward attribution, redundancy measurements
-(distinct-\(n\), self-BLEU on CoTs), and the zero-pass@\(K\) recovery
-experiment.
-
 \bibliography{iclr2026_conference}
 \bibliographystyle{iclr2026_conference}
 
 \appendix
 \section{Appendix}
 \textit{Reserved for derivations, hyperparameters, and additional results.}
+
+\subsection{Per-puzzle solution life-cycle across configs}
+\label{app:lifecycle}
+
+Figure~\ref{fig:lifecycle-grid} reproduces the lifecycle ``river'' of
+\citet{shao2024deepseekmath}-style GRPO rollouts on a single held-out
+Game-of-24 puzzle, drawn for every (model, budget) cell of the
+\(\{0.6,1.7,4\}\)B \(\times\) \(\{512, 1024\}\) sweep. Each lane is one
+unique AST-canonicalised expression; the thickness at training step
+\(s\) equals the number of rollouts (out of \(G\)) that emitted that
+expression that cycle, and the colour is green (verifier accepted) or
+red (rejected). Comparing panels across rows isolates the effect of
+model scale; across columns, the effect of the token budget.
+
+\begin{figure}[h!]
+  \centering
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-0.6B-len512.png}
+    \caption{0.6B, \(T_{\max}=512\).}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-0.6B-len1024.png}
+    \caption{0.6B, \(T_{\max}=1024\).}
+  \end{subfigure}
+
+  \vspace{0.6em}
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-1.7B-len512.png}
+    \caption{1.7B, \(T_{\max}=512\).}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-1.7B-len1024.png}
+    \caption{1.7B, \(T_{\max}=1024\).}
+  \end{subfigure}
+
+  \vspace{0.6em}
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-4B-len512.png}
+    \caption{4B, \(T_{\max}=512\).}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.48\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/game24-lifecycle-4B-len1024.png}
+    \caption{4B, \(T_{\max}=1024\).}
+  \end{subfigure}
+
+  \caption{\textbf{Per-puzzle solution life-cycle across configs.}
+  Stream graph of unique CoT/expressions emitted by vanilla GRPO over
+  training, for one fixed held-out puzzle across the six
+  (model, budget) cells.}
+  \label{fig:lifecycle-grid}
+\end{figure}
 
 \end{document}

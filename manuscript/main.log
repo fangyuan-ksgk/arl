@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) (preloaded format=pdflatex 2024.3.16)  13 MAY 2026 23:54
+This is pdfTeX, Version 3.141592653-2.6-1.40.26 (TeX Live 2024) (preloaded format=pdflatex 2024.3.16)  20 MAY 2026 18:57
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -270,13 +270,50 @@ Package uniquecounter Info: New unique counter `rerunfilecheck' on input line 28
 \Hy@SectionHShift=\skip64
 ) (/usr/local/texlive/2024/texmf-dist/tex/latex/amsfonts/amssymb.sty
 Package: amssymb 2013/01/14 v3.01 AMS font symbols
+) (/usr/local/texlive/2024/texmf-dist/tex/latex/graphics/graphicx.sty
+Package: graphicx 2021/09/16 v1.2d Enhanced LaTeX Graphics (DPC,SPQR)
+ (/usr/local/texlive/2024/texmf-dist/tex/latex/graphics/graphics.sty
+Package: graphics 2022/03/10 v1.4e Standard LaTeX Graphics (DPC,SPQR)
+ (/usr/local/texlive/2024/texmf-dist/tex/latex/graphics/trig.sty
+Package: trig 2021/08/11 v1.11 sin cos tan (DPC)
+) (/usr/local/texlive/2024/texmf-dist/tex/latex/graphics-cfg/graphics.cfg
+File: graphics.cfg 2016/06/04 v1.11 sample graphics configuration
+)
+Package graphics Info: Driver file: pdftex.def on input line 107.
+)
+\Gin@req@height=\dimen159
+\Gin@req@width=\dimen160
+) (/usr/local/texlive/2024/texmf-dist/tex/latex/caption/subcaption.sty
+Package: subcaption 2023/07/28 v1.6b Sub-captions (AR)
+ (/usr/local/texlive/2024/texmf-dist/tex/latex/caption/caption.sty
+Package: caption 2023/08/05 v3.6o Customizing captions (AR)
+ (/usr/local/texlive/2024/texmf-dist/tex/latex/caption/caption3.sty
+Package: caption3 2023/07/31 v2.4d caption3 kernel (AR)
+\caption@tempdima=\dimen161
+\captionmargin=\dimen162
+\caption@leftmargin=\dimen163
+\caption@rightmargin=\dimen164
+\caption@width=\dimen165
+\caption@indent=\dimen166
+\caption@parindent=\dimen167
+\caption@hangindent=\dimen168
+Package caption Info: Standard document class detected.
+)
+\c@caption@flags=\count292
+\c@continuedfloat=\count293
+Package caption Info: hyperref package is loaded.
+)
+Package caption Info: New subtype `subfigure' on input line 238.
+\c@subfigure=\count294
+Package caption Info: New subtype `subtable' on input line 238.
+\c@subtable=\count295
 )
 LaTeX Font Info:    Trying to load font information for OT1+ptm on input line 31.
  (/usr/local/texlive/2024/texmf-dist/tex/latex/psnfss/ot1ptm.fd
 File: ot1ptm.fd 2001/06/04 font definitions for OT1/ptm.
 ) (/usr/local/texlive/2024/texmf-dist/tex/latex/l3backend/l3backend-pdftex.def
 File: l3backend-pdftex.def 2024-02-20 L3 backend support: PDF output (pdfTeX)
-\l__color_backend_stack_int=\count292
+\l__color_backend_stack_int=\count296
 \l__pdf_internal_box=\box55
 ) (./main.aux)
 \openout1 = `main.aux'.
@@ -301,23 +338,30 @@ LaTeX Font Info:    Checking defaults for PU/pdf/m/n on input line 31.
 LaTeX Font Info:    ... okay on input line 31.
  (/usr/local/texlive/2024/texmf-dist/tex/context/base/mkii/supp-pdf.mkii
 [Loading MPS to PDF converter (version 2006.09.02).]
-\scratchcounter=\count293
-\scratchdimen=\dimen159
+\scratchcounter=\count297
+\scratchdimen=\dimen169
 \scratchbox=\box56
-\nofMPsegments=\count294
-\nofMParguments=\count295
+\nofMPsegments=\count298
+\nofMParguments=\count299
 \everyMPshowfont=\toks23
-\MPscratchCnt=\count296
-\MPscratchDim=\dimen160
-\MPnumerator=\count297
-\makeMPintoPDFobject=\count298
+\MPscratchCnt=\count300
+\MPscratchDim=\dimen170
+\MPnumerator=\count301
+\makeMPintoPDFobject=\count302
 \everyMPtoPDFconversion=\toks24
-)
+) (/usr/local/texlive/2024/texmf-dist/tex/latex/epstopdf-pkg/epstopdf-base.sty
+Package: epstopdf-base 2020-01-24 v2.11 Base part for package epstopdf
+Package epstopdf-base Info: Redefining graphics rule for `.eps' on input line 485.
+ (/usr/local/texlive/2024/texmf-dist/tex/latex/latexconfig/epstopdf-sys.cfg
+File: epstopdf-sys.cfg 2010/07/13 v1.3 Configuration of (r)epstopdf for TeX Live
+))
 Package hyperref Info: Link coloring OFF on input line 31.
  (./main.out) (./main.out)
 \@outlinefile=\write3
 \openout3 = `main.out'.
 
+Package caption Info: Begin \AtBeginDocument code.
+Package caption Info: End \AtBeginDocument code.
 LaTeX Font Info:    Trying to load font information for U+msa on input line 38.
  (/usr/local/texlive/2024/texmf-dist/tex/latex/amsfonts/umsa.fd
 File: umsa.fd 2013/01/14 v3.01 AMS symbols A
@@ -327,36 +371,111 @@ LaTeX Font Info:    Trying to load font information for U+msb on input line 38.
 File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 ) [1{/usr/local/texlive/2024/texmf-var/fonts/map/pdftex/updmap/pdftex.map}{/usr/local/texlive/2024/texmf-dist/fonts/enc/dvips/base/8r.enc}
 
-] [2] [3] [4]
-LaTeX Font Info:    Trying to load font information for TS1+ptm on input line 369.
+]
+LaTeX Font Info:    Trying to load font information for TS1+ptm on input line 111.
  (/usr/local/texlive/2024/texmf-dist/tex/latex/psnfss/ts1ptm.fd
 File: ts1ptm.fd 2001/06/04 font definitions for TS1/ptm.
-) [5] (./main.bbl
+) [2] [3] [4]
+<figures/game24-k1.png, id=176, 1429.13925pt x 410.4936pt>
+File: figures/game24-k1.png Graphic file (type png)
+<use figures/game24-k1.png>
+Package pdftex.def Info: figures/game24-k1.png  used on input line 398.
+(pdftex.def)             Requested size: 397.48499pt x 114.16699pt.
+<figures/game24-k2.png, id=179, 1429.13925pt x 410.4936pt>
+File: figures/game24-k2.png Graphic file (type png)
+<use figures/game24-k2.png>
+Package pdftex.def Info: figures/game24-k2.png  used on input line 414.
+(pdftex.def)             Requested size: 397.48499pt x 114.16699pt.
+<figures/game24-k3.png, id=181, 995.8806pt x 410.4936pt>
+File: figures/game24-k3.png Graphic file (type png)
+<use figures/game24-k3.png>
+Package pdftex.def Info: figures/game24-k3.png  used on input line 428.
+(pdftex.def)             Requested size: 397.48499pt x 163.8375pt.
+<figures/game24-k4.png, id=183, 1429.5006pt x 410.4936pt>
+File: figures/game24-k4.png Graphic file (type png)
+<use figures/game24-k4.png>
+Package pdftex.def Info: figures/game24-k4.png  used on input line 443.
+(pdftex.def)             Requested size: 397.48499pt x 114.14194pt.
+ [5 <./figures/game24-k1.png> <./figures/game24-k2.png>]
+<figures/game24-k5.png, id=199, 570.933pt x 295.5843pt>
+File: figures/game24-k5.png Graphic file (type png)
+<use figures/game24-k5.png>
+Package pdftex.def Info: figures/game24-k5.png  used on input line 460.
+(pdftex.def)             Requested size: 218.61795pt x 113.18465pt.
+<figures/game24-k6.png, id=200, 599.1183pt x 295.5843pt>
+File: figures/game24-k6.png Graphic file (type png)
+<use figures/game24-k6.png>
+Package pdftex.def Info: figures/game24-k6.png  used on input line 469.
+(pdftex.def)             Requested size: 170.91562pt x 84.32358pt.
+<figures/game24-k7.png, id=203, 777.6252pt x 387.3672pt>
+File: figures/game24-k7.png Graphic file (type png)
+<use figures/game24-k7.png>
+Package pdftex.def Info: figures/game24-k7.png  used on input line 498.
+(pdftex.def)             Requested size: 337.86465pt x 168.30832pt.
+ [6 <./figures/game24-k3.png> <./figures/game24-k4.png>]
+Underfull \vbox (badness 2103) has occurred while \output is active []
+
+ [7 <./figures/game24-k5.png> <./figures/game24-k6.png> <./figures/game24-k7.png>] (./main.bbl
 Underfull \hbox (badness 2221) in paragraph at lines 19--22
 []\OT1/ptm/m/n/10 Kimi Team.  Kimi k1.5: Scal-ing re-in-force-ment learn-ing with LLMs.  \OT1/ptm/m/it/10 arXiv preprint
  []
 
-) [6] (./main.aux)
+[8])
+<figures/game24-lifecycle-0.6B-len512.png, id=262, 922.8879pt x 594.0594pt>
+File: figures/game24-lifecycle-0.6B-len512.png Graphic file (type png)
+<use figures/game24-lifecycle-0.6B-len512.png>
+Package pdftex.def Info: figures/game24-lifecycle-0.6B-len512.png  used on input line 628.
+(pdftex.def)             Requested size: 190.79109pt x 122.80727pt.
+<figures/game24-lifecycle-0.6B-len1024.png, id=263, 922.52655pt x 1190.2869pt>
+File: figures/game24-lifecycle-0.6B-len1024.png Graphic file (type png)
+<use figures/game24-lifecycle-0.6B-len1024.png>
+Package pdftex.def Info: figures/game24-lifecycle-0.6B-len1024.png  used on input line 633.
+(pdftex.def)             Requested size: 190.79109pt x 246.15355pt.
+<figures/game24-lifecycle-1.7B-len512.png, id=264, 923.97195pt x 229.0959pt>
+File: figures/game24-lifecycle-1.7B-len512.png Graphic file (type png)
+<use figures/game24-lifecycle-1.7B-len512.png>
+Package pdftex.def Info: figures/game24-lifecycle-1.7B-len512.png  used on input line 640.
+(pdftex.def)             Requested size: 190.79109pt x 47.30405pt.
+<figures/game24-lifecycle-1.7B-len1024.png, id=265, 923.97195pt x 395.3169pt>
+File: figures/game24-lifecycle-1.7B-len1024.png Graphic file (type png)
+<use figures/game24-lifecycle-1.7B-len1024.png>
+Package pdftex.def Info: figures/game24-lifecycle-1.7B-len1024.png  used on input line 645.
+(pdftex.def)             Requested size: 190.79109pt x 81.6256pt.
+<figures/game24-lifecycle-4B-len512.png, id=266, 923.97195pt x 395.3169pt>
+File: figures/game24-lifecycle-4B-len512.png Graphic file (type png)
+<use figures/game24-lifecycle-4B-len512.png>
+Package pdftex.def Info: figures/game24-lifecycle-4B-len512.png  used on input line 652.
+(pdftex.def)             Requested size: 190.79109pt x 81.6256pt.
+<figures/game24-lifecycle-4B-len1024.png, id=267, 923.97195pt x 435.0654pt>
+File: figures/game24-lifecycle-4B-len1024.png Graphic file (type png)
+<use figures/game24-lifecycle-4B-len1024.png>
+Package pdftex.def Info: figures/game24-lifecycle-4B-len1024.png  used on input line 657.
+(pdftex.def)             Requested size: 190.79109pt x 89.83292pt.
+
+
+LaTeX Warning: `!h' float specifier changed to `!ht'.
+
+[9] [10 <./figures/game24-lifecycle-0.6B-len512.png> <./figures/game24-lifecycle-0.6B-len1024.png> <./figures/game24-lifecycle-1.7B-len512.png> <./figures/game24-lifecycle-1.7B-len1024.png> <./figures/game24-lifecycle-4B-len512.png> <./figures/game24-lifecycle-4B-len1024.png>] (./main.aux)
  ***********
 LaTeX2e <2023-11-01> patch level 1
 L3 programming layer <2024-02-20>
  ***********
 Package rerunfilecheck Info: File `main.out' has not changed.
-(rerunfilecheck)             Checksum: 85E66DADB9D42874E9316ADD86291C3F;2499.
+(rerunfilecheck)             Checksum: C1D8153453A9B495490DA21DF7676670;3076.
  ) 
 Here is how much of TeX's memory you used:
- 11014 strings out of 474116
- 159638 string characters out of 5743682
- 1944187 words of memory out of 5000000
- 33180 multiletter control sequences out of 15000+600000
- 578719 words of font info for 74 fonts, out of 8000000 for 9000
+ 12983 strings out of 474116
+ 197994 string characters out of 5743682
+ 1947187 words of memory out of 5000000
+ 35083 multiletter control sequences out of 15000+600000
+ 586878 words of font info for 96 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,11n,79p,382b,447s stack positions out of 10000i,1000n,20000p,200000b,200000s
-</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmri8a.pfb>
-Output written on main.pdf (6 pages, 168778 bytes).
+ 75i,12n,79p,497b,568s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi6.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi9.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr6.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmr9.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy7.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/symbols/msam10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/public/amsfonts/symbols/msbm10.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/local/texlive/2024/texmf-dist/fonts/type1/urw/times/utmri8a.pfb>
+Output written on main.pdf (10 pages, 3164712 bytes).
 PDF statistics:
- 240 PDF objects out of 1000 (max. 8388607)
- 205 compressed objects within 3 object streams
- 54 named destinations out of 1000 (max. 500000)
- 137 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 377 PDF objects out of 1000 (max. 8388607)
+ 301 compressed objects within 4 object streams
+ 77 named destinations out of 1000 (max. 500000)
+ 218 words of extra memory for PDF output out of 10000 (max. 10000000)
 

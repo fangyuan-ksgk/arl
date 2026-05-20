@@ -487,6 +487,7 @@ def run_one(args: argparse.Namespace) -> Dict[str, Any]:
         scored = compute_vt_batched(
             prompts, completions, refs_flat, scorer_model, tokenizer,
             micro_batch_size=args.vt_micro_batch,
+            chunk_size=args.vt_chunk_size,
         )
 
         N_PTS = args.vt_resample_pts
@@ -661,7 +662,15 @@ def parse_args() -> argparse.Namespace:
                    help="Retain the transient trained-policy checkpoint "
                         "(<out_dir>/trained_for_vt) used as the R_T scorer. "
                         "By default it is deleted after R_T scoring completes.")
-    p.add_argument("--vt-micro-batch", type=int, default=8)
+    p.add_argument("--vt-micro-batch", type=int, default=64,
+                   help="Forward batch size for compute_vt_batched. Increase "
+                        "to saturate VRAM; lower if you OOM on long CoTs.")
+    p.add_argument("--vt-chunk-size", type=int, default=1,
+                   help="CoT-position stride for v_t sampling. 1 = every "
+                        "position (original behavior). chunk_size=k computes "
+                        "v_t every k tokens — endpoints (0, T) always included "
+                        "so R_T is exact. Pick k so T/k ≥ vt_resample_pts to "
+                        "avoid losing cumR_resampled resolution.")
     p.add_argument("--vt-resample-pts", type=int, default=100)
     p.add_argument("--rt-pair-seed", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)

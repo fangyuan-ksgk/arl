@@ -51,7 +51,8 @@ PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 SCORE_VT="${SCORE_VT:-1}"
-VT_MICRO_BATCH="${VT_MICRO_BATCH:-8}"
+VT_MICRO_BATCH="${VT_MICRO_BATCH:-128}"
+VT_CHUNK_SIZE="${VT_CHUNK_SIZE:-1}"  # >1 = stride-sampled v_t (faster, coarser)
 RT_PAIR_SEED="${RT_PAIR_SEED:-0}"
 SEED="${SEED:-0}"
 KEEP_CKPT="${KEEP_CKPT:-0}"  # 1 = retain trained_for_vt checkpoint dir
@@ -192,6 +193,7 @@ for LEN in ${LENGTHS}; do
           --vllm-server-host "${VLLM_HOST}"
           --vllm-server-port "${VLLM_PORT}"
           --vt-micro-batch "${VT_MICRO_BATCH}"
+          --vt-chunk-size "${VT_CHUNK_SIZE}"
           --rt-pair-seed "${RT_PAIR_SEED}"
           --seed "${SEED}" )
 

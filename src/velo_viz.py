@@ -37,7 +37,357 @@ __all__ = ["VizCtx", "prepare", "plot_R_t_static", "print_paragraphs",
            "make_pair_animation_from_vt", "plot_lifecycle_river",
            "plot_solution_coverage_dynamics",
            "plot_prefix_sharing_dynamics",
-           "plot_R_t_correctness_dynamics"]
+           "plot_R_t_correctness_dynamics",
+           "plot_truncation_stats",
+           "plot_length_and_diversity",
+           "plot_pass_at_k"]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# pass@k over training
+# ────────────────────────────────────────────────────────────────────────────
+def plot_pass_at_k(eval_df, *, ks: Tuple[int, ...] = (1, 4, 8),
+                   figsize=(7, 4.2), n_boot: int = 300, seed: int = 0,
+                   verbose: bool = True):
+    """pass@k over GRPO training (95% bootstrap CI).
+
+    Each (eval cycle, puzzle) cell has ``num_generations`` rollouts.
+    Per-puzzle unbiased estimator::
+
+        pass@k = 1 - C(n - c, k) / C(n, k),  n = #rollouts, c = #correct
+
+    Cycle-level point = mean across puzzles; CI ribbon = 95% bootstrap
+    over puzzles. No extra forward passes needed.
+
+    Returns ``(fig, ax, info)`` with ``info`` = {"pak_long", "pak_df"}.
+    """
+    from math import comb
+    import pandas as pd
+
+    C_K = {1: "#264653", 4: "#2a9d8f", 8: "#e76f51"}
+
+    def _pass_at_k(c: int, n: int, k: int) -> float:
+        if n - c < k:
+            return 1.0
+        return 1.0 - comb(n - c, k) / comb(n, k)
+
+    rows = []
+    for (gs, key), g in eval_df.groupby(["global_step", "key"]):
+        n = len(g); c = int(g.correct.sum())
+        for k in ks:
+            if k > n:
+                continue
+            rows.append({"global_step": gs, "key": key, "k": k,
+                         "pass": _pass_at_k(c, n, k)})
+    pak_long = pd.DataFrame(rows)
+
+    def _boot_ci_mean(values):
+        v = np.asarray(values, dtype=float)
+        if len(v) < 2:
+            c = float(v.mean()) if len(v) else float("nan")
+            return c, c
+        rng = np.random.default_rng(seed)
+        boots = np.array([rng.choice(v, size=len(v), replace=True).mean()
+                          for _ in range(n_boot)])
+        return float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+
+    pak_summary = []
+    for (step, k), g in pak_long.groupby(["global_step", "k"]):
+        lo, hi = _boot_ci_mean(g["pass"].values)
+        pak_summary.append({"step": step, "k": k,
+                            "val": float(g["pass"].mean()),
+                            "lo": lo, "hi": hi})
+    pak_df = pd.DataFrame(pak_summary).sort_values(["k", "step"])
+
+    with plt.rc_context({
+        "axes.spines.top":   False, "axes.spines.right": False,
+        "axes.grid":         True,  "grid.alpha": 0.25,
+        "grid.linestyle":    ":",
+        "axes.titleweight":  "bold", "axes.titlesize": 11,
+        "axes.labelsize":    10,    "legend.frameon": False,
+    }):
+        fig, ax = plt.subplots(figsize=figsize)
+        for k in ks:
+            sub = pak_df[pak_df.k == k]
+            if sub.empty:
+                continue
+            c = C_K.get(k, None)
+            ax.plot(sub.step, sub.val, color=c, lw=2, marker="o", ms=5,
+                    label=f"pass@{k}")
+            ax.fill_between(sub.step, sub.lo, sub.hi,
+                            color=c, alpha=0.15, linewidth=0)
+        ax.set(xlabel="global_step", ylabel="pass@k", ylim=(0, 1.02),
+               title="Accuracy · pass@k over eval cycles (95% CI)")
+        ax.legend(loc="best")
+        fig.tight_layout()
+
+    if verbose:
+        print(pak_df.pivot(index="step", columns="k", values="val")
+                    .round(3)
+                    .rename_axis(index="global_step"))
+
+    return fig, ax, {"pak_long": pak_long, "pak_df": pak_df}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# D1 · CoT length & diversity
+# ────────────────────────────────────────────────────────────────────────────
+def plot_length_and_diversity(eval_df, *, figsize=(16, 4.2),
+                              n_boot: int = 300, seed: int = 0):
+    """D1 · CoT length & diversity over GRPO training.
+
+    Panels:
+      1. Mean CoT length per step (95% bootstrap CI ribbon).
+      2. Mean CoT length split by correctness (95% bootstrap CI ribbons).
+      3. Mean unique-CoT count per puzzle, split by correctness.
+         Per (step, key) we count unique whitespace-normalized completions
+         in each class; both counts are over the SAME G rollouts so
+         ``n_correct + n_incorrect ≤ G`` (= G when no byte-identical
+         duplicates within a class, which is the case here).
+
+    Returns ``(fig, axes, info)`` with ``info`` containing
+    ``mean_df``, ``corr_dfs``, ``uniq_dfs``, ``len_col``.
+    """
+    import pandas as pd
+
+    C_CORRECT, C_INCORRECT, C_MEAN = "#2a9d8f", "#e76f51", "#264653"
+    len_col = ("n_cot_tokens" if "n_cot_tokens" in eval_df.columns
+               else "n_tokens")
+
+    def _boot_ci(values, fn):
+        v = np.asarray(values, dtype=float)
+        if len(v) < 2:
+            c = float(fn(v)) if len(v) else float("nan")
+            return c, c
+        rng = np.random.default_rng(seed)
+        boots = np.array([fn(rng.choice(v, size=len(v), replace=True))
+                          for _ in range(n_boot)])
+        return float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))
+
+    def _per_step(df, value_col, fn):
+        rows = []
+        for step, g in df.groupby("global_step"):
+            v = g[value_col].values
+            lo, hi = _boot_ci(v, fn)
+            rows.append({"step": step, "val": float(fn(v)),
+                         "lo": lo, "hi": hi})
+        return pd.DataFrame(rows).sort_values("step")
+
+    # length aggregations
+    mean_df  = _per_step(eval_df, len_col, np.mean)
+    corr_dfs = {bool(k): _per_step(g, len_col, np.mean)
+                for k, g in eval_df.groupby("correct")}
+
+    # per-puzzle unique-CoT counts, split by correctness
+    def _norm(s: str) -> str:
+        return " ".join(s.split())
+
+    def _split(g):
+        ok   = g.correct.astype(bool).values
+        cots = g.completion.values
+        return pd.Series({
+            "n_correct":   len({_norm(c) for c, k in zip(cots, ok) if k}),
+            "n_incorrect": len({_norm(c) for c, k in zip(cots, ok) if not k}),
+        })
+
+    udf = (eval_df.groupby(["global_step", "key"])
+                  .apply(_split, include_groups=False).reset_index())
+    uniq_dfs = {
+        True:  _per_step(udf.rename(columns={"n_correct":   "v"}), "v", np.mean),
+        False: _per_step(udf.rename(columns={"n_incorrect": "v"}), "v", np.mean),
+    }
+
+    with plt.rc_context({
+        "axes.spines.top":   False, "axes.spines.right": False,
+        "axes.grid":         True,  "grid.alpha": 0.25,
+        "grid.linestyle":    ":",
+        "axes.titleweight":  "bold", "axes.titlesize": 11,
+        "axes.labelsize":    10,    "legend.frameon": False,
+    }):
+        fig, axes = plt.subplots(1, 3, figsize=figsize, sharex=True)
+
+        ax = axes[0]
+        ax.plot(mean_df.step, mean_df.val, color=C_MEAN, lw=2, label="mean")
+        ax.fill_between(mean_df.step, mean_df.lo, mean_df.hi,
+                        color=C_MEAN, alpha=0.15, linewidth=0)
+        ax.set(xlabel="global_step", ylabel=len_col,
+               title="CoT length (mean, 95% CI)")
+        ax.legend(loc="best")
+
+        ax = axes[1]
+        for is_corr, df in corr_dfs.items():
+            c = C_CORRECT if is_corr else C_INCORRECT
+            ax.plot(df.step, df.val, color=c, lw=2,
+                    label="correct" if is_corr else "incorrect")
+            ax.fill_between(df.step, df.lo, df.hi,
+                            color=c, alpha=0.15, linewidth=0)
+        ax.set(xlabel="global_step", ylabel=f"mean {len_col}",
+               title="length, split by correctness (95% CI)")
+        ax.legend(loc="best")
+
+        ax = axes[2]
+        for is_corr in (True, False):
+            c   = C_CORRECT if is_corr else C_INCORRECT
+            df  = uniq_dfs[is_corr]
+            ax.plot(df.step, df.val, color=c, lw=2, marker="o", ms=5,
+                    label="correct" if is_corr else "incorrect")
+            ax.fill_between(df.step, df.lo, df.hi,
+                            color=c, alpha=0.15, linewidth=0)
+        ax.set(xlabel="global_step",
+               ylabel="unique CoTs per puzzle (mean ± 95% CI)",
+               title="unique CoTs per puzzle\n(correct + incorrect ≤ G)")
+        ax.legend(loc="best")
+
+        fig.suptitle("D1 · CoT length & diversity over GRPO training",
+                     fontsize=13, fontweight="bold", y=1.02)
+        fig.tight_layout()
+
+    return fig, axes, {"mean_df": mean_df, "corr_dfs": corr_dfs,
+                       "uniq_dfs": uniq_dfs, "len_col": len_col}
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Truncation / structural-completeness stats
+# ────────────────────────────────────────────────────────────────────────────
+def plot_truncation_stats(eval_df, *, figsize=(16, 4), verbose: bool = True):
+    """Truncation statistics from an eval_rollout DataFrame.
+
+    A rollout is "structurally complete" when both markers are present:
+    ``</think>`` (reasoning closed) AND ``####`` (parsable answer line).
+    If either is missing, the response was almost certainly cut off by
+    ``max_completion_length``.
+
+    Splits incorrect rollouts into:
+      - ``parsable_wrong``   : both markers, but the expression is wrong
+                               → genuine reasoning error
+      - ``no_answer_marker`` : ``####`` missing → almost always truncated
+      - ``no_think_close``   : ``</think>`` missing but ``####`` present → rare
+
+    Returns (fig, axes, info) where info is a dict with the per-step summary
+    DataFrame and the bucket-tagged frame.
+    """
+    import inspect
+    import pandas as pd
+
+    needed = {"has_answer_marker", "has_think_close"}
+    assert needed.issubset(eval_df.columns), (
+        f"eval_df is missing {needed - set(eval_df.columns)}; "
+        "re-run training with the updated RolloutLogger."
+    )
+
+    # matplotlib >=3.9 renamed `labels=` to `tick_labels=`.
+    _BOXPLOT_LABEL_KW = (
+        "tick_labels"
+        if "tick_labels" in inspect.signature(plt.Axes.boxplot).parameters
+        else "labels"
+    )
+
+    trunc_df = eval_df.copy()
+    trunc_df["parsable"] = trunc_df.has_answer_marker & trunc_df.has_think_close
+
+    def _bucket(row):
+        if row.correct:                  return "correct"
+        if not row.has_answer_marker:    return "no_answer_marker"
+        if not row.has_think_close:      return "no_think_close"
+        return "parsable_wrong"
+    trunc_df["bucket"] = trunc_df.apply(_bucket, axis=1)
+
+    order  = ["correct", "parsable_wrong", "no_think_close", "no_answer_marker"]
+    colors = {"correct": "#2a9d8f", "parsable_wrong": "#e76f51",
+              "no_think_close": "#f4a261", "no_answer_marker": "#264653"}
+
+    comp = (trunc_df.groupby(["global_step", "bucket"]).size()
+                    .unstack(fill_value=0)
+                    .reindex(columns=order, fill_value=0))
+    comp_frac = comp.div(comp.sum(axis=1), axis=0)
+
+    len_col = ("n_cot_tokens" if "n_cot_tokens" in trunc_df.columns
+               else "n_tokens")
+    by_step = trunc_df.groupby("global_step").agg(
+        pct_truncated=("has_answer_marker", lambda s: 1.0 - s.mean()),
+        pct_no_think =("has_think_close",   lambda s: 1.0 - s.mean()),
+        pct_parsable =("parsable",          "mean"),
+        pct_correct  =("correct",           "mean"),
+        mean_len     =(len_col,             "mean"),
+        p90_len      =(len_col, lambda s: float(np.percentile(s, 90))),
+        max_len      =(len_col,             "max"),
+    ).reset_index()
+
+    if verbose:
+        print("Per eval-cycle structural completeness:")
+        print(by_step.assign(
+            pct_truncated=lambda d: (d.pct_truncated * 100).round(1),
+            pct_no_think =lambda d: (d.pct_no_think  * 100).round(1),
+            pct_parsable =lambda d: (d.pct_parsable  * 100).round(1),
+            pct_correct  =lambda d: (d.pct_correct   * 100).round(1),
+        ).to_string(index=False))
+
+        def _pct(mask):
+            return f"{mask.mean()*100:5.1f}%  ({int(mask.sum())}/{len(mask)})"
+
+        print("\nOverall (all eval cycles pooled):")
+        print(f"  '####' present     : {_pct(trunc_df.has_answer_marker)}")
+        print(f"  '</think>' present : {_pct(trunc_df.has_think_close)}")
+        print(f"  parsable (both)    : {_pct(trunc_df.parsable)}")
+        print(f"  correct            : {_pct(trunc_df.correct)}")
+
+        inc = trunc_df[~trunc_df.correct]
+        if len(inc):
+            print(f"\nAmong {len(inc)} incorrect eval rollouts:")
+            print(f"  no_answer_marker (truncated)   : {_pct(~inc.has_answer_marker)}")
+            print(f"  no_think_close                 : {_pct(~inc.has_think_close & inc.has_answer_marker)}")
+            print(f"  parsable_wrong (real error)    : {_pct(inc.parsable)}")
+
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    # (a) trend lines over training
+    axes[0].plot(by_step.global_step, by_step.pct_truncated,
+                 label="no '####' (truncated)",
+                 color=colors["no_answer_marker"], marker="o")
+    axes[0].plot(by_step.global_step, by_step.pct_no_think,
+                 label="no '</think>'",
+                 color=colors["no_think_close"], marker="o", linestyle="--")
+    axes[0].plot(by_step.global_step, by_step.pct_parsable,
+                 label="parsable", color="#2a9d8f", marker="o")
+    axes[0].plot(by_step.global_step, by_step.pct_correct,
+                 label="correct", color="#2a9d8f", marker="s", linestyle=":")
+    axes[0].set(xlabel="global_step", ylabel="fraction of rollouts",
+                title="Structural completeness over training",
+                ylim=(-0.02, 1.02))
+    axes[0].grid(alpha=0.3); axes[0].legend(fontsize=8)
+
+    # (b) stacked composition by failure mode
+    axes[1].stackplot(comp_frac.index,
+                      *[comp_frac[c] for c in order],
+                      labels=order,
+                      colors=[colors[c] for c in order], alpha=0.85)
+    axes[1].set(xlabel="global_step", ylabel="fraction of rollouts",
+                title="Eval-rollout composition by failure mode",
+                ylim=(0, 1))
+    axes[1].legend(loc="lower right", fontsize=8)
+
+    # (c) length by bucket
+    data, labels = [], []
+    for b in order:
+        vals = trunc_df.loc[trunc_df.bucket == b, len_col].values
+        if len(vals):
+            data.append(vals); labels.append(b)
+    parts = axes[2].boxplot(data, patch_artist=True, showfliers=False,
+                            **{_BOXPLOT_LABEL_KW: labels})
+    for patch, lbl in zip(parts["boxes"], labels):
+        patch.set_facecolor(colors[lbl]); patch.set_alpha(0.65)
+    cap = int(trunc_df[len_col].max())
+    axes[2].axhline(cap, color="k", linestyle=":", alpha=0.5,
+                    label=f"observed max = {cap}")
+    axes[2].set(ylabel=len_col,
+                title="Length by failure mode\n"
+                      "(truncated should pile up at the cap)")
+    axes[2].tick_params(axis="x", rotation=15)
+    axes[2].legend(fontsize=8)
+
+    fig.tight_layout()
+    return fig, axes, {"by_step": by_step, "trunc_df": trunc_df,
+                       "comp_frac": comp_frac, "len_col": len_col}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1118,7 +1468,8 @@ def plot_solution_coverage_dynamics(
 
       * ``found(s, p)``    = solution indices emitted (verifier-correct,
                              AST-canonicalized) at step *s*
-      * ``cov_G(s, p)``    = ``|found(s, p)| / G``                       (panel A)
+      * ``total_found(p)`` = ``|⋃_s found(s, p)|`` (over all eval cycles)
+      * ``div(s, p)``      = ``|found(s, p)| / min(total_found(p), G)``  (panel A)
       * ``cum(s, p)``      = ``|⋃_{s' ≤ s} found(s', p)| / |S(p)|``      (panel B)
       * ``novel_frac(s,p)`` = ``|found(s,p) \\ ⋃_{s'<s} found(s',p)| /
                               total_found(p)``                            (panel C)
@@ -1181,6 +1532,16 @@ def plot_solution_coverage_dynamics(
         total_found_by_key[key] |= found
     total_found_count = {k: len(v) for k, v in total_found_by_key.items()}
 
+    # diversity-collapse ratio: # unique-correct-now / min(total-ever-found, G)
+    # The min(., G) cap keeps the ceiling reachable: if a puzzle has more
+    # ever-found solutions than rollouts per cycle, the numerator can't
+    # exceed G no matter how diverse the model is at that cycle.
+    # Puzzles where the model never finds a solution are dropped.
+    cov_df["total_found"] = cov_df["key"].map(total_found_count)
+    div_df = cov_df[cov_df.total_found > 0].copy()
+    div_df["div_denom"] = np.minimum(div_df["total_found"], div_df["n_roll"])
+    div_df["div_ratio"] = div_df["n_found"] / div_df["div_denom"]
+
     # --- per-step cumulative + novelty fraction --------------------------
     cum_records: List[Dict[str, Any]] = []
     novel_records: List[Dict[str, Any]] = []
@@ -1213,6 +1574,7 @@ def plot_solution_coverage_dynamics(
     )
 
     cov_mean   = _per_step_mean_ci(cov_df,   "cov_g",      n_boot=n_boot, seed=seed)
+    div_mean   = _per_step_mean_ci(div_df,   "div_ratio",  n_boot=n_boot, seed=seed)
     cum_mean   = _per_step_mean_ci(cum_df,   "cum",        n_boot=n_boot, seed=seed)
     novel_mean = _per_step_mean_ci(novel_df, "novel_frac", n_boot=n_boot, seed=seed)
 
@@ -1228,8 +1590,8 @@ def plot_solution_coverage_dynamics(
               f"max={max(nsol_by_key.values())}, "
               f"mean={np.mean(list(nsol_by_key.values())):.2f}")
         print(f"Rollouts per (step,puzzle): mode={G_typical}")
-        print("\nPer-cycle:  # unique rollouts / # rollouts")
-        print(cov_mean.round(3).to_string(index=False))
+        print("\nDiversity collapse:  # unique-correct-now / min(# unique-correct-total, G)")
+        print(div_mean.round(3).to_string(index=False))
         print("\nCumulative:  # found solutions / # solutions   (over s' ≤ s)")
         print(cum_mean.round(3).to_string(index=False))
         print("\nNovel-fraction:  # novel solutions / # ever-found  (per cycle)")
@@ -1250,14 +1612,14 @@ def plot_solution_coverage_dynamics(
         fig, axes = plt.subplots(1, 3, figsize=figsize)
 
         ax = axes[0]
-        ax.plot(cov_mean.step, cov_mean.val, color=C_INST, lw=2, marker="o", ms=5)
-        ax.fill_between(cov_mean.step, cov_mean.lo, cov_mean.hi,
+        ax.plot(div_mean.step, div_mean.val, color=C_INST, lw=2, marker="o", ms=5)
+        ax.fill_between(div_mean.step, div_mean.lo, div_mean.hi,
                         color=C_INST, alpha=0.15, linewidth=0,
                         label="95% bootstrap CI over puzzles")
         ax.axhline(1.0, color="k", linestyle=":", alpha=0.4, label="ceiling = 1")
         ax.set(xlabel="global_step",
-               ylabel="# unique rollouts / # rollouts",
-               title="(a) Per-cycle answer diversity",
+               ylabel="# unique-correct-now / min(# unique-correct-total, G)",
+               title="(a) Per-cycle correct-answer diversity\n(collapse if ratio drops)",
                ylim=(-0.02, 1.02))
         ax.legend(loc="best")
 
@@ -1288,8 +1650,10 @@ def plot_solution_coverage_dynamics(
         fig.tight_layout()
 
     info: Dict[str, Any] = {
-        "cov_df": cov_df, "cum_df": cum_df, "novel_df": novel_df,
-        "cov_mean": cov_mean, "cum_mean": cum_mean, "novel_mean": novel_mean,
+        "cov_df": cov_df, "div_df": div_df,
+        "cum_df": cum_df, "novel_df": novel_df,
+        "cov_mean": cov_mean, "div_mean": div_mean,
+        "cum_mean": cum_mean, "novel_mean": novel_mean,
         "nsol_by_key": nsol_by_key,
         "total_found_by_key": total_found_by_key,
         "total_found_count": total_found_count,

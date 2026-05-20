@@ -1,4 +1,4 @@
-\begin{thebibliography}{9}
+\begin{thebibliography}{13}
 \providecommand{\natexlab}[1]{#1}
 \providecommand{\url}[1]{\texttt{#1}}
 \expandafter\ifx\csname urlstyle\endcsname\relax
@@ -20,10 +20,25 @@ Ganqu Cui, Lifan Yuan, Zefan Wang, Hanbin Wang, Wendi Li, Bingxiang He, Yuchen F
 \newblock Kimi k1.5: Scaling reinforcement learning with {LLMs}.
 \newblock \emph{arXiv preprint arXiv:2501.12599}, 2025.
 
+\bibitem[Li et~al.(2025)Li, Zhong, Zheng, Wen, Xu, Cheng, Zhang, and Xu]{li2025stepentropy}
+Zeju Li, Jianyuan Zhong, Ziyang Zheng, Xiangyu Wen, Zhijian Xu, Yingying Cheng, Fan Zhang, and Qiang Xu.
+\newblock Making slow thinking faster: Compressing {LLM} chain-of-thought via step entropy.
+\newblock \emph{arXiv preprint arXiv:2508.03346}, 2025.
+
 \bibitem[Lightman et~al.(2024)Lightman, Kosaraju, Burda, Edwards, Baker, Lee, Leike, Schulman, Sutskever, and Cobbe]{lightman2023letsverify}
 Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee, Jan Leike, John Schulman, Ilya Sutskever, and Karl Cobbe.
 \newblock Let's verify step by step.
 \newblock In \emph{International Conference on Learning Representations (ICLR)}, 2024.
+
+\bibitem[Liu et~al.(2025)Liu, Chen, Li, Qi, Pang, Du, Lee, and Lin]{liu2025drgrpo}
+Zichen Liu, Changyu Chen, Wenjun Li, Penghui Qi, Tianyu Pang, Chao Du, Wee~Sun Lee, and Min Lin.
+\newblock Understanding {R1-Zero}-like training: A critical perspective.
+\newblock \emph{arXiv preprint arXiv:2503.20783}, 2025.
+
+\bibitem[Setlur et~al.(2024)Setlur, Nagpal, Fisch, Geng, Eisenstein, Agarwal, Agarwal, Berant, and Kumar]{setlur2024rewardingprogress}
+Amrith Setlur, Chirag Nagpal, Adam Fisch, Xinyang Geng, Jacob Eisenstein, Rishabh Agarwal, Alekh Agarwal, Jonathan Berant, and Aviral Kumar.
+\newblock Rewarding progress: Scaling automated process verifiers for {LLM} reasoning.
+\newblock \emph{arXiv preprint arXiv:2410.08146}, 2024.
 
 \bibitem[Shao et~al.(2024)Shao, Wang, Zhu, Xu, Song, Bi, Zhang, Zhang, Li, Wu, and Guo]{shao2024deepseekmath}
 Zhihong Shao, Peiyi Wang, Qihao Zhu, Runxin Xu, Junxiao Song, Xiao Bi, Haowei Zhang, Mingchuan Zhang, Y.~K. Li, Y.~Wu, and Daya Guo.
@@ -40,6 +55,11 @@ Avi Singh, John~D. Co-Reyes, Rishabh Agarwal, Ankesh Anand, Piyush Patil, Xavier
 Peiyi Wang, Lei Li, Zhihong Shao, R.~X. Xu, Damai Dai, Yifei Li, Deli Chen, Y.~Wu, and Zhifang Sui.
 \newblock {Math-Shepherd}: Verify and reinforce {LLMs} step-by-step without human annotations.
 \newblock In \emph{Annual Meeting of the Association for Computational Linguistics (ACL)}, 2024.
+
+\bibitem[Yu et~al.(2025)Yu, Zhang, Zhu, Yuan, Zuo, Yue, Fan, Liu, Liu, Liu, et~al.]{yu2025dapo}
+Qiying Yu, Zheng Zhang, Ruofei Zhu, Yufeng Yuan, Xiaochen Zuo, Yu~Yue, Tiantian Fan, Gaohong Liu, Lingjun Liu, Xin Liu, et~al.
+\newblock {DAPO}: An open-source {LLM} reinforcement learning system at scale.
+\newblock \emph{arXiv preprint arXiv:2503.14476}, 2025.
 
 \bibitem[Yuan et~al.(2023)Yuan, Yuan, Li, Dong, Lu, Tan, Zhou, and Zhou]{yuan2023rft}
 Zheng Yuan, Hongyi Yuan, Chengpeng Li, Guanting Dong, Keming Lu, Chuanqi Tan, Chang Zhou, and Jingren Zhou.
