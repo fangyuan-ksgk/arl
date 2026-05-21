@@ -1,4 +1,4 @@
 *.pyc
-*.html
 logs/*
 *.DS_Store
+output/figures/*
