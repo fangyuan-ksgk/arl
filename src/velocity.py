@@ -40,7 +40,8 @@ Public API
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -59,7 +60,8 @@ def compute_vt_batched(
     model,
     tokenizer,
     *,
-    micro_batch_size: int = 32,
+    micro_batch_size: int = 64,
+    chunk_size: int = 1,
     strip_answer_marker: bool = True,
 ) -> List[Dict[str, Any]]:
     """Vectorized decoding-velocity computation (shared-prefix KV cache).
@@ -91,6 +93,17 @@ def compute_vt_batched(
     micro_batch_size
         How many ``t`` slices to forward at once **within a rollout**.
         Tune to saturate GPU memory; lower if you hit OOM on long CoTs.
+    chunk_size
+        Stride at which ``t`` is sampled along the CoT (1 = every position,
+        the original O(T) behavior). With ``chunk_size=k`` we evaluate
+        ``v_t`` only at t ∈ {0, k, 2k, ..., T}, reducing the number of
+        cache-sliced forwards by ~k. ``R_T`` (endpoint difference) is
+        unchanged because t=0 and t=T are always included. The returned
+        ``vt`` array has length ceil(T/k); each entry covers a window of
+        ``k`` CoT tokens. For downstream resampling to a fixed grid, the
+        coarser per-chunk velocities suffice. Choose k so that
+        ``T/chunk_size`` ≥ ``vt_resample_pts`` to avoid loss of resolution
+        in ``cumR_resampled``.
 
     Returns
     -------
@@ -118,91 +131,141 @@ def compute_vt_batched(
         a_ids = tokenizer(a_text, add_special_tokens=False).input_ids
         per.append((q_ids, o_ids, a_ids))
 
-    out: List[Dict[str, Any]] = []
-    for q_ids, o_ids, a_ids in per:
-        Q, T, La = len(q_ids), len(o_ids), len(a_ids)
+    # Group rollouts by shared (q_ids, o_ids) so the (Q+T)-prefix forward
+    # is computed once per unique rollout, not once per (rollout, ref) pair.
+    # Callers like run_game24_deepspeed.py score one rollout against N refs
+    # by repeating (prompt, completion) N times — without grouping we'd
+    # redo the prefix N times. Grouping shaves ~(N-1)/N off the prefix work.
+    groups: Dict[Tuple[tuple, tuple], List[Tuple[int, List[int]]]] = defaultdict(list)
+    for idx, (q_ids, o_ids, a_ids) in enumerate(per):
+        groups[(tuple(q_ids), tuple(o_ids))].append((idx, a_ids))
+
+    out: List[Dict[str, Any]] = [None] * len(per)  # type: ignore
+
+    for (q_tup, o_tup), members in groups.items():
+        q_ids = list(q_tup); o_ids = list(o_tup)
+        Q, T = len(q_ids), len(o_ids)
         toks = tokenizer.convert_ids_to_tokens(o_ids)
-        if T == 0 or La == 0:
-            out.append({"toks": toks, "vt": np.array([]), "logps": np.array([]),
-                        "R_T": float("nan"), "R_per_token": float("nan")})
+
+        if T == 0:
+            for idx, a_ids in members:
+                out[idx] = {"toks": toks, "vt": np.array([]),
+                            "logps": np.array([]),
+                            "R_T": float("nan"),
+                            "R_per_token": float("nan")}
             continue
+
+        # Sample t at strides of `chunk_size`; always include endpoints 0 and T
+        # so R_T = logps[-1] - logps[0] is exact regardless of chunk_size.
+        if chunk_size <= 1:
+            t_grid_list = list(range(T + 1))
+        else:
+            t_grid_list = list(range(0, T + 1, chunk_size))
+            if t_grid_list[-1] != T:
+                t_grid_list.append(T)
+        G = len(t_grid_list)
+        t_grid = torch.tensor(t_grid_list, device=device, dtype=torch.long)
 
         # --- (1) one forward over q+o; capture logits + full cache ---------
         qo_ids = torch.tensor([q_ids + o_ids], device=device)
         res = model(qo_ids, use_cache=True)
         logp_qo = F.log_softmax(res.logits.float(), dim=-1)[0]   # (Q+T, V)
         past = res.past_key_values
-        if hasattr(past, "to_legacy_cache"):                      # DynamicCache → tuple
+        if hasattr(past, "to_legacy_cache"):                     # DynamicCache → tuple
             past = past.to_legacy_cache()
+        del res
 
-        # log p(a_0 | q + o[:t]) for t = 0..T comes from logits at Q+t-1
-        # (the position whose next-token prediction is a_0).
-        positions = Q - 1 + torch.arange(T + 1, device=device)
-        logp_a0 = logp_qo[positions, a_ids[0]]                    # (T+1,)
+        for idx, a_ids in members:
+            La = len(a_ids)
+            if La == 0:
+                out[idx] = {"toks": toks, "vt": np.array([]),
+                            "logps": np.array([]),
+                            "R_T": float("nan"),
+                            "R_per_token": float("nan")}
+                continue
 
-        if La == 1:
-            logps_t = logp_a0
-        else:
-            # --- (2) for each t, forward a[:-1] with cache sliced to Q+t ---
-            a_input  = torch.tensor(a_ids[:-1], device=device)    # (La-1,)
-            a_target = torch.tensor(a_ids[1:],  device=device)    # (La-1,)
-            logp_rest = torch.zeros(T + 1, La - 1,
-                                    device=device, dtype=torch.float32)
+            # log p(a_0 | q + o[:t]) for t in t_grid (positions Q+t-1).
+            positions = (Q - 1) + t_grid                          # (G,)
+            logp_a0 = logp_qo[positions, a_ids[0]]                # (G,)
 
-            for s in range(0, T + 1, micro_batch_size):
-                ts = list(range(s, min(s + micro_batch_size, T + 1)))
-                B  = len(ts)
-                t_max = ts[-1]
-                Cmax  = Q + t_max                                 # padded cache len
+            if La == 1:
+                logps_t = logp_a0
+            else:
+                # --- (2) for each t in grid, forward a[:-1] with cache sliced to Q+t
+                a_input  = torch.tensor(a_ids[:-1], device=device)
+                a_target = torch.tensor(a_ids[1:],  device=device)
+                logp_rest = torch.zeros(G, La - 1,
+                                        device=device, dtype=torch.float32)
 
-                # Build a (B, H, Cmax, D) padded cache by COPYING the relevant
-                # slice. Padding positions are zeros; attention_mask gates them.
-                padded = []
-                for k, v in past:
-                    _, H, _, D = k.shape
-                    K = torch.zeros((B, H, Cmax, D), dtype=k.dtype, device=device)
-                    V = torch.zeros((B, H, Cmax, D), dtype=v.dtype, device=device)
-                    for b, t in enumerate(ts):
-                        L = Q + t
-                        K[b, :, :L, :] = k[0, :, :L, :]
-                        V[b, :, :L, :] = v[0, :, :L, :]
-                    padded.append((K, V))
-                # HF ≥4.36 wants a Cache object, not a legacy tuple.
-                padded_cache = DynamicCache.from_legacy_cache(tuple(padded))
+                for s in range(0, G, micro_batch_size):
+                    e = min(s + micro_batch_size, G)
+                    ts_tensor = t_grid[s:e]                       # (B,)
+                    B = ts_tensor.numel()
+                    t_max = int(ts_tensor[-1].item())
+                    Cmax  = Q + t_max
 
-                input_ids = a_input.unsqueeze(0).expand(B, -1).contiguous()
-                # Attention mask over (past + new) positions.
-                total = Cmax + (La - 1)
-                attn  = torch.zeros((B, total), dtype=torch.long, device=device)
-                for b, t in enumerate(ts):
-                    attn[b, :Q + t] = 1
-                attn[:, Cmax:] = 1
-                # Position ids for the new tokens: [Q+t, ..., Q+t+La-2]
-                pos_ids = torch.zeros((B, La - 1), dtype=torch.long, device=device)
-                for b, t in enumerate(ts):
-                    pos_ids[b] = torch.arange(Q + t, Q + t + La - 1, device=device)
+                    # Per-batch valid cache length L_b = Q + t_b; mask of shape
+                    # (B, Cmax) marks positions < L_b. We use it to (a) zero
+                    # padding in K/V and (b) build the attention mask in one shot.
+                    L_per_b = Q + ts_tensor                       # (B,)
+                    pos_idx = torch.arange(Cmax, device=device)   # (Cmax,)
+                    valid_mask = pos_idx.unsqueeze(0) < L_per_b.unsqueeze(1)  # (B, Cmax)
 
-                res2 = model(
-                    input_ids=input_ids,
-                    attention_mask=attn,
-                    position_ids=pos_ids,
-                    past_key_values=padded_cache,
-                    use_cache=False,
-                )
-                lp = F.log_softmax(res2.logits.float(), dim=-1)   # (B, La-1, V)
-                gathered = lp.gather(
-                    2, a_target.view(1, -1, 1).expand(B, -1, 1)
-                ).squeeze(-1)                                     # (B, La-1)
-                for b, t in enumerate(ts):
-                    logp_rest[t] = gathered[b]
+                    # Vectorized padded-cache build: one masked broadcast per
+                    # layer per K/V, replacing the previous nested Python loop
+                    # over (layers × batch). Each layer's k/v slice is broadcast
+                    # to (B, H, Cmax, D) and gated by mask4d in a single fused
+                    # multiply that materializes the result tensor — same memory
+                    # traffic, ~B× fewer kernel launches.
+                    padded: List[Tuple[torch.Tensor, torch.Tensor]] = []
+                    for k, v in past:
+                        k_slice = k[0, :, :Cmax, :]               # (H, Cmax, D) view
+                        v_slice = v[0, :, :Cmax, :]
+                        mask4d_k = valid_mask.unsqueeze(1).unsqueeze(-1).to(k.dtype)
+                        mask4d_v = mask4d_k if v.dtype == k.dtype else \
+                                   valid_mask.unsqueeze(1).unsqueeze(-1).to(v.dtype)
+                        K = k_slice.unsqueeze(0) * mask4d_k        # (B, H, Cmax, D)
+                        V = v_slice.unsqueeze(0) * mask4d_v
+                        padded.append((K, V))
+                    padded_cache = DynamicCache.from_legacy_cache(tuple(padded))
 
-            logps_t = logp_a0 + logp_rest.sum(dim=1)              # (T+1,)
+                    input_ids = a_input.unsqueeze(0).expand(B, -1).contiguous()
+                    total = Cmax + (La - 1)
+                    attn = torch.zeros((B, total), dtype=torch.long, device=device)
+                    attn[:, :Cmax] = valid_mask.long()
+                    attn[:, Cmax:] = 1
+                    # Position ids: row b is [Q+t_b, ..., Q+t_b+La-2]
+                    base = (Q + ts_tensor).unsqueeze(1)            # (B, 1)
+                    offsets = torch.arange(La - 1, device=device).unsqueeze(0)
+                    pos_ids = base + offsets                       # (B, La-1)
 
-        logps = logps_t.cpu().numpy().astype(np.float64)
-        vt    = logps[1:] - logps[:-1]
-        R_T   = float(logps[-1] - logps[0])
-        out.append({"toks": toks, "vt": vt, "logps": logps,
-                    "R_T": R_T, "R_per_token": R_T / max(1, len(vt))})
+                    res2 = model(
+                        input_ids=input_ids,
+                        attention_mask=attn,
+                        position_ids=pos_ids,
+                        past_key_values=padded_cache,
+                        use_cache=False,
+                    )
+                    lp = F.log_softmax(res2.logits.float(), dim=-1)
+                    gathered = lp.gather(
+                        2, a_target.view(1, -1, 1).expand(B, -1, 1)
+                    ).squeeze(-1)                                   # (B, La-1)
+                    logp_rest[s:e] = gathered
+
+                logps_t = logp_a0 + logp_rest.sum(dim=1)            # (G,)
+
+            logps = logps_t.cpu().numpy().astype(np.float64)
+            vt    = logps[1:] - logps[:-1]                          # (G-1,) per-chunk velocity
+            R_T   = float(logps[-1] - logps[0])
+            # R_per_token is normalized by full CoT length T (not G-1), so the
+            # scalar is comparable across chunk_size settings.
+            R_per_token = R_T / T if T > 0 else float("nan")
+            out[idx] = {"toks": toks, "vt": vt, "logps": logps,
+                        "R_T": R_T, "R_per_token": R_per_token}
+
+        # Release prefix cache before the next group; it can be sizeable
+        # (Q+T tokens × n_layers × n_heads × head_dim × 2 bytes × 2 K/V).
+        del past, logp_qo
     return out
 
 
