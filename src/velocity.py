@@ -49,7 +49,12 @@ import torch.nn.functional as F
 from transformers import DynamicCache
 
 
-__all__ = ["compute_vt_batched", "compute_vt_prefix_cache", "compute_cot_perplexity"]
+__all__ = [
+    "compute_vt_batched",
+    "compute_vt_prefix_cache",
+    "compute_cot_perplexity",
+    "compute_vt_vllm_remote",
+]
 
 
 @torch.no_grad()
@@ -347,4 +352,187 @@ def compute_cot_perplexity(
                 "ppl": float(np.exp(-lp.mean())),
                 "delta_logp": lp[1:] - lp[:-1],
             }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Remote (vLLM-served) variant
+# ---------------------------------------------------------------------------
+
+def compute_vt_vllm_remote(
+    prompts: List[str],
+    completions: List[str],
+    references: List[str],
+    tokenizer,
+    *,
+    server_url: str = "http://localhost:8000",
+    chunk_size: int = 1,
+    strip_answer_marker: bool = True,
+    max_sequences_per_request: int = 256,
+    timeout: float = 600.0,
+) -> List[Dict[str, Any]]:
+    """Decoding-velocity reward against a remote ``trl vllm-serve`` instance.
+
+    Functionally equivalent to :func:`compute_vt_batched` but offloads every
+    forward to a running vLLM server via the ``/get_sequence_logprobs/``
+    endpoint (TRL >= 1.4). No GPU memory is consumed in this process; the
+    server's prefix cache automatically deduplicates the heavy
+    ``q + o[:t]`` shared prefixes across all (rollout, t) requests.
+
+    Parameters
+    ----------
+    prompts, completions, references
+        Same semantics as :func:`compute_vt_batched`.
+    tokenizer
+        Same tokenizer used by the served model. Needed locally to construct
+        ``prompt_token_ids`` and to compute ``prompt_length`` for each
+        ``(q + o[:t]) + a`` sequence.
+    server_url
+        Base URL of the ``trl vllm-serve`` process (no trailing slash needed).
+    chunk_size
+        Stride for the ``t`` grid; identical to :func:`compute_vt_batched`.
+    strip_answer_marker
+        If True, truncate ``cot`` at the first ``####`` (matches the local
+        implementation).
+    max_sequences_per_request
+        Cap on how many sequences are POSTed in a single HTTP call. The
+        server batches concurrent requests internally, so this is purely a
+        client-side payload-size guard. Adjust upward if your CoTs are short.
+    timeout
+        Request timeout in seconds.
+
+    Returns
+    -------
+    list of dicts with the same keys as :func:`compute_vt_batched`:
+    ``toks``, ``vt``, ``logps``, ``R_T``, ``R_per_token``.
+    """
+    import base64
+    import requests
+
+    server_url = server_url.rstrip("/")
+
+    # --- tokenize once per rollout (mirrors compute_vt_batched) ----------
+    per: List[Tuple[List[int], List[int], List[int]]] = []
+    for q, cot, a in zip(prompts, completions, references):
+        if strip_answer_marker:
+            i = cot.find("####")
+            cot = cot[:i].rstrip() if i >= 0 else cot
+        a_text = a if a.lstrip().startswith("####") else f"#### {a}"
+        q_ids = tokenizer(q,      add_special_tokens=False).input_ids
+        o_ids = tokenizer(cot,    add_special_tokens=False).input_ids
+        a_ids = tokenizer(a_text, add_special_tokens=False).input_ids
+        per.append((q_ids, o_ids, a_ids))
+
+    # Group by (q_ids, o_ids) so a rollout scored against multiple refs only
+    # builds the (q+o[:t]) prefixes once. With prefix caching on the server
+    # this matters less than for the local KV-cache path, but it still
+    # reduces tokenization + HTTP payload size.
+    groups: Dict[Tuple[tuple, tuple], List[Tuple[int, List[int]]]] = defaultdict(list)
+    for idx, (q_ids, o_ids, a_ids) in enumerate(per):
+        groups[(tuple(q_ids), tuple(o_ids))].append((idx, a_ids))
+
+    out: List[Dict[str, Any]] = [None] * len(per)  # type: ignore
+
+    # Build the full request manifest: one entry per (rollout, t-grid point).
+    # We accumulate across groups, then flush in chunks of
+    # `max_sequences_per_request` so a single huge POST doesn't stall.
+    manifest: List[Dict[str, Any]] = []  # one entry = one sequence to score
+    grid_lookup: Dict[Tuple[tuple, tuple], List[int]] = {}
+
+    for (q_tup, o_tup), members in groups.items():
+        q_ids = list(q_tup); o_ids = list(o_tup)
+        Q, T = len(q_ids), len(o_ids)
+        toks = tokenizer.convert_ids_to_tokens(o_ids)
+
+        if T == 0:
+            for idx, a_ids in members:
+                out[idx] = {"toks": toks, "vt": np.array([]),
+                            "logps": np.array([]),
+                            "R_T": float("nan"),
+                            "R_per_token": float("nan")}
+            continue
+
+        if chunk_size <= 1:
+            t_grid = list(range(T + 1))
+        else:
+            t_grid = list(range(0, T + 1, chunk_size))
+            if t_grid[-1] != T:
+                t_grid.append(T)
+        grid_lookup[(q_tup, o_tup)] = t_grid
+
+        for idx, a_ids in members:
+            La = len(a_ids)
+            if La == 0:
+                out[idx] = {"toks": toks, "vt": np.array([]),
+                            "logps": np.array([]),
+                            "R_T": float("nan"),
+                            "R_per_token": float("nan")}
+                continue
+            for g, t in enumerate(t_grid):
+                seq = q_ids + o_ids[:t] + a_ids
+                manifest.append({
+                    "rollout_idx": idx,
+                    "grid_idx":    g,
+                    "n_grid":      len(t_grid),
+                    "toks":        toks,
+                    "T":           T,
+                    "sequence":    seq,
+                    "prompt_length": Q + t,   # everything before `a`
+                })
+
+    if not manifest:
+        return out
+
+    # Per-rollout accumulator: list of (grid_idx, logp(a|prefix))
+    rollout_logps: Dict[int, Dict[int, float]] = defaultdict(dict)
+    rollout_meta:  Dict[int, Dict[str, Any]] = {}
+    for entry in manifest:
+        rollout_meta[entry["rollout_idx"]] = {
+            "toks": entry["toks"], "T": entry["T"], "n_grid": entry["n_grid"],
+        }
+
+    # --- POST in chunks --------------------------------------------------
+    for s in range(0, len(manifest), max_sequences_per_request):
+        chunk = manifest[s:s + max_sequences_per_request]
+        payload = {
+            "sequences":      [e["sequence"]      for e in chunk],
+            "prompt_lengths": [e["prompt_length"] for e in chunk],
+            "top_logprobs":   1,           # we only need the actual-token track
+            "temperature":    1.0,
+            "response_format": "binary",
+        }
+        r = requests.post(f"{server_url}/get_sequence_logprobs/",
+                          json=payload, timeout=timeout)
+        r.raise_for_status()
+        body = r.json()
+
+        shape = body["shape"]                      # [B, max_comp_len, top_k]
+        B, max_comp_len, _ = shape
+        comp_lengths = body["completion_lengths"]
+        actual_lp = np.frombuffer(
+            base64.b64decode(body["actual_logprobs_b64"]), dtype=np.float32,
+        ).reshape(B, max_comp_len, 1)
+
+        for i, e in enumerate(chunk):
+            cl = comp_lengths[i]
+            # log p(a | q + o[:t]) = sum of per-token actual logprobs over
+            # the |a| completion positions. Padded slots beyond cl are -inf;
+            # slice to cl.
+            logp = float(actual_lp[i, :cl, 0].sum()) if cl > 0 else float("nan")
+            rollout_logps[e["rollout_idx"]][e["grid_idx"]] = logp
+
+    # --- assemble per-rollout outputs ------------------------------------
+    for idx, grid_dict in rollout_logps.items():
+        meta = rollout_meta[idx]
+        n_grid = meta["n_grid"]; T = meta["T"]
+        logps = np.array([grid_dict[g] for g in range(n_grid)], dtype=np.float64)
+        vt = logps[1:] - logps[:-1]
+        R_T = float(logps[-1] - logps[0])
+        out[idx] = {
+            "toks":        meta["toks"],
+            "vt":          vt,
+            "logps":       logps,
+            "R_T":         R_T,
+            "R_per_token": R_T / T if T > 0 else float("nan"),
+        }
     return out
