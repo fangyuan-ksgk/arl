@@ -46,7 +46,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.game24utils import enumerate_solutions, to_chat
-from src.velocity import compute_vt_batched
+from src.velocity import evaluate_pv_reward
 
 
 def _canon(expr: str) -> str:
@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
                    help="Tokenizer to use (defaults to --scorer-model). Override "
                         "if your scorer checkpoint doesn't ship its tokenizer.")
     p.add_argument("--micro-batch", type=int, default=8,
-                   help="Forward-pass micro-batch for compute_vt_batched.")
+                   help="(unused; kept for CLI compat with older callers)")
     p.add_argument("--resample-pts", type=int, default=100,
                    help="Grid size for cumR_resampled.")
     p.add_argument("--device", default=None,
@@ -180,9 +180,8 @@ def main() -> None:
 
     # --- Score -------------------------------------------------------------
     t0 = time.time()
-    scored = compute_vt_batched(
+    scored = evaluate_pv_reward(
         prompts, completions, refs_flat, scorer, tokenizer,
-        micro_batch_size=args.micro_batch,
     )
     print(f"[rescore] forward pass done in {time.time()-t0:.0f}s "
           f"({len(scored)} ref-scores)")
