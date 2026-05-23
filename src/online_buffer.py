@@ -32,15 +32,15 @@ from typing import Dict, Hashable, Iterable, List, Optional, Tuple
 import numpy as np
 
 
-__all__ = ["OnlineAnswerBuffer"]
+__all__ = ["OnlineBuffer"]
 
 
-class OnlineAnswerBuffer:
+class OnlineBuffer:
     """Per-query bag of accepted answer strings with appearance counts.
 
     Examples
     --------
-    >>> buf = OnlineAnswerBuffer(capacity_per_query=4)
+    >>> buf = OnlineBuffer(capacity_per_query=4)
     >>> buf.add("q1", "(8-4)*6")
     >>> buf.add("q1", "6*(8-4)")
     >>> buf.add("q1", "(8-4)*6")    # count -> 2
