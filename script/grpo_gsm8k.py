@@ -156,8 +156,12 @@ def main():
                         help="MBE reward denominator (default 40.0 → max ~0.05)")
     parser.add_argument("--mbe_clip", type=float, default=2.0,
                         help="MBE value clipped before scaling")
-    # MBE velocity reward (length-normalised endpoint diff of growing-prefix MBE trace)
-    parser.add_argument("--mbe_velocity_reward", action="store_true",
+    # MBE velocity reward (trajectory-level).
+    # raw_velocity = MBE(hidden_states[:prompt_len+T_comp]) − MBE(hidden_states[:prompt_len])
+    #              = MBE(query + response)             − MBE(query)
+    # Pass --no-mbe_velocity_reward to disable.
+    parser.add_argument("--mbe_velocity_reward",
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="Add length-normalised MBE velocity reward: clip((trace[-1]-trace[0])/log(min(T,D)), ±clip)/scale")
     parser.add_argument("--mbe_velocity_scale", type=float, default=4.0,
                         help="MBE velocity reward denominator (default 4.0 → max |reward| ≈ 0.25)")
@@ -166,6 +170,15 @@ def main():
     parser.add_argument("--mbe_velocity_stride", type=int, default=8,
                         help="Sampling stride for the running-prefix MBE trace "
                              "(every `stride` tokens we record MBE of all tokens so far)")
+    parser.add_argument("--mbe_velocity_layers", type=str, default="-1",
+                        help="Comma-separated hidden-layer indices for MBE velocity "
+                             "(default '-1' = last layer only; e.g. '-1,-2' averages "
+                             "the top two layers, '0,-1' averages embedding + final).")
+    parser.add_argument("--mbe_velocity_mode", type=str, default="trajectory",
+                        choices=["trajectory", "rollercoaster"],
+                        help="trajectory: raw_v = MBE(query+response) - MBE(query). "
+                             "rollercoaster: raw_v = sum of positive per-stride MBE jumps "
+                             "(rewards continual diversity growth, ignores drawdowns).")
     # Prefix-conditioned rollout exploration (PCRE)
     parser.add_argument("--prefix_rollout", action="store_true",
                         help="Enable prefix-conditioned rollout exploration")
@@ -337,15 +350,19 @@ def main():
     if args.mbe_velocity_reward:
         from src.mbe_reward import MBEVeloReward
         tokenizer = AutoTokenizer.from_pretrained(args.model)
+        velo_layers = [int(x) for x in args.mbe_velocity_layers.split(",") if x.strip()]
         mbe_velo_reward_obj = MBEVeloReward(
             tokenizer,
+            layers=velo_layers,
             stride=args.mbe_velocity_stride,
             scale=args.mbe_velocity_scale,
             clip=args.mbe_velocity_clip,
+            mode=args.mbe_velocity_mode,
         )
         reward_funcs.append(mbe_velo_reward_obj)
-        print(f"MBE velocity reward enabled: scale={args.mbe_velocity_scale}, "
-              f"clip=±{args.mbe_velocity_clip}, stride={args.mbe_velocity_stride}")
+        print(f"MBE velocity reward enabled: mode={args.mbe_velocity_mode}, "
+              f"scale={args.mbe_velocity_scale}, clip=±{args.mbe_velocity_clip}, "
+              f"stride={args.mbe_velocity_stride}, layers={velo_layers}")
 
     eval_dataset = None
     if args.eval_steps > 0:
