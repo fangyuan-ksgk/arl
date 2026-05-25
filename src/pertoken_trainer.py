@@ -121,6 +121,12 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         # the velocity route. Set externally before training:
         #     trainer.velocity_log_path = output_dir / "velocity_log.jsonl"
         self.velocity_log_path: Optional[Path] = None
+        # Optional frozen scorer for log p(a | q + o[:t]). Default (None)
+        # uses the live policy — same as before. Setting this to a frozen
+        # copy of the base model decouples the velocity reward from the
+        # parameters being updated. Set externally before training:
+        #     trainer.velocity_ref_model = ref_model.eval().to(device)
+        self.velocity_ref_model = None
 
     # ------------------------------------------------------------------ reward
 
@@ -157,10 +163,19 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                 for b in range(completion_ids.size(0))
             ]
 
-            # Score with the live policy (unwrapped for raw forward).
-            scoring_model = self.accelerator.unwrap_model(self.model)
-            was_training = scoring_model.training
-            scoring_model.eval()
+            # Pick the scorer for log p(a | q + o[:t]):
+            #   • velocity_ref_model is None  → live policy (default).
+            #   • velocity_ref_model set       → frozen ref model. Reward then
+            #     measures progress under a fixed scorer, not the policy
+            #     under update — useful for isolating reward shape from
+            #     policy drift.
+            if self.velocity_ref_model is not None:
+                scoring_model = self.velocity_ref_model
+                was_training  = False  # frozen — never flip back
+            else:
+                scoring_model = self.accelerator.unwrap_model(self.model)
+                was_training  = scoring_model.training
+                scoring_model.eval()
             sink: list | None = [] if self.velocity_log_path is not None else None
             try:
                 r_t, cot_mask = self.velocity_computer.compute_per_token_reward(

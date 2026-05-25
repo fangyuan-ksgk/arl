@@ -137,6 +137,8 @@ def build_run_name(a) -> str:
     if a.variant == "pt-velocity-prefix":
         parts.append(f"pinj-{a.p_inject}")
         parts.append(f"L-{a.prefix_max_layer}")
+    if a.variant.startswith("pt-velocity") and a.velocity_scorer != "policy":
+        parts.append(f"score-{a.velocity_scorer}")
     parts.append(f"seed-{a.seed}")
     return "_".join(parts)
 
@@ -219,6 +221,10 @@ def parse_args():
     ap.add_argument("--log_velocity", action="store_true",
                     help="Dump per-rollout per-token velocity reward to "
                          "<output_dir>/velocity_log.jsonl (pt-velocity* only).")
+    ap.add_argument("--velocity_scorer", choices=["policy", "ref"], default="policy",
+                    help="Model used to score log p(a|q+o[:t]) for the velocity "
+                         "reward. 'policy' (default) = live policy under update; "
+                         "'ref' = frozen copy of --model loaded once at startup.")
     return ap.parse_args()
 
 
@@ -333,6 +339,21 @@ def main():
             log_path.write_text("")
             trainer.velocity_log_path = log_path
             print(f"  velocity_log → {log_path}")
+
+        # Frozen reference scorer for the velocity reward (variant 2).
+        # Loaded once at startup; never updated. Lives on the same device as
+        # the policy so compute_pv_reward can run prompts/completion ids
+        # through it without cross-device copies.
+        if (a.velocity_scorer == "ref"
+                and a.variant in ("pt-velocity", "pt-velocity-prefix")):
+            ref_device = next(trainer.model.parameters()).device
+            ref_model  = AutoModelForCausalLM.from_pretrained(
+                a.model, torch_dtype=torch.bfloat16,
+            ).to(ref_device).eval()
+            for p in ref_model.parameters():
+                p.requires_grad_(False)
+            trainer.velocity_ref_model = ref_model
+            print(f"  velocity_scorer = ref (frozen {a.model} on {ref_device})")
 
     print(f"  trainer = {type(trainer).__name__}")
     import time as _time
