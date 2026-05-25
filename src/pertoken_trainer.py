@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import re
+import warnings
 from pathlib import Path
 from typing import Callable, Hashable, List, Optional
 
@@ -195,12 +196,24 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                     scoring_model.train()
 
             # Drop per-rollout records to JSONL with the current global_step.
+            # Network FS (e.g. RunPod MooseFS) occasionally returns EIO during
+            # chunkserver reconnects; logging is research-only telemetry, so a
+            # transient write failure must NOT kill a multi-hour training run.
             if sink:
                 step = int(getattr(self.state, "global_step", 0))
-                with self.velocity_log_path.open("a") as f:
-                    for rec in sink:
-                        rec["global_step"] = step
-                        f.write(json.dumps(rec) + "\n")
+                try:
+                    with self.velocity_log_path.open("a") as f:
+                        for rec in sink:
+                            rec["global_step"] = step
+                            f.write(json.dumps(rec) + "\n")
+                except OSError as e:
+                    if not getattr(self, "_velocity_log_warn_emitted", False):
+                        warnings.warn(
+                            f"velocity_log write failed at step {step} "
+                            f"({type(e).__name__}: {e}); continuing without "
+                            f"this step's log entries. Further failures silenced."
+                        )
+                        self._velocity_log_warn_emitted = True
 
             # Feed accepted answers back into the answer buffer.
             self.velocity_computer.update_buffer(
