@@ -156,6 +156,16 @@ def main():
                         help="MBE reward denominator (default 40.0 → max ~0.05)")
     parser.add_argument("--mbe_clip", type=float, default=2.0,
                         help="MBE value clipped before scaling")
+    # MBE velocity reward (length-normalised endpoint diff of growing-prefix MBE trace)
+    parser.add_argument("--mbe_velocity_reward", action="store_true",
+                        help="Add length-normalised MBE velocity reward: clip((trace[-1]-trace[0])/log(min(T,D)), ±clip)/scale")
+    parser.add_argument("--mbe_velocity_scale", type=float, default=4.0,
+                        help="MBE velocity reward denominator (default 4.0 → max |reward| ≈ 0.25)")
+    parser.add_argument("--mbe_velocity_clip", type=float, default=1.0,
+                        help="Two-sided clip on length-normalised velocity (∈ ~[-1, +1])")
+    parser.add_argument("--mbe_velocity_stride", type=int, default=8,
+                        help="Sampling stride for the running-prefix MBE trace "
+                             "(every `stride` tokens we record MBE of all tokens so far)")
     # Prefix-conditioned rollout exploration (PCRE)
     parser.add_argument("--prefix_rollout", action="store_true",
                         help="Enable prefix-conditioned rollout exploration")
@@ -320,6 +330,23 @@ def main():
         print(f"MBE reward enabled: {'gated' if args.gated_mbe_reward else 'plain'}, "
               f"scale={args.mbe_scale}, clip={args.mbe_clip}")
 
+    # MBE velocity reward (length-normalised endpoint diff of growing-prefix MBE trace).
+    # Estimator chain: src/mbe_reward.py:compute_mbe_running_trace (kernel-trick K=h hᵀ
+    #   + 2D cumsum, identical math to mbe_reverse_gram, no D×D matrices materialised).
+    mbe_velo_reward_obj = None
+    if args.mbe_velocity_reward:
+        from src.mbe_reward import MBEVeloReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        mbe_velo_reward_obj = MBEVeloReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale=args.mbe_velocity_scale,
+            clip=args.mbe_velocity_clip,
+        )
+        reward_funcs.append(mbe_velo_reward_obj)
+        print(f"MBE velocity reward enabled: scale={args.mbe_velocity_scale}, "
+              f"clip=±{args.mbe_velocity_clip}, stride={args.mbe_velocity_stride}")
+
     eval_dataset = None
     if args.eval_steps > 0:
         eval_dataset = test_dataset
@@ -341,6 +368,8 @@ def main():
         mbe_logger.set_model(trainer.model)
     if mbe_reward_obj is not None:
         mbe_reward_obj.set_model(trainer.model)
+    if mbe_velo_reward_obj is not None:
+        mbe_velo_reward_obj.set_model(trainer.model)
 
     trainer.train()
     trainer.save_model(args.output_dir)
