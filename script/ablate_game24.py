@@ -31,7 +31,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOConfig, GRPOTrainer
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -64,9 +64,9 @@ def game24_is_correct(completion_str: str, prompt_str: str) -> bool:
     nums = _nums_from_prompt(prompt_str)
     return bool(nums) and bool(verify_24(nums, extract_expr(completion_str)))
 
-
+# Progression reward, for correct trajectory
 def placeholder_per_token_reward(prompt_ids, completion_ids, completion_mask, *, tokenizer):
-    """Trajectory-correctness × position-ramp. Sanity baseline only."""
+    """Trajectory-correctness × relative progression. Sanity baseline only."""
     B, T = completion_ids.shape
     device = completion_ids.device
     pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
@@ -87,24 +87,47 @@ def placeholder_per_token_reward(prompt_ids, completion_ids, completion_mask, *,
 
 
 class RolloutLogger:
-    """Zero-reward callback: dumps every rollout to JSONL."""
+    """Zero-reward callback: dumps every rollout to JSONL.
+
+    Writes to ``train_path`` during training and ``eval_path`` during eval.
+    The active path is selected via ``in_eval`` which an external callback
+    flips around the eval loop (see :class:`EvalFlagCallback`).
+    """
     __name__ = "rollout_logger"
-    def __init__(self, path: Path, tok):
-        self.path, self.tok, self.step = path, tok, 0
-        path.write_text("")
+    def __init__(self, train_path: Path, eval_path: Path, tok):
+        self.train_path, self.eval_path, self.tok = train_path, eval_path, tok
+        train_path.write_text(""); eval_path.write_text("")
+        self.in_eval = False
+        self.global_step = 0  # set by EvalFlagCallback so eval rows share a step
     def __call__(self, completions, numbers, solutions=None, **kwargs):
-        with self.path.open("a") as f:
+        path = self.eval_path if self.in_eval else self.train_path
+        with path.open("a") as f:
             for i, (c, nums) in enumerate(zip(completions, numbers)):
                 text = _text(c); expr = extract_expr(text)
                 ok = verify_24(list(nums), expr)
                 n_tok = len(self.tok.encode(text, add_special_tokens=False))
                 f.write(json.dumps({
-                    "step": self.step, "idx": i, "numbers": list(nums),
+                    "global_step": int(self.global_step),
+                    "idx": i, "numbers": list(nums),
                     "completion": text, "expr": expr,
                     "correct": bool(ok), "n_tokens": int(n_tok),
+                    "split": "eval" if self.in_eval else "train",
                 }) + "\n")
-        self.step += 1
         return [0.0] * len(completions)
+
+
+class EvalFlagCallback(TrainerCallback):
+    """Toggles RolloutLogger.in_eval around eval loops; tracks global_step."""
+    def __init__(self, logger: RolloutLogger):
+        self.logger = logger
+    def on_step_begin(self, args, state, control, **kw):
+        self.logger.in_eval = False
+        self.logger.global_step = state.global_step
+    def on_prediction_step(self, args, state, control, **kw):
+        self.logger.in_eval = True
+        self.logger.global_step = state.global_step
+    def on_evaluate(self, args, state, control, **kw):
+        self.logger.in_eval = False
 
 
 def build_run_name(a) -> str:
@@ -142,6 +165,13 @@ def make_grpo_config(a, output_dir: Path, with_prefix: bool) -> GRPOConfig:
     else:  # server
         kw["vllm_server_host"] = a.vllm_server_host
         kw["vllm_server_port"] = a.vllm_server_port
+
+    if a.eval_steps > 0:
+        kw["eval_strategy"] = "steps"
+        kw["eval_steps"] = a.eval_steps
+        kw["eval_on_start"] = True   # baseline at global_step=0
+        kw["per_device_eval_batch_size"] = a.per_device_train_batch_size
+
     return GRPOConfig(**kw)
 
 
@@ -159,6 +189,9 @@ def parse_args():
     ap.add_argument("--gradient_accumulation_steps", type=int, default=4)
     ap.add_argument("--learning_rate", type=float, default=5e-6)
     ap.add_argument("--logging_steps", type=int, default=5)
+    ap.add_argument("--eval_steps", type=int, default=200,
+                    help="Run eval on eval_ds every N global steps (0=disable). "
+                         "Eval rollouts go to eval_rollouts.jsonl; baseline at step 0.")
     ap.add_argument("--vllm_mem", type=float, default=0.4)
     # vLLM mode
     ap.add_argument("--vllm_mode", choices=["colocate", "server"], default="colocate",
@@ -183,6 +216,9 @@ def parse_args():
     ap.add_argument("--prefix_truncate", default="none", choices=["none", "uniform"])
     # Output
     ap.add_argument("--output_root", default="output/ablate_game24")
+    ap.add_argument("--log_velocity", action="store_true",
+                    help="Dump per-rollout per-token velocity reward to "
+                         "<output_dir>/velocity_log.jsonl (pt-velocity* only).")
     return ap.parse_args()
 
 
@@ -222,8 +258,14 @@ def main():
         # Pin training to --train_device so it never lands on the GPU(s) running vLLM.
         model_kw["device_map"] = {"": f"cuda:{a.train_device}"}
     model = AutoModelForCausalLM.from_pretrained(a.model, **model_kw)
-    rollout_logger = RolloutLogger(output_dir / "rollouts.jsonl", tokenizer)
+    rollout_logger = RolloutLogger(
+        output_dir / "rollouts.jsonl",
+        output_dir / "eval_rollouts.jsonl",
+        tokenizer,
+    )
     rewards = [correctness_reward, format_reward, rollout_logger]
+    eval_callback = [EvalFlagCallback(rollout_logger)] if a.eval_steps > 0 else []
+    eval_dataset = eval_ds if a.eval_steps > 0 else None
 
     # ---- variant dispatch ----
     answer_buffer = None
@@ -232,13 +274,17 @@ def main():
     if a.variant == "grpo":
         cfg = make_grpo_config(a, output_dir, with_prefix=False)
         trainer = GRPOTrainer(
-            model=model, reward_funcs=rewards, args=cfg, train_dataset=train_ds,
+            model=model, reward_funcs=rewards, args=cfg,
+            train_dataset=train_ds, eval_dataset=eval_dataset,
+            processing_class=tokenizer, callbacks=eval_callback,
         )
     else:
         with_prefix = a.variant == "pt-velocity-prefix"
         cfg = make_grpo_config(a, output_dir, with_prefix=with_prefix)
         kw = dict(
             model=model, reward_funcs=rewards, args=cfg, train_dataset=train_ds,
+            eval_dataset=eval_dataset, processing_class=tokenizer,
+            callbacks=eval_callback,
             adv_mode=a.adv_mode, adv_n_chunks=a.adv_n_chunks, adv_stride=a.adv_stride,
         )
 
@@ -281,20 +327,144 @@ def main():
 
         trainer = PerTokenAdvantageTrainer(**kw)
 
+        # Per-rollout velocity-reward dump (only meaningful on velocity routes).
+        if a.log_velocity and a.variant in ("pt-velocity", "pt-velocity-prefix"):
+            log_path = output_dir / "velocity_log.jsonl"
+            log_path.write_text("")
+            trainer.velocity_log_path = log_path
+            print(f"  velocity_log → {log_path}")
+
     print(f"  trainer = {type(trainer).__name__}")
+    import time as _time
+    t0 = _time.time()
     trainer.train()
+    wall_s = _time.time() - t0
 
-    # final buffer stats
-    stats = {}
+    # ---- metrics.json (always written) ------------------------------------
+    metrics = compute_metrics_from_rollouts(output_dir / "rollouts.jsonl")
+    metrics.update(compute_eval_metrics(output_dir / "eval_rollouts.jsonl"))
+    metrics.update({
+        "variant":      a.variant,
+        "model":        a.model,
+        "adv_mode":     a.adv_mode if a.variant.startswith("pt-") else None,
+        "vllm_mode":    a.vllm_mode,
+        "steps":        a.steps,
+        "seed":         a.seed,
+        "wall_seconds": round(wall_s, 1),
+        "run_name":     run_name,
+    })
+    if a.variant == "pt-velocity-prefix":
+        metrics.update({
+            "p_inject":          a.p_inject,
+            "share_within_group": int(a.share_within_group),
+            "prefix_max_layer":  a.prefix_max_layer,
+        })
+    (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
+    print(
+        f"  metrics → {output_dir / 'metrics.json'}\n"
+        f"    train: acc_all={metrics.get('acc_all', 0):.3f}  "
+        f"acc_last_200={metrics.get('acc_last_200', 0):.3f}\n"
+        f"    eval : baseline={metrics.get('eval_acc_first', float('nan')):.3f}  "
+        f"final={metrics.get('eval_acc_last', float('nan')):.3f}  "
+        f"Δ={metrics.get('eval_delta', float('nan')):+.3f}  "
+        f"(n_eval_cycles={metrics.get('n_eval_cycles', 0)})"
+    )
+
+    # ---- final buffer stats (only when applicable) ------------------------
+    bstats = {}
     if answer_buffer is not None:
-        stats["answer_buffer"] = answer_buffer.stats()
+        bstats["answer_buffer"] = answer_buffer.stats()
     if prefix_buffer is not None:
-        stats["prefix_buffer"] = prefix_buffer.stats()
-    if stats:
-        (output_dir / "buffers.json").write_text(json.dumps(stats, indent=2))
-        print(f"  buffer stats → {output_dir / 'buffers.json'}")
+        bstats["prefix_buffer"] = prefix_buffer.stats()
+    if bstats:
+        (output_dir / "buffers.json").write_text(json.dumps(bstats, indent=2))
 
-    print(f"[{run_name}] done.")
+    print(f"[{run_name}] done in {wall_s/60:.1f} min.")
+
+
+def _load_jsonl(path: Path) -> list:
+    if not path.exists():
+        return []
+    rows = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def compute_metrics_from_rollouts(jsonl_path: Path) -> dict:
+    """Reduce train rollouts.jsonl into a flat metrics dict."""
+    rows = _load_jsonl(jsonl_path)
+    if not rows:
+        return {"n_rollouts": 0, "acc_all": 0.0, "acc_last_200": 0.0, "n_steps": 0}
+
+    n = len(rows)
+    n_correct = sum(1 for r in rows if r.get("correct"))
+    last200 = rows[-min(200, n):]
+    last500 = rows[-min(500, n):]
+    # Support both legacy "step" and new "global_step" keys.
+    step_key = "global_step" if "global_step" in rows[0] else "step"
+    n_steps = max((r.get(step_key, 0) for r in rows), default=0) + 1
+    mean_tok = sum(r.get("n_tokens", 0) for r in rows) / max(1, n)
+
+    return {
+        "n_rollouts":   n,
+        "n_steps":      int(n_steps),
+        "acc_all":      n_correct / n,
+        "acc_last_500": sum(1 for r in last500 if r.get("correct")) / max(1, len(last500)),
+        "acc_last_200": sum(1 for r in last200 if r.get("correct")) / max(1, len(last200)),
+        "mean_completion_tokens": round(mean_tok, 1),
+    }
+
+
+def compute_eval_metrics(jsonl_path: Path) -> dict:
+    """Reduce eval_rollouts.jsonl into per-cycle accuracy + summary deltas.
+
+    Returns:
+        eval_acc_first    : accuracy on the baseline eval (global_step=0)
+        eval_acc_last     : accuracy on the final eval cycle
+        eval_delta        : eval_acc_last - eval_acc_first (training improvement)
+        eval_acc_curve    : list of (global_step, acc, n) per eval cycle
+        n_eval_cycles     : number of eval cycles run
+        n_eval_rollouts   : total eval rollouts logged
+    """
+    rows = _load_jsonl(jsonl_path)
+    if not rows:
+        return {
+            "eval_acc_first": float("nan"),
+            "eval_acc_last":  float("nan"),
+            "eval_delta":     float("nan"),
+            "eval_acc_curve": [],
+            "n_eval_cycles":  0,
+            "n_eval_rollouts": 0,
+        }
+
+    # Group by global_step (= eval cycle).
+    from collections import defaultdict
+    by_step: dict[int, list] = defaultdict(list)
+    for r in rows:
+        by_step[int(r.get("global_step", 0))].append(r)
+
+    curve = []
+    for gs in sorted(by_step):
+        bucket = by_step[gs]
+        acc = sum(1 for r in bucket if r.get("correct")) / len(bucket)
+        curve.append((gs, round(acc, 4), len(bucket)))
+
+    return {
+        "eval_acc_first":  curve[0][1],
+        "eval_acc_last":   curve[-1][1],
+        "eval_delta":      round(curve[-1][1] - curve[0][1], 4),
+        "eval_acc_curve":  curve,
+        "n_eval_cycles":   len(curve),
+        "n_eval_rollouts": len(rows),
+    }
 
 
 if __name__ == "__main__":

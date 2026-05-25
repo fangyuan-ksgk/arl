@@ -32,7 +32,9 @@ If neither hook is set the trainer falls back to vanilla GRPO behavior.
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Callable, Hashable, List, Optional
 
 import torch
@@ -114,6 +116,11 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         self.adv_mode = adv_mode
         self.adv_n_chunks = adv_n_chunks
         self.adv_stride = adv_stride
+        # Optional per-rollout dump of velocity reward internals (tokens,
+        # per-token reward, per-chunk velocity, R_T, ref). Only honored on
+        # the velocity route. Set externally before training:
+        #     trainer.velocity_log_path = output_dir / "velocity_log.jsonl"
+        self.velocity_log_path: Optional[Path] = None
 
     # ------------------------------------------------------------------ reward
 
@@ -154,6 +161,7 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
             scoring_model = self.accelerator.unwrap_model(self.model)
             was_training = scoring_model.training
             scoring_model.eval()
+            sink: list | None = [] if self.velocity_log_path is not None else None
             try:
                 r_t, cot_mask = self.velocity_computer.compute_per_token_reward(
                     prompt_ids, completion_ids, mask,
@@ -161,10 +169,19 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                     tokenizer=tok,
                     query_keys=query_keys,
                     correctness=correctness,
+                    record_sink=sink,
                 )
             finally:
                 if was_training:
                     scoring_model.train()
+
+            # Drop per-rollout records to JSONL with the current global_step.
+            if sink:
+                step = int(getattr(self.state, "global_step", 0))
+                with self.velocity_log_path.open("a") as f:
+                    for rec in sink:
+                        rec["global_step"] = step
+                        f.write(json.dumps(rec) + "\n")
 
             # Feed accepted answers back into the answer buffer.
             self.velocity_computer.update_buffer(
@@ -250,6 +267,72 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
             #     ck_adv = ((ck - mu[:, None]) / (sd[:, None] + 1e-6)).view(Bp, K)
             #     adv    = ck_adv.gather(1, chunk) * m
 
+            # ── train-time reward diagnostics ────────────────────────────
+            # One JSONL line per microbatch with R_T mean/length/correlation
+            # split by has-marker (terminating) vs no-marker (clipped). Used
+            # to test the hypothesis that velocity reward gives positive R_T
+            # to long clipped rollouts via teacher-forced answer priming.
+            try:
+                self._log_reward_stats(r_t, mask, cot_mask, ans_m)
+            except Exception:
+                pass  # logging must never break training
+
         inputs = dict(inputs)
         inputs["advantages"] = adv
         return super()._compute_loss(model, inputs)
+
+    # ------------------------------------------------------------------ stats
+
+    def _log_reward_stats(self, r_t, mask, cot_mask, ans_m):
+        """Append per-microbatch aggregates to ``<output_dir>/reward_stats.jsonl``.
+
+        Per-rollout R_T = sum of per-token reward over all real tokens (CoT +
+        answer-marker). For the velocity route this equals
+        ``logp(a | q+o) − logp(a | q)``. For the placeholder route it equals
+        ``T_eff/2`` if the rollout is correct, 0 otherwise.
+
+        ``has_marker[b]`` is True iff the rollout has at least one
+        answer-marker token (i.e. ``####`` was emitted), False if clipped.
+        """
+        out_dir = getattr(getattr(self, "args", None), "output_dir", None)
+        if out_dir is None:
+            return
+        path = Path(out_dir) / "reward_stats.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        m_f       = mask.float()
+        R_T       = (r_t * m_f).sum(dim=1)                # (Bp,)
+        length    = m_f.sum(dim=1)                        # (Bp,)
+        has_mark  = ans_m.any(dim=1)                      # (Bp,) bool
+        valid     = length > 0
+
+        def _stats(sel: torch.Tensor) -> dict:
+            sel = sel & valid
+            if not sel.any():
+                return {"n": 0}
+            return {
+                "n":        int(sel.sum().item()),
+                "RT_mean":  float(R_T[sel].mean().item()),
+                "RT_std":   float(R_T[sel].std(unbiased=False).item()),
+                "len_mean": float(length[sel].mean().item()),
+            }
+
+        # Pearson corr(R_T, length) across valid rollouts in this microbatch.
+        if valid.sum() >= 2:
+            x = R_T[valid]
+            y = length[valid]
+            xc, yc = x - x.mean(), y - y.mean()
+            denom = (xc.pow(2).sum().sqrt() * yc.pow(2).sum().sqrt()).clamp_min(1e-12)
+            rt_len_corr = float((xc * yc).sum().div(denom).item())
+        else:
+            rt_len_corr = float("nan")
+
+        rec = {
+            "step":        int(getattr(self.state, "global_step", -1)),
+            "n":           int(valid.sum().item()),
+            "marker":      _stats(has_mark),
+            "no_marker":   _stats(~has_mark),
+            "RT_len_corr": rt_len_corr,
+        }
+        with path.open("a") as f:
+            f.write(json.dumps(rec) + "\n")

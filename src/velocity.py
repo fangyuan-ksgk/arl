@@ -535,6 +535,7 @@ class VelocityRewardComputer:
         query_keys: List[Hashable],
         correctness: List[bool],
         rng: "np.random.Generator | None" = None,
+        record_sink: list | None = None,
     ) -> torch.Tensor:
         """Return ``r_t`` of shape ``(Bp, T)`` (already mask-applied).
 
@@ -565,6 +566,7 @@ class VelocityRewardComputer:
         q_raws: List[List[int]] = []
         c_raws: List[List[int]] = []   # already cut to o_eff (marker-stripped)
         a_raws: List[List[int]] = []
+        a_strs: List[str]       = []   # reference answer string used per rollout
         valid_idx: List[int]    = []
 
         for b in range(Bp):
@@ -609,6 +611,7 @@ class VelocityRewardComputer:
             q_raws.append(p_ids)
             c_raws.append(c_ids_full[:o_eff])
             a_raws.append(a_ids_b)
+            a_strs.append(ref_text)
             valid_idx.append(b)
 
         r_t = torch.zeros(Bp, T, device=device, dtype=torch.float32)
@@ -688,6 +691,44 @@ class VelocityRewardComputer:
             cot_mask[b, :o_eff_j] = 1
             if comp_len_b > o_eff_j:
                 r_t[b, o_eff_j:comp_len_b] = float(R_T_cpu[j])
+
+        # ── optional per-rollout reward dump ───────────────────────────────
+        # The trainer wires this when `velocity_log_path` is set on it. Each
+        # record carries enough state to reconstruct the velocity reward
+        # offline: tokens, per-token reward, per-chunk velocity, R_T, ref.
+        if record_sink is not None:
+            r_sub_cpu = r_sub.detach().cpu().tolist()
+            for j, b in enumerate(valid_idx):
+                o_eff_j    = int(o_len_cpu[j])
+                cot_ids    = c_raws[j]
+                cot_tokens = tokenizer.convert_ids_to_tokens(cot_ids)
+                # per-token CoT reward (length o_eff_j); answer-marker tail
+                # positions are constant R_T (omitted to keep records small).
+                r_cot   = r_sub_cpu[j][:o_eff_j]
+                # per-chunk velocity v_g = sum of token rewards inside chunk.
+                # Sum-invariant by construction of compute_pv_reward.
+                vt = []
+                for g in range(len(chunk_ends) - 1):
+                    sta = min(chunk_ends[g],     o_eff_j)
+                    end = min(chunk_ends[g + 1], o_eff_j)
+                    vt.append(float(sum(r_cot[sta:end])) if end > sta else 0.0)
+                qk = query_keys[b]
+                record_sink.append({
+                    "row":         int(b),
+                    "query_key":   list(qk) if isinstance(qk, tuple) else qk,
+                    "correct":     bool(correctness[b]),
+                    "ref":         a_strs[j],
+                    "q_len":       int(q_len[j].item()),
+                    "o_len":       int(o_eff_j),
+                    "a_len":       int(a_len[j].item()),
+                    "comp_len":    int(comp_len_cpu[b]),
+                    "t_grid":      [int(x) for x in chunk_ends],
+                    "vt":          vt,
+                    "R_T":         float(R_T_cpu[j]),
+                    "R_per_token": float(R_T_cpu[j] / max(1, o_eff_j)),
+                    "tokens":      cot_tokens,
+                    "r_cot":       [float(x) for x in r_cot],
+                })
 
         return r_t * completion_mask.float(), cot_mask
 

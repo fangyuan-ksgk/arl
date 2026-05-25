@@ -53,6 +53,8 @@ PER_DEVICE_BATCH_SIZE="${PER_DEVICE_BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-4}"
 LEARNING_RATE="${LEARNING_RATE:-5e-6}"
 LOGGING_STEPS="${LOGGING_STEPS:-5}"
+EVAL_STEPS="${EVAL_STEPS:-200}"
+VEL_CHUNK_SIZE="${VEL_CHUNK_SIZE:-64}"
 
 # 2-GPU layout: vLLM on GPU 1, training on GPU 0.
 VLLM_GPU="${VLLM_GPU:-1}"
@@ -148,6 +150,8 @@ run_cell () {
       --gradient_accumulation_steps "${GRAD_ACCUM}"
       --learning_rate "${LEARNING_RATE}"
       --logging_steps "${LOGGING_STEPS}"
+      --eval_steps "${EVAL_STEPS}"
+      --vel_chunk_size "${VEL_CHUNK_SIZE}"
       --vllm_mode "${mode}"
       "$@" )
 
