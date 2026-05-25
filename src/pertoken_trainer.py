@@ -108,6 +108,10 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
             raise ValueError("velocity_computer requires is_correct")
 
         super().__init__(*args, **kw)
+        # Set by an external EvalFlagCallback during prediction loops so
+        # `_compute_loss` can short-circuit the per-token reward path
+        # (avoids buffer contamination + spurious velocity_log writes).
+        self.in_eval: bool = False
         self.per_token_reward_fn = per_token_reward_fn
         self.velocity_computer = velocity_computer
         self.is_correct = is_correct
@@ -222,6 +226,20 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
     # ------------------------------------------------------------------ loss
 
     def _compute_loss(self, model, inputs):
+        # During eval, skip the per-token reward path entirely:
+        #   • avoids contaminating the answer/prefix buffer with eval-set answers
+        #   • prevents eval rollouts from being appended to velocity_log.jsonl
+        #   • avoids redundant velocity-scorer forwards on tossed-away losses
+        # Eval loss falls back to vanilla GRPO (advantages already on `inputs`).
+        # Eval guard: prefer the autograd-state signal over the callback-set
+        # `in_eval` flag. `eval_on_start=True` runs evaluation BEFORE
+        # `EvalFlagCallback.on_evaluate` fires, so `in_eval` is still False at
+        # the very first eval cycle. `prediction_step` always wraps this call
+        # in `torch.no_grad()`, so `not torch.is_grad_enabled()` is the robust
+        # signal for "we are in eval, do not touch buffers / velocity_log".
+        if self.in_eval or not torch.is_grad_enabled():
+            return super()._compute_loss(model, inputs)
+
         prompt_ids     = inputs["prompt_ids"]
         completion_ids = inputs["completion_ids"]    # (Bp, T)
         mask           = inputs["completion_mask"]   # (Bp, T)

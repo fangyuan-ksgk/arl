@@ -615,8 +615,9 @@ class VelocityRewardComputer:
             valid_idx.append(b)
 
         r_t = torch.zeros(Bp, T, device=device, dtype=torch.float32)
+        cot_mask = torch.zeros(Bp, T, device=device, dtype=torch.long)
         if not valid_idx:
-            return r_t
+            return r_t, cot_mask
 
         # ── pack into PV tensors directly in id space ─────────────────────
         B = len(valid_idx)

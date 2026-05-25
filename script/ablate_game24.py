@@ -117,17 +117,32 @@ class RolloutLogger:
 
 
 class EvalFlagCallback(TrainerCallback):
-    """Toggles RolloutLogger.in_eval around eval loops; tracks global_step."""
+    """Toggles eval flags on logger and trainer; tracks global_step.
+
+    Two flags ride this signal:
+      • ``logger.in_eval``  routes rollouts to ``eval_rollouts.jsonl``
+      • ``trainer.in_eval`` short-circuits per-token reward in
+                            ``PerTokenAdvantageTrainer._compute_loss`` so
+                            the answer/prefix buffer + velocity_log are
+                            not contaminated by eval-set rollouts.
+    The trainer reference is set after ctor via :meth:`bind_trainer`.
+    """
     def __init__(self, logger: RolloutLogger):
         self.logger = logger
+        self.trainer = None
+    def bind_trainer(self, trainer):
+        self.trainer = trainer
+    def _set(self, in_eval: bool, step: int):
+        self.logger.in_eval = in_eval
+        self.logger.global_step = step
+        if self.trainer is not None:
+            self.trainer.in_eval = in_eval
     def on_step_begin(self, args, state, control, **kw):
-        self.logger.in_eval = False
-        self.logger.global_step = state.global_step
+        self._set(False, state.global_step)
     def on_prediction_step(self, args, state, control, **kw):
-        self.logger.in_eval = True
-        self.logger.global_step = state.global_step
+        self._set(True, state.global_step)
     def on_evaluate(self, args, state, control, **kw):
-        self.logger.in_eval = False
+        self._set(False, state.global_step)
 
 
 def build_run_name(a) -> str:
@@ -272,7 +287,8 @@ def main():
         tokenizer,
     )
     rewards = [correctness_reward, format_reward, rollout_logger]
-    eval_callback = [EvalFlagCallback(rollout_logger)] if a.eval_steps > 0 else []
+    eval_flag_cb = EvalFlagCallback(rollout_logger) if a.eval_steps > 0 else None
+    eval_callback = [eval_flag_cb] if eval_flag_cb is not None else []
     eval_dataset = eval_ds if a.eval_steps > 0 else None
 
     # ---- variant dispatch ----
@@ -334,6 +350,12 @@ def main():
                 )
 
         trainer = PerTokenAdvantageTrainer(**kw)
+
+        # Bind the trainer to the eval-flag callback so eval phases short-
+        # circuit `_compute_loss` (skip per-token reward / buffer updates /
+        # velocity_log writes).
+        if eval_flag_cb is not None:
+            eval_flag_cb.bind_trainer(trainer)
 
         # Per-rollout velocity-reward dump (only meaningful on velocity routes).
         if a.log_velocity and a.variant in ("pt-velocity", "pt-velocity-prefix"):
