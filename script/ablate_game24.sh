@@ -56,6 +56,20 @@ LOGGING_STEPS="${LOGGING_STEPS:-5}"
 EVAL_STEPS="${EVAL_STEPS:-200}"
 VEL_CHUNK_SIZE="${VEL_CHUNK_SIZE:-64}"
 
+# Subset of cells to run (space-separated). Default = full sweep.
+# Examples:
+#   VARIANTS="pt-velocity"                 # only the velocity cell
+#   VARIANTS="grpo pt-velocity"            # baseline + velocity
+VARIANTS="${VARIANTS:-grpo pt-placeholder pt-velocity pt-velocity-prefix}"
+
+# pt-velocity-only knobs.
+#   LOG_VELOCITY=1               → pass --log_velocity to pt-velocity cells
+#                                  (writes <run>/velocity_log.jsonl)
+#   VELOCITY_SCORERS="policy ref" → run pt-velocity once per scorer.
+#                                  'policy' = live policy, 'ref' = frozen base.
+LOG_VELOCITY="${LOG_VELOCITY:-0}"
+VELOCITY_SCORERS="${VELOCITY_SCORERS:-policy}"
+
 # 2-GPU layout: vLLM on GPU 1, training on GPU 0.
 VLLM_GPU="${VLLM_GPU:-1}"
 TRAIN_GPU="${TRAIN_GPU:-0}"
@@ -80,9 +94,20 @@ echo "  max_comp_len = ${MAX_COMPLETION_LENGTH}"
 echo "  num_gen      = ${NUM_GENERATIONS}"
 echo "  vllm_gpu     = ${VLLM_GPU}    train_gpu = ${TRAIN_GPU}"
 echo "  extended     = ${EXTENDED}"
+echo "  variants     = ${VARIANTS}"
+echo "  log_velocity = ${LOG_VELOCITY}     scorers = ${VELOCITY_SCORERS}"
 echo "  models       ="
 for m in ${MODELS}; do echo "    - ${m}"; done
 echo
+
+# True iff $1 appears in the space-separated VARIANTS list.
+want_variant () {
+  local v
+  for v in ${VARIANTS}; do
+    [[ "${v}" == "$1" ]] && return 0
+  done
+  return 1
+}
 
 # --- vLLM server lifecycle (copied from run_game24_sweep.sh) ---------------
 VLLM_PID=""
