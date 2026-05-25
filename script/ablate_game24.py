@@ -172,7 +172,9 @@ def make_grpo_config(a, output_dir: Path, with_prefix: bool) -> GRPOConfig:
         kw["eval_strategy"] = "steps"
         kw["eval_steps"] = a.eval_steps
         kw["eval_on_start"] = True   # baseline at global_step=0
-        kw["per_device_eval_batch_size"] = a.per_device_train_batch_size
+        # GRPO requires global_eval_bs % num_generations == 0. The driver runs
+        # single-process so global == per_device; default to num_generations.
+        kw["per_device_eval_batch_size"] = a.num_generations
 
     return GRPOConfig(**kw)
 
