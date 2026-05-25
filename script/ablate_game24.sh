@@ -31,6 +31,13 @@
 #   MODELS="Qwen/Qwen3-0.6B"          bash script/ablate_game24.sh  # one model
 #   STEPS=200                         bash script/ablate_game24.sh  # short
 #   EXTENDED=1                        bash script/ablate_game24.sh  # full knob sweep
+#
+# Velocity-reward focused run (Qwen3-0.6B, 400 steps, both scorers, full per-token logging):
+#   MODELS="Qwen/Qwen3-0.6B" STEPS=400 \
+#   VARIANTS="pt-velocity" \
+#   VELOCITY_SCORERS="policy ref" LOG_VELOCITY=1 \
+#   OUTPUT_ROOT=output/ablate_game24_velreward \
+#   bash script/ablate_game24.sh
 
 set -u
 
@@ -216,32 +223,55 @@ for MODEL in ${MODELS}; do
   echo " out  → ${MODEL_ROOT}"
   echo "##############################################################"
 
-  # ---- server-mode variants (vLLM on GPU 1, training on GPU 0) ----
-  VLLM_LOG="${LOG_DIR}/vllm_$(date +%s).log"
-  if start_vllm_server "${MODEL}" "${VLLM_LOG}"; then
-    run_cell "${MODEL}" server  --variant grpo
-    run_cell "${MODEL}" server  --variant pt-placeholder --adv_mode token
-    run_cell "${MODEL}" server  --variant pt-velocity    --adv_mode token
+  # Optional --log_velocity flag and per-scorer loop for pt-velocity cells.
+  vel_log_args=()
+  [[ "${LOG_VELOCITY}" == "1" ]] && vel_log_args+=( --log_velocity )
 
-    if [[ "${EXTENDED}" == "1" ]]; then
-      run_cell "${MODEL}" server  --variant pt-velocity --adv_mode position
-      run_cell "${MODEL}" server  --variant pt-velocity --adv_mode progress
+  # Decide whether server-mode block is needed at all.
+  need_server=0
+  for v in grpo pt-placeholder pt-velocity; do
+    want_variant "${v}" && need_server=1
+  done
+
+  # ---- server-mode variants (vLLM on GPU 1, training on GPU 0) ----
+  if [[ "${need_server}" == "1" ]]; then
+    VLLM_LOG="${LOG_DIR}/vllm_$(date +%s).log"
+    if start_vllm_server "${MODEL}" "${VLLM_LOG}"; then
+      want_variant grpo           && run_cell "${MODEL}" server --variant grpo
+      want_variant pt-placeholder && run_cell "${MODEL}" server --variant pt-placeholder --adv_mode token
+
+      if want_variant pt-velocity; then
+        for SCORER in ${VELOCITY_SCORERS}; do
+          run_cell "${MODEL}" server --variant pt-velocity --adv_mode token \
+                   --velocity_scorer "${SCORER}" "${vel_log_args[@]}"
+        done
+
+        if [[ "${EXTENDED}" == "1" ]]; then
+          run_cell "${MODEL}" server --variant pt-velocity --adv_mode position
+          run_cell "${MODEL}" server --variant pt-velocity --adv_mode progress
+        fi
+      fi
+    else
+      echo "  !! vLLM server failed to start for ${MODEL}; skipping server variants."
+      FAILED="${FAILED} ${MODEL}:vllm-start"
     fi
-  else
-    echo "  !! vLLM server failed to start for ${MODEL}; skipping server variants."
-    FAILED="${FAILED} ${MODEL}:vllm-start"
+    stop_vllm_server
   fi
-  stop_vllm_server
 
   # ---- colocate-mode variants (PrefixInjector requires it) ----
-  run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5
+  if want_variant pt-velocity-prefix; then
+    for SCORER in ${VELOCITY_SCORERS}; do
+      run_cell "${MODEL}" colocate --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 \
+               --velocity_scorer "${SCORER}" "${vel_log_args[@]}"
+    done
 
-  if [[ "${EXTENDED}" == "1" ]]; then
-    run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.25
-    run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.75
-    run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --share_within_group 0
-    run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --prefix_max_layer 2
-    run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --prefix_max_layer 4
+    if [[ "${EXTENDED}" == "1" ]]; then
+      run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.25
+      run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.75
+      run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --share_within_group 0
+      run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --prefix_max_layer 2
+      run_cell "${MODEL}" colocate  --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 --prefix_max_layer 4
+    fi
   fi
 done
 
