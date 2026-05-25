@@ -371,7 +371,7 @@ def evaluate_pv_reward(
     per: List[Tuple[List[int], List[int], List[int]]] = []
     for q, cot, a in zip(prompts, completions, references):
         if strip_answer_marker:
-            i = cot.find("####")
+            i = _find_answer_marker(cot)
             cot = cot[:i] if i >= 0 else cot
         a_text = a if a.lstrip().startswith("####") else f"#### {a}"
         q_raw = tokenizer(q,      add_special_tokens=False).input_ids
@@ -493,6 +493,26 @@ def _default_extract_answer(text: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _find_answer_marker(text: str) -> int:
+    """Index of the answer-region '####', or -1 if absent.
+
+    Hardened against reward-hacking: only counts a '####' that appears AFTER
+    ``</think>``. A naked ``text.find("####")`` lets the policy stuff a literal
+    ``####`` inside its CoT, collapsing the velocity-reward CoT/answer split so
+    most of the (degenerate, predictable) completion ends up in the constant-
+    R_T answer-marker pool. Anchoring on ``</think>`` mirrors the chat-template
+    contract: anything before that tag is reasoning, not answer.
+
+    Falls back to ``-1`` (no marker found) if either tag is absent — caller
+    treats that as "no marker cut" and uses the full completion as CoT.
+    """
+    j = text.find("</think>")
+    if j < 0:
+        return -1
+    k = text.find("####", j)
+    return k if k >= 0 else -1
+
+
 class VelocityRewardComputer:
 
     def __init__(
@@ -589,8 +609,14 @@ class VelocityRewardComputer:
 
             # id-space marker cut: decode → find "####" → re-tokenize prefix.
             # Used only for its length; no byte-perfect round-trip required.
+            #
+            # Reward-hacking guard: only honor a "####" that appears AFTER
+            # </think>. A literal "####" inside the CoT would otherwise let
+            # the policy collapse `o_eff` to a tiny prefix and stuff the rest
+            # of the (degenerate, highly predictable) tokens into the
+            # answer-marker pool that all carry constant R_T. See `_find_answer_marker`.
             if self.strip_answer_marker:
-                i = completion_str.find("####")
+                i = _find_answer_marker(completion_str)
                 if i >= 0:
                     prefix_ids = tokenizer(
                         completion_str[:i], add_special_tokens=False

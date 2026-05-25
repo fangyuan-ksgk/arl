@@ -265,14 +265,22 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                 # *cumulative* signal on a different scale than per-token
                 # velocity, so they need their own baseline.
                 adv = torch.zeros_like(r_t)
+                # NaN-safe pool z-score: a single-element pool gives std==nan
+                # under Bessel correction, which propagates to adv -> loss ->
+                # gradient -> optimizer writes nan into the policy. After the
+                # vLLM weight sync, the server returns None logprobs and TRL's
+                # `torch.tensor(None)` crashes _generate_and_score_completions.
+                # `unbiased=False` + numel>1 guard kills the cascade at source.
                 if cot_m.any():
-                    p_c   = r_t[cot_m]
-                    mu_c, sd_c = p_c.mean(), p_c.std()
-                    adv[cot_m] = (r_t[cot_m] - mu_c) / (sd_c + 1e-6)
+                    p_c = r_t[cot_m]
+                    mu_c = p_c.mean()
+                    sd_c = p_c.std(unbiased=False) if p_c.numel() > 1 else p_c.new_zeros(())
+                    adv[cot_m] = (p_c - mu_c) / (sd_c + 1e-6)
                 if ans_m.any():
-                    p_a   = r_t[ans_m]
-                    mu_a, sd_a = p_a.mean(), p_a.std()
-                    adv[ans_m] = (r_t[ans_m] - mu_a) / (sd_a + 1e-6)
+                    p_a = r_t[ans_m]
+                    mu_a = p_a.mean()
+                    sd_a = p_a.std(unbiased=False) if p_a.numel() > 1 else p_a.new_zeros(())
+                    adv[ans_m] = (p_a - mu_a) / (sd_a + 1e-6)
             else: 
                 raise ValueError(f"Unknown adv_mode: {self.adv_mode} | Need to add support for CoT / Answer token separate handling")
             # elif self.adv_mode == "position":
