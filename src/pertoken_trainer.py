@@ -81,6 +81,11 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         specific identity (e.g., the puzzle numbers tuple) to make the
         offline seed and the online lookups agree even if tokenization is
         not pinned.
+    task_extras_fn
+        Optional ``(completion_str, query_key) -> dict`` callback. Whatever
+        dict it returns is merged into each rollout record written to
+        ``rollouts.jsonl`` / ``eval_rollouts.jsonl``. For Game-of-24 we use
+        ``lambda c, qk: {"numbers": list(qk), "expr": extract_expr(c)}``.
     adv_mode
         ``"token"`` | ``"position"`` | ``"progress"``.
     adv_n_chunks
@@ -96,6 +101,7 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         velocity_computer=None,
         is_correct: Optional[Callable[[str, str], bool]] = None,
         query_key_fn: Optional[Callable[[str], Hashable]] = None,
+        task_extras_fn: Optional[Callable[[str, Hashable], dict]] = None,
         prefix_buffer=None,
         adv_mode: str = "token",
         adv_n_chunks: int = 8,
@@ -110,28 +116,35 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
 
         super().__init__(*args, **kw)
         # Set by an external EvalFlagCallback during prediction loops so
-        # `_compute_loss` can short-circuit the per-token reward path
-        # (avoids buffer contamination + spurious velocity_log writes).
+        # `_compute_loss` routes rollouts to ``eval_rollouts.jsonl`` and
+        # skips buffer updates. The autograd-state check is the robust
+        # fallback (see `_compute_loss`).
         self.in_eval: bool = False
         self.per_token_reward_fn = per_token_reward_fn
         self.velocity_computer = velocity_computer
         self.is_correct = is_correct
         self.query_key_fn = query_key_fn
+        self.task_extras_fn = task_extras_fn
         self.prefix_buffer = prefix_buffer
         self.adv_mode = adv_mode
         self.adv_n_chunks = adv_n_chunks
         self.adv_stride = adv_stride
-        # Optional per-rollout dump of velocity reward internals (tokens,
-        # per-token reward, per-chunk velocity, R_T, ref). Only honored on
-        # the velocity route. Set externally before training:
-        #     trainer.velocity_log_path = output_dir / "velocity_log.jsonl"
-        self.velocity_log_path: Optional[Path] = None
         # Optional frozen scorer for log p(a | q + o[:t]). Default (None)
         # uses the live policy — same as before. Setting this to a frozen
         # copy of the base model decouples the velocity reward from the
         # parameters being updated. Set externally before training:
         #     trainer.velocity_ref_model = ref_model.eval().to(device)
         self.velocity_ref_model = None
+        # Unified per-rollout logging — exactly two JSONL sinks, train + eval.
+        # Lazy-resolved against ``args.output_dir`` on first write; override
+        # by setting these attributes before training.
+        self.rollouts_path: Optional[Path] = None
+        self.eval_rollouts_path: Optional[Path] = None
+        # `inner_step` = which microbatch within the current global step
+        # (advantages z-score within a `_compute_loss` call → they sum to ~0
+        # over a single inner_step). Resets when global_step advances.
+        self._inner_step = 0
+        self._last_global_step = -1
 
     # ------------------------------------------------------------------ reward
 
@@ -181,7 +194,6 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                 scoring_model = self.accelerator.unwrap_model(self.model)
                 was_training  = scoring_model.training
                 scoring_model.eval()
-            sink: list | None = [] if self.velocity_log_path is not None else None
             try:
                 r_t, cot_mask = self.velocity_computer.compute_per_token_reward(
                     prompt_ids, completion_ids, mask,
@@ -189,31 +201,10 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                     tokenizer=tok,
                     query_keys=query_keys,
                     correctness=correctness,
-                    record_sink=sink,
                 )
             finally:
                 if was_training:
                     scoring_model.train()
-
-            # Drop per-rollout records to JSONL with the current global_step.
-            # Network FS (e.g. RunPod MooseFS) occasionally returns EIO during
-            # chunkserver reconnects; logging is research-only telemetry, so a
-            # transient write failure must NOT kill a multi-hour training run.
-            if sink:
-                step = int(getattr(self.state, "global_step", 0))
-                try:
-                    with self.velocity_log_path.open("a") as f:
-                        for rec in sink:
-                            rec["global_step"] = step
-                            f.write(json.dumps(rec) + "\n")
-                except OSError as e:
-                    if not getattr(self, "_velocity_log_warn_emitted", False):
-                        warnings.warn(
-                            f"velocity_log write failed at step {step} "
-                            f"({type(e).__name__}: {e}); continuing without "
-                            f"this step's log entries. Further failures silenced."
-                        )
-                        self._velocity_log_warn_emitted = True
 
             # Feed accepted answers back into the answer buffer.
             self.velocity_computer.update_buffer(
@@ -224,6 +215,14 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
                 for b, ok in enumerate(correctness):
                     if ok:
                         self.prefix_buffer.add(query_keys[b], completion_strs[b])
+            # Stash decoded strings + query_keys + correctness for the
+            # unified rollout logger so we don't decode twice.
+            self._last_decoded = {
+                "prompt_strs":     prompt_strs,
+                "completion_strs": completion_strs,
+                "query_keys":      query_keys,
+                "correctness":     correctness,
+            }
             return r_t, cot_mask
 
         if self.per_token_reward_fn is not None:
@@ -239,18 +238,26 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
     # ------------------------------------------------------------------ loss
 
     def _compute_loss(self, model, inputs):
-        # During eval, skip the per-token reward path entirely:
-        #   • avoids contaminating the answer/prefix buffer with eval-set answers
-        #   • prevents eval rollouts from being appended to velocity_log.jsonl
-        #   • avoids redundant velocity-scorer forwards on tossed-away losses
-        # Eval loss falls back to vanilla GRPO (advantages already on `inputs`).
+        # Eval path: skip per-token reward (no buffer contamination, no
+        # velocity-scorer forwards on losses we're about to throw away), but
+        # still log eval rollouts with r_t/advantage = None.
+        #
         # Eval guard: prefer the autograd-state signal over the callback-set
-        # `in_eval` flag. `eval_on_start=True` runs evaluation BEFORE
-        # `EvalFlagCallback.on_evaluate` fires, so `in_eval` is still False at
-        # the very first eval cycle. `prediction_step` always wraps this call
-        # in `torch.no_grad()`, so `not torch.is_grad_enabled()` is the robust
-        # signal for "we are in eval, do not touch buffers / velocity_log".
-        if self.in_eval or not torch.is_grad_enabled():
+        # `in_eval` flag. `eval_on_start=True` triggers eval BEFORE
+        # `EvalFlagCallback.on_evaluate` fires; `prediction_step` always wraps
+        # this in `torch.no_grad()`, so `not torch.is_grad_enabled()` is the
+        # robust signal for "this is eval, do not touch buffers".
+        in_eval = self.in_eval or not torch.is_grad_enabled()
+        if in_eval:
+            try:
+                self._log_rollouts(
+                    inputs["prompt_ids"],
+                    inputs["completion_ids"],
+                    inputs["completion_mask"],
+                    r_t=None, adv=None, loss=None, in_eval=True,
+                )
+            except Exception:
+                pass  # logging must never break training
             return super()._compute_loss(model, inputs)
 
         prompt_ids     = inputs["prompt_ids"]
@@ -321,13 +328,20 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
             #     ck_adv = ((ck - mu[:, None]) / (sd[:, None] + 1e-6)).view(Bp, K)
             #     adv    = ck_adv.gather(1, chunk) * m
 
-            # ── train-time reward diagnostics ────────────────────────────
-            # One JSONL line per microbatch with R_T mean/length/correlation
-            # split by has-marker (terminating) vs no-marker (clipped). Used
-            # to test the hypothesis that velocity reward gives positive R_T
-            # to long clipped rollouts via teacher-forced answer priming.
+            # Per-token loss for logging: TRL's GRPO loss is
+            #   L_t = -min(ratio_t * A_t, clip(ratio_t) * A_t) * mask_t  (+ beta * KL_t)
+            # At the first inner iteration ratio_t == 1 exactly (the default
+            # since TRL uses num_iterations=1), so L_t = -A_t * mask_t. We use
+            # this here for the rollouts log; it's a diagnostic, not the value
+            # backpropagated through super()._compute_loss.
+            loss_per_tok = -adv * mask.float()
+
+            # ── unified per-rollout logging (train) ──────────────────────
             try:
-                self._log_reward_stats(r_t, mask, cot_mask, ans_m)
+                self._log_rollouts(
+                    prompt_ids, completion_ids, mask,
+                    r_t=r_t, adv=adv, loss=loss_per_tok, in_eval=False,
+                )
             except Exception:
                 pass  # logging must never break training
 
@@ -335,58 +349,155 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         inputs["advantages"] = adv
         return super()._compute_loss(model, inputs)
 
-    # ------------------------------------------------------------------ stats
+    # ------------------------------------------------------------------ logging
 
-    def _log_reward_stats(self, r_t, mask, cot_mask, ans_m):
-        """Append per-microbatch aggregates to ``<output_dir>/reward_stats.jsonl``.
+    def _bump_inner_step(self) -> int:
+        """Inner-step counter: 0..gas-1 within each optimizer step.
 
-        Per-rollout R_T = sum of per-token reward over all real tokens (CoT +
-        answer-marker). For the velocity route this equals
-        ``logp(a | q+o) − logp(a | q)``. For the placeholder route it equals
-        ``T_eff/2`` if the rollout is correct, 0 otherwise.
-
-        ``has_marker[b]`` is True iff the rollout has at least one
-        answer-marker token (i.e. ``####`` was emitted), False if clipped.
+        Advantages z-score within a single `_compute_loss` call, so all
+        records sharing `(global_step, inner_step)` form a single advantage
+        pool whose values sum to ~0 (over real tokens).
         """
+        cur = int(getattr(self.state, "global_step", 0))
+        if cur != self._last_global_step:
+            self._inner_step = 0
+            self._last_global_step = cur
+            return 0
+        self._inner_step += 1
+        return self._inner_step
+
+    def _resolve_log_path(self, in_eval: bool) -> Optional[Path]:
+        attr = "eval_rollouts_path" if in_eval else "rollouts_path"
+        p = getattr(self, attr, None)
+        if p is not None:
+            return Path(p)
         out_dir = getattr(getattr(self, "args", None), "output_dir", None)
         if out_dir is None:
+            return None
+        p = Path(out_dir) / ("eval_rollouts.jsonl" if in_eval else "rollouts.jsonl")
+        setattr(self, attr, p)
+        return p
+
+    def _log_rollouts(
+        self,
+        prompt_ids: torch.Tensor,
+        completion_ids: torch.Tensor,
+        mask: torch.Tensor,
+        *,
+        r_t: Optional[torch.Tensor],
+        adv: Optional[torch.Tensor],
+        loss: Optional[torch.Tensor],
+        in_eval: bool,
+    ) -> None:
+        """Append one JSONL line per rollout in this microbatch.
+
+        Schema (per record):
+            global_step, inner_step, idx, split, completion, n_tokens,
+            r_t, advantage, loss, correct, + task_extras_fn(completion, qk).
+
+        On the train path `r_t`/`adv`/`loss` are the per-token tensors; only
+        the real (non-padding) positions are dumped. On the eval path all
+        three are None (velocity + advantage aren't computed during eval)
+        and the record stores empty lists.
+
+        The logged `loss` is the per-token GRPO PG term under the ratio==1
+        assumption (exact when `num_iterations == 1`, which is TRL's
+        default). It does not include the KL term super()._compute_loss may
+        add, so per-token sums won't exactly equal the trainer's reported
+        scalar loss — close enough for diagnostics.
+        """
+        path = self._resolve_log_path(in_eval)
+        if path is None:
             return
-        path = Path(out_dir) / "reward_stats.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        m_f       = mask.float()
-        R_T       = (r_t * m_f).sum(dim=1)                # (Bp,)
-        length    = m_f.sum(dim=1)                        # (Bp,)
-        has_mark  = ans_m.any(dim=1)                      # (Bp,) bool
-        valid     = length > 0
+        tok    = self.processing_class
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
 
-        def _stats(sel: torch.Tensor) -> dict:
-            sel = sel & valid
-            if not sel.any():
-                return {"n": 0}
-            return {
-                "n":        int(sel.sum().item()),
-                "RT_mean":  float(R_T[sel].mean().item()),
-                "RT_std":   float(R_T[sel].std(unbiased=False).item()),
-                "len_mean": float(length[sel].mean().item()),
-            }
-
-        # Pearson corr(R_T, length) across valid rollouts in this microbatch.
-        if valid.sum() >= 2:
-            x = R_T[valid]
-            y = length[valid]
-            xc, yc = x - x.mean(), y - y.mean()
-            denom = (xc.pow(2).sum().sqrt() * yc.pow(2).sum().sqrt()).clamp_min(1e-12)
-            rt_len_corr = float((xc * yc).sum().div(denom).item())
+        # Reuse decoded strings from `_per_token_reward` if available; on the
+        # eval path nothing has been decoded yet so we do it here.
+        cached = getattr(self, "_last_decoded", None) if not in_eval else None
+        if cached is not None and len(cached["completion_strs"]) == completion_ids.size(0):
+            prompt_strs     = cached["prompt_strs"]
+            completion_strs = cached["completion_strs"]
+            query_keys      = cached["query_keys"]
+            correctness     = cached["correctness"]
         else:
-            rt_len_corr = float("nan")
+            prompt_strs = [
+                tok.decode(
+                    [int(x) for x in prompt_ids[b].tolist() if x != pad_id],
+                    skip_special_tokens=False,
+                )
+                for b in range(prompt_ids.size(0))
+            ]
+            completion_strs = [
+                tok.decode(
+                    completion_ids[b][mask[b].bool()].tolist(),
+                    skip_special_tokens=False,
+                )
+                for b in range(completion_ids.size(0))
+            ]
+            if self.query_key_fn is not None:
+                query_keys = [self.query_key_fn(s) for s in prompt_strs]
+            else:
+                query_keys = [
+                    prompt_token_hash(prompt_ids[b], pad_id)
+                    for b in range(prompt_ids.size(0))
+                ]
+            if self.is_correct is not None:
+                correctness = [
+                    bool(self.is_correct(completion_strs[b], prompt_strs[b]))
+                    for b in range(completion_ids.size(0))
+                ]
+            else:
+                correctness = [False] * completion_ids.size(0)
+        # Consume the cache exactly once so subsequent calls don't reuse it.
+        self._last_decoded = None
 
-        rec = {
-            "step":        int(getattr(self.state, "global_step", -1)),
-            "n":           int(valid.sum().item()),
-            "marker":      _stats(has_mark),
-            "no_marker":   _stats(~has_mark),
-            "RT_len_corr": rt_len_corr,
-        }
-        with path.open("a") as f:
-            f.write(json.dumps(rec) + "\n")
+        gs    = int(getattr(self.state, "global_step", 0))
+        inner = 0 if in_eval else self._bump_inner_step()
+
+        # OSError-tolerant write (research telemetry, never crash training).
+        try:
+            with path.open("a") as f:
+                for b in range(completion_ids.size(0)):
+                    m_b = mask[b].bool()
+                    n_tok = int(m_b.sum().item())
+                    if r_t is not None:
+                        r_b = [float(x) for x in r_t[b][m_b].tolist()]
+                    else:
+                        r_b = []
+                    if adv is not None:
+                        a_b = [float(x) for x in adv[b][m_b].tolist()]
+                    else:
+                        a_b = []
+                    if loss is not None:
+                        l_b = [float(x) for x in loss[b][m_b].tolist()]
+                    else:
+                        l_b = []
+                    rec = {
+                        "global_step": gs,
+                        "inner_step":  inner,
+                        "idx":         b,
+                        "split":       "eval" if in_eval else "train",
+                        "completion":  completion_strs[b],
+                        "n_tokens":    n_tok,
+                        "r_t":         r_b,
+                        "advantage":   a_b,
+                        "loss":        l_b,
+                        "correct":     bool(correctness[b]),
+                    }
+                    if self.task_extras_fn is not None:
+                        try:
+                            rec.update(self.task_extras_fn(completion_strs[b], query_keys[b]))
+                        except Exception:
+                            pass
+                    f.write(json.dumps(rec) + "\n")
+        except OSError as e:
+            if not getattr(self, "_rollouts_log_warn_emitted", False):
+                warnings.warn(
+                    f"rollouts log write failed at step {gs} "
+                    f"({type(e).__name__}: {e}); continuing without "
+                    f"this step's entries. Further failures silenced."
+                )
+                self._rollouts_log_warn_emitted = True

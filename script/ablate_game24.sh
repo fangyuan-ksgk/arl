@@ -32,12 +32,14 @@
 #   STEPS=200                         bash script/ablate_game24.sh  # short
 #   EXTENDED=1                        bash script/ablate_game24.sh  # full knob sweep
 #
-# Velocity-reward focused run (Qwen3-0.6B, 400 steps, both scorers, full per-token logging):
+# Velocity-reward focused run (Qwen3-0.6B, 400 steps, both scorers):
 #   MODELS="Qwen/Qwen3-0.6B" STEPS=400 \
 #   VARIANTS="pt-velocity" \
-#   VELOCITY_SCORERS="policy ref" LOG_VELOCITY=1 \
+#   VELOCITY_SCORERS="policy ref" \
 #   OUTPUT_ROOT=output/ablate_game24_velreward \
 #   bash script/ablate_game24.sh
+# (per-token velocity reward + advantage are now always logged into
+#  <run>/rollouts.jsonl by the trainer; no extra flag needed.)
 
 set -u
 
@@ -70,11 +72,8 @@ VEL_CHUNK_SIZE="${VEL_CHUNK_SIZE:-64}"
 VARIANTS="${VARIANTS:-grpo pt-placeholder pt-velocity pt-velocity-prefix}"
 
 # pt-velocity-only knobs.
-#   LOG_VELOCITY=1               → pass --log_velocity to pt-velocity cells
-#                                  (writes <run>/velocity_log.jsonl)
 #   VELOCITY_SCORERS="policy ref" → run pt-velocity once per scorer.
 #                                  'policy' = live policy, 'ref' = frozen base.
-LOG_VELOCITY="${LOG_VELOCITY:-0}"
 VELOCITY_SCORERS="${VELOCITY_SCORERS:-policy}"
 
 # 2-GPU layout: vLLM on GPU 1, training on GPU 0.
@@ -102,7 +101,7 @@ echo "  num_gen      = ${NUM_GENERATIONS}"
 echo "  vllm_gpu     = ${VLLM_GPU}    train_gpu = ${TRAIN_GPU}"
 echo "  extended     = ${EXTENDED}"
 echo "  variants     = ${VARIANTS}"
-echo "  log_velocity = ${LOG_VELOCITY}     scorers = ${VELOCITY_SCORERS}"
+echo "  scorers      = ${VELOCITY_SCORERS}"
 echo "  models       ="
 for m in ${MODELS}; do echo "    - ${m}"; done
 echo
@@ -223,10 +222,6 @@ for MODEL in ${MODELS}; do
   echo " out  → ${MODEL_ROOT}"
   echo "##############################################################"
 
-  # Optional --log_velocity flag and per-scorer loop for pt-velocity cells.
-  vel_log_args=()
-  [[ "${LOG_VELOCITY}" == "1" ]] && vel_log_args+=( --log_velocity )
-
   # Decide whether server-mode block is needed at all.
   need_server=0
   for v in grpo pt-placeholder pt-velocity; do
@@ -243,7 +238,7 @@ for MODEL in ${MODELS}; do
       if want_variant pt-velocity; then
         for SCORER in ${VELOCITY_SCORERS}; do
           run_cell "${MODEL}" server --variant pt-velocity --adv_mode token \
-                   --velocity_scorer "${SCORER}" "${vel_log_args[@]}"
+                   --velocity_scorer "${SCORER}"
         done
 
         if [[ "${EXTENDED}" == "1" ]]; then
@@ -262,7 +257,7 @@ for MODEL in ${MODELS}; do
   if want_variant pt-velocity-prefix; then
     for SCORER in ${VELOCITY_SCORERS}; do
       run_cell "${MODEL}" colocate --variant pt-velocity-prefix --adv_mode token --p_inject 0.5 \
-               --velocity_scorer "${SCORER}" "${vel_log_args[@]}"
+               --velocity_scorer "${SCORER}"
     done
 
     if [[ "${EXTENDED}" == "1" ]]; then

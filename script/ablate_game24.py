@@ -86,63 +86,37 @@ def placeholder_per_token_reward(prompt_ids, completion_ids, completion_mask, *,
     return ramp * traj_r.unsqueeze(1) * completion_mask.float()
 
 
-class RolloutLogger:
-    """Zero-reward callback: dumps every rollout to JSONL.
+def game24_task_extras(completion_str: str, query_key) -> dict:
+    """Task-specific fields merged into each rollout record by the trainer.
 
-    Writes to ``train_path`` during training and ``eval_path`` during eval.
-    The active path is selected via ``in_eval`` which an external callback
-    flips around the eval loop (see :class:`EvalFlagCallback`).
+    The query_key for Game-of-24 is the puzzle's numbers tuple (set via
+    :func:`game24_query_key`), so we surface it as ``numbers`` and add the
+    extracted answer expression for human-readable inspection.
     """
-    __name__ = "rollout_logger"
-    def __init__(self, train_path: Path, eval_path: Path, tok):
-        self.train_path, self.eval_path, self.tok = train_path, eval_path, tok
-        train_path.write_text(""); eval_path.write_text("")
-        self.in_eval = False
-        self.global_step = 0  # set by EvalFlagCallback so eval rows share a step
-    def __call__(self, completions, numbers, solutions=None, **kwargs):
-        path = self.eval_path if self.in_eval else self.train_path
-        with path.open("a") as f:
-            for i, (c, nums) in enumerate(zip(completions, numbers)):
-                text = _text(c); expr = extract_expr(text)
-                ok = verify_24(list(nums), expr)
-                n_tok = len(self.tok.encode(text, add_special_tokens=False))
-                f.write(json.dumps({
-                    "global_step": int(self.global_step),
-                    "idx": i, "numbers": list(nums),
-                    "completion": text, "expr": expr,
-                    "correct": bool(ok), "n_tokens": int(n_tok),
-                    "split": "eval" if self.in_eval else "train",
-                }) + "\n")
-        return [0.0] * len(completions)
+    qk = list(query_key) if isinstance(query_key, (tuple, list)) else query_key
+    return {"numbers": qk, "expr": extract_expr(completion_str)}
 
 
 class EvalFlagCallback(TrainerCallback):
-    """Toggles eval flags on logger and trainer; tracks global_step.
+    """Flips ``trainer.in_eval`` around the prediction loop.
 
-    Two flags ride this signal:
-      • ``logger.in_eval``  routes rollouts to ``eval_rollouts.jsonl``
-      • ``trainer.in_eval`` short-circuits per-token reward in
-                            ``PerTokenAdvantageTrainer._compute_loss`` so
-                            the answer/prefix buffer + velocity_log are
-                            not contaminated by eval-set rollouts.
-    The trainer reference is set after ctor via :meth:`bind_trainer`.
+    The flag drives :meth:`PerTokenAdvantageTrainer._compute_loss` to
+    short-circuit the per-token reward path (no buffer contamination, no
+    velocity-scorer forwards) and to route rollouts to ``eval_rollouts.jsonl``.
     """
-    def __init__(self, logger: RolloutLogger):
-        self.logger = logger
+    def __init__(self):
         self.trainer = None
     def bind_trainer(self, trainer):
         self.trainer = trainer
-    def _set(self, in_eval: bool, step: int):
-        self.logger.in_eval = in_eval
-        self.logger.global_step = step
+    def _set(self, in_eval: bool):
         if self.trainer is not None:
             self.trainer.in_eval = in_eval
     def on_step_begin(self, args, state, control, **kw):
-        self._set(False, state.global_step)
+        self._set(False)
     def on_prediction_step(self, args, state, control, **kw):
-        self._set(True, state.global_step)
+        self._set(True)
     def on_evaluate(self, args, state, control, **kw):
-        self._set(False, state.global_step)
+        self._set(False)
 
 
 def build_run_name(a) -> str:
@@ -235,9 +209,6 @@ def parse_args():
     ap.add_argument("--prefix_truncate", default="none", choices=["none", "uniform"])
     # Output
     ap.add_argument("--output_root", default="output/ablate_game24")
-    ap.add_argument("--log_velocity", action="store_true",
-                    help="Dump per-rollout per-token velocity reward to "
-                         "<output_dir>/velocity_log.jsonl (pt-velocity* only).")
     ap.add_argument("--velocity_scorer", choices=["policy", "ref"], default="policy",
                     help="Model used to score log p(a|q+o[:t]) for the velocity "
                          "reward. 'policy' (default) = live policy under update; "
@@ -281,13 +252,14 @@ def main():
         # Pin training to --train_device so it never lands on the GPU(s) running vLLM.
         model_kw["device_map"] = {"": f"cuda:{a.train_device}"}
     model = AutoModelForCausalLM.from_pretrained(a.model, **model_kw)
-    rollout_logger = RolloutLogger(
-        output_dir / "rollouts.jsonl",
-        output_dir / "eval_rollouts.jsonl",
-        tokenizer,
-    )
-    rewards = [correctness_reward, format_reward, rollout_logger]
-    eval_flag_cb = EvalFlagCallback(rollout_logger) if a.eval_steps > 0 else None
+    # Per-rollout logging is now done by PerTokenAdvantageTrainer itself
+    # (see `_log_rollouts`); reward functions only return scalars.
+    rewards = [correctness_reward, format_reward]
+    # Truncate the two unified sinks at the start of every run so we don't
+    # mix records across runs sharing an output_dir.
+    (output_dir / "rollouts.jsonl").write_text("")
+    (output_dir / "eval_rollouts.jsonl").write_text("")
+    eval_flag_cb = EvalFlagCallback() if a.eval_steps > 0 else None
     eval_callback = [eval_flag_cb] if eval_flag_cb is not None else []
     eval_dataset = eval_ds if a.eval_steps > 0 else None
 
@@ -333,6 +305,7 @@ def main():
                 ),
                 is_correct=game24_is_correct,
                 query_key_fn=game24_query_key,
+                task_extras_fn=game24_task_extras,
             )
 
             if a.variant == "pt-velocity-prefix":
@@ -352,17 +325,9 @@ def main():
         trainer = PerTokenAdvantageTrainer(**kw)
 
         # Bind the trainer to the eval-flag callback so eval phases short-
-        # circuit `_compute_loss` (skip per-token reward / buffer updates /
-        # velocity_log writes).
+        # circuit `_compute_loss` (skip per-token reward / buffer updates).
         if eval_flag_cb is not None:
             eval_flag_cb.bind_trainer(trainer)
-
-        # Per-rollout velocity-reward dump (only meaningful on velocity routes).
-        if a.log_velocity and a.variant in ("pt-velocity", "pt-velocity-prefix"):
-            log_path = output_dir / "velocity_log.jsonl"
-            log_path.write_text("")
-            trainer.velocity_log_path = log_path
-            print(f"  velocity_log → {log_path}")
 
         # Frozen reference scorer for the velocity reward (variant 2).
         # Loaded once at startup; never updated. Lives on the same device as
