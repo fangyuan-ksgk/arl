@@ -529,6 +529,7 @@ class VelocityRewardComputer:
         normalize_by_chunk: bool = True,
         strip_answer_marker: bool = True,
         penalty_on_truncated: bool = False,
+        penalty_on_incorrect: bool = False,
     ):
         if chunk_strategy == "uniform":
             if chunk_size is None and n_chunks is None:
@@ -547,6 +548,7 @@ class VelocityRewardComputer:
         self.normalize_by_chunk  = normalize_by_chunk
         self.strip_answer_marker = strip_answer_marker
         self.penalty_on_truncated = penalty_on_truncated
+        self.penalty_on_incorrect = penalty_on_incorrect
 
     @torch.no_grad()
     def compute_per_token_reward(
@@ -607,6 +609,12 @@ class VelocityRewardComputer:
 
             if correctness[b]:
                 ref = self.extract_answer(completion_str)
+            elif self.penalty_on_incorrect:
+                # Penalty path: skip velocity compute, mark for -10 fill
+                # below. Same shape as penalty_on_truncated — the model
+                # gets a strong, uniform negative signal on incorrect
+                # rollouts so it learns to avoid the mistake.
+                continue
             else:
                 ref = self.buffer.sample(query_keys[b], rng=rng)
             if not ref or not ref.strip():
@@ -614,15 +622,6 @@ class VelocityRewardComputer:
 
             # id-space marker cut: decode → find "####" → re-tokenize prefix.
             # Used only for its length; no byte-perfect round-trip required.
-            #
-            # Reward-hacking guard: only honor a "####" that appears AFTER
-            # </think>. A literal "####" inside the CoT would otherwise let
-            # the policy collapse `o_eff` to a tiny prefix and stuff the rest
-            # of the (degenerate, highly predictable) tokens into the
-            # answer-marker pool that all carry constant R_T. See `_find_answer_marker`.
-            # Truncation = no '</think>...####' marker. We still need to score
-            # the rollout (so the trainer sees a reward tensor of consistent
-            # shape), but `penalty_on_truncated` will overwrite its reward at the end.
             marker_i = _find_answer_marker(completion_str) if self.strip_answer_marker else -1
             is_truncated = (marker_i < 0)
             if self.strip_answer_marker and marker_i >= 0:
@@ -691,9 +690,6 @@ class VelocityRewardComputer:
         R_T_per_row = r_sub.sum(dim=1)                               # (B,)
 
         if not self.normalize_by_chunk:
-            # compute_pv_reward always divides by chunk width to get token-level
-            # rewards summing to R_T. Recover raw per-chunk values by undoing
-            # that division: multiply each token by its chunk width.
             idx = torch.arange(o_max, device=device)[None, :]        # (1, o_max)
             for g in range(len(chunk_ends) - 1):
                 sta = torch.clamp(torch.full_like(o_len, chunk_ends[g]),     max=o_len)
@@ -707,13 +703,6 @@ class VelocityRewardComputer:
         r_t[idx_t, :o_max] = r_sub.to(r_t.dtype)
 
         # ── answer-marker positions get the rollout's R_T ──────────────────
-        # Archery analogy: per-CoT-token velocity tells the policy *which
-        # moves* were good; the answer tokens carry R_T = "how confident
-        # the model is in the reference answer given the full CoT", i.e.
-        # how close the bow was pointing to the target. Together with a
-        # separate advantage pool for these tokens (see trainer), this
-        # prevents the policy from being told "your own #### marker was
-        # below-mean" when its CoT was actually good.
         cot_mask     = torch.zeros(Bp, T, device=device, dtype=torch.long)
         comp_lens    = completion_mask.sum(dim=1)                    # (Bp,)
         o_len_cpu    = o_len.tolist()
@@ -727,16 +716,19 @@ class VelocityRewardComputer:
                 r_t[b, o_eff_j:comp_len_b] = float(R_T_cpu[j])
 
         # ── penalty_on_truncated ──────────────────────────────────────────────
-        # Rollouts that never emitted '</think>...####' get a constant
-        # negative reward on every real token. Zero is a no-op (it's the
-        # natural value of R_T when log p(a|q+o) ≈ log p(a|q), which is
-        # already where the empirical mean sits). −10 is one order of
-        # magnitude above typical |R_T| so truncated rows reliably land in
-        # the negative tail of each pool's z-score distribution.
-        # Padding positions are zeroed out at the return by completion_mask.
         if self.penalty_on_truncated and any(truncated):
             for j, b in enumerate(valid_idx):
                 if truncated[j]:
+                    r_t[b].fill_(-10.0)
+
+        # ── penalty_on_incorrect ─────────────────────────────────────────────
+        # Applied AFTER truncation so an incorrect-and-truncated rollout
+        # still gets a single -10 fill (idempotent). Incorrect rollouts
+        # were skipped above (no valid_idx entry, no velocity compute), so
+        # we fill directly by Bp index.
+        if self.penalty_on_incorrect:
+            for b, ok in enumerate(correctness):
+                if not ok:
                     r_t[b].fill_(-10.0)
 
         return r_t * completion_mask.float(), cot_mask
