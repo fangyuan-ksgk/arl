@@ -256,8 +256,18 @@ _text = completion_text
 
 
 def extract_expr(text: str) -> str:
-    """Return the expression after the last '#### ' marker, or empty string."""
-    m = re.search(r"####\s*(.+?)\s*$", text.strip())
+    """Return the expression after '#### ' in the post-``</think>`` region.
+
+    The model's chat template ends thinking with ``</think>``; the answer line
+    ``#### <expr>`` is expected to live after that tag. Restricting the search
+    to ``text.split("</think>")[-1]`` mirrors the reward-hacking guard in
+    ``velocity._find_answer_marker``: a literal ``####`` inside the CoT must
+    not be picked up. When ``</think>`` is absent (e.g. truncated rollouts or
+    non-thinking models), ``split`` returns the whole string, so we fall back
+    to scanning everything. Returns the empty string on miss.
+    """
+    tail = text.split("</think>")[-1]
+    m = re.search(r"####\s*(.+?)\s*$", tail.strip())
     return m.group(1).strip() if m else ""
 
 

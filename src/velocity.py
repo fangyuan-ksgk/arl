@@ -482,15 +482,18 @@ def _empty_result(toks: List[str], t_grid: List[int]) -> Dict[str, Any]:
 # Trainer-side wrapper: pick reference answer, scatter to per-token reward
 # ---------------------------------------------------------------------------
 
-import re as _re
-
-_DEFAULT_ANSWER_RE = _re.compile(r"####\s*(.+?)\s*$")
-
-
 def _default_extract_answer(text: str) -> str | None:
-    """Pull '#### <expr>' from the end of a completion. Returns None on miss."""
-    m = _DEFAULT_ANSWER_RE.search(text.strip())
-    return m.group(1).strip() if m else None
+    """Pull '#### <expr>' from the post-``</think>`` region of a completion.
+
+    Thin shim around :func:`src.game24utils.extract_expr` (the single source of
+    truth for the regex + ``</think>`` anchoring) that returns ``None`` instead
+    of the empty string, matching the sentinel used by the rest of the velocity
+    pipeline (caller treats ``None`` as "no answer extracted").
+    """
+    from src.game24utils import extract_expr  # local to avoid import cycle
+
+    expr = extract_expr(text)
+    return expr if expr else None
 
 
 def _find_answer_marker(text: str) -> int:
