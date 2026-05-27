@@ -326,6 +326,86 @@ class MBEVeloReward:
         return rewards
 
 
+class InvLogLengthReward:
+    """Pure length-normalisation baseline for the MBE velocity reward.
+
+    Reward = clip(1 / log(min(T_comp, D)), ±clip) / scale
+
+    This is exactly the denominator of :class:`MBEVeloReward` with the
+    numerator (``raw_v``) ablated to a constant 1. It isolates the
+    *length-pressure* component of MBE velocity:
+      - if MBE-velocity-w10's length reduction is fully explained by the
+        log-T denominator, this baseline should reproduce the same
+        length-vs-accuracy curve.
+      - if the diversity numerator contributes real signal, MBE velocity
+        should dominate this baseline on the Pareto frontier.
+
+    All gating logic (T_comp ≥ 2·stride, prompt_len ≥ 2) is mirrored
+    from :func:`_compute_mbe_velocity_for_completion` for parity. The
+    ``D`` term is taken from the model's hidden size so the cap matches
+    MBE velocity exactly; falls back to a constant if no model is bound.
+
+    Usage::
+
+        inv_len = InvLogLengthReward(tokenizer, scale=4.0, clip=1.0)
+        trainer = GRPOTrainer(model=..., reward_funcs=[..., inv_len], ...)
+        inv_len.set_model(trainer.model)
+        trainer.train()
+    """
+
+    def __init__(self, tokenizer, stride: int = 8,
+                 scale: float = 4.0, clip: float = 1.0):
+        self.__name__ = "inv_log_length"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale = scale
+        self.clip = clip
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+        device = (
+            next(self.model.parameters()).device
+            if self.model is not None else torch.device("cpu")
+        )
+        # Hidden dim D mirrors the MBE velocity cap; default 2048 is a
+        # reasonable fallback for the model class we sweep over (Qwen3 0.6/1.7/4B).
+        D = getattr(getattr(self.model, "config", None), "hidden_size", 2048)
+
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            completion_text = completion[0]["content"]
+            # Mirror MBE-velocity tokenization so T_comp is computed
+            # identically — fair apples-to-apples.
+            try:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    prompt, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                prompt_text = prompt if isinstance(prompt, str) else str(prompt)
+            full_text  = prompt_text + completion_text
+            prompt_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+            full_ids   = self.tokenizer(full_text,   return_tensors="pt")["input_ids"]
+            prompt_len = prompt_ids.shape[1]
+            T_total    = full_ids.shape[1]
+            T_comp     = T_total - prompt_len
+
+            # Same guard as MBE velocity → 0 reward on too-short completions
+            # so the model can't game the length-norm via 1-token outputs.
+            if T_comp < 2 * self.stride or prompt_len < 2:
+                rewards.append(0.0)
+                continue
+
+            length_norm = math.log(min(T_comp, D))            # > 0
+            v = 1.0 / length_norm
+            v = max(-self.clip, min(v, self.clip))            # parity w/ MBEVeloReward
+            rewards.append(v / self.scale)
+        return rewards
+
+
 class CorrectnessGatedMBEReward:
     """
     Correctness-gated MBE reward with clipping and scaling.

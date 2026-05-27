@@ -179,6 +179,17 @@ def main():
                         help="trajectory: raw_v = MBE(query+response) - MBE(query). "
                              "rollercoaster: raw_v = sum of positive per-stride MBE jumps "
                              "(rewards continual diversity growth, ignores drawdowns).")
+    # InvLogLength baseline: same denominator as MBE velocity, raw_v ablated to 1.
+    # Use to isolate the length-pressure component of MBE velocity (see analysis 2026-05-27).
+    parser.add_argument("--inv_log_length_reward", action="store_true",
+                        help="Pure 1/log(min(T_comp, D)) baseline reward — "
+                             "the denominator of MBE velocity with raw_v=1. "
+                             "Sweep against MBE velocity to test whether the "
+                             "diversity numerator adds signal beyond length normalisation.")
+    parser.add_argument("--inv_log_length_scale", type=float, default=4.0,
+                        help="InvLogLength reward denominator (default 4.0 matches MBE velocity)")
+    parser.add_argument("--inv_log_length_clip", type=float, default=1.0,
+                        help="Two-sided clip on 1/log(min(T_comp, D))")
     # Prefix-conditioned rollout exploration (PCRE)
     parser.add_argument("--prefix_rollout", action="store_true",
                         help="Enable prefix-conditioned rollout exploration")
@@ -364,6 +375,21 @@ def main():
               f"scale={args.mbe_velocity_scale}, clip=±{args.mbe_velocity_clip}, "
               f"stride={args.mbe_velocity_stride}, layers={velo_layers}")
 
+    # InvLogLength baseline (no MBE forward pass; just tokenize + log).
+    inv_log_len_reward_obj = None
+    if args.inv_log_length_reward:
+        from src.mbe_reward import InvLogLengthReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        inv_log_len_reward_obj = InvLogLengthReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,             # share the guard threshold
+            scale=args.inv_log_length_scale,
+            clip=args.inv_log_length_clip,
+        )
+        reward_funcs.append(inv_log_len_reward_obj)
+        print(f"InvLogLength reward enabled: scale={args.inv_log_length_scale}, "
+              f"clip=±{args.inv_log_length_clip}, stride={args.mbe_velocity_stride}")
+
     eval_dataset = None
     if args.eval_steps > 0:
         eval_dataset = test_dataset
@@ -387,6 +413,8 @@ def main():
         mbe_reward_obj.set_model(trainer.model)
     if mbe_velo_reward_obj is not None:
         mbe_velo_reward_obj.set_model(trainer.model)
+    if inv_log_len_reward_obj is not None:
+        inv_log_len_reward_obj.set_model(trainer.model)
 
     trainer.train()
     trainer.save_model(args.output_dir)

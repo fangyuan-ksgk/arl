@@ -1,8 +1,8 @@
 #!/bin/bash
-# Sweep MBE *velocity* reward for Qwen3-1.7B on GSM8K.
+# Sweep MBE *velocity* reward (+ InvLogLength baseline) for Qwen3-1.7B on GSM8K.
 # Layout: GPU 0 = vLLM server, GPU 1 = training (--vllm_mode server).
 #
-# Variants (9 runs total):
+# Variants (12 runs total):
 #   1. baseline                       — pure GRPO (correctness + format), no MBE velocity
 #   2-7. positive MBE velocity        — modes ∈ {trajectory, rollercoaster}
 #                                       weights ∈ {10, 100, 10000}
@@ -11,6 +11,10 @@
 #                                        meaningfully affect group-relative advantage.)
 #   8-9. negative MBE velocity        — modes ∈ {trajectory, rollercoaster}
 #                                       weight = 10000 (penalises high MBE velocity)
+#   10-12. InvLogLength baseline      — pure 1/log(min(T_comp, D)), MBE velocity disabled.
+#                                       Tests whether the diversity numerator in MBE
+#                                       velocity adds signal beyond length normalisation;
+#                                       same weights {10, 100, 10000} as the positive arm.
 #
 # Weight magnitude w is implemented via --mbe_velocity_scale = ±1/w with clip=1.0,
 # so the reward is bounded in [-w, +w]. Negative scale flips sign of the reward.
@@ -137,10 +141,11 @@ trap stop_vllm_server EXIT INT TERM
 #
 # Args:
 #   $1  name          — short tag, used for output dir
-#   $2  mode          — "trajectory" | "rollercoaster"
+#   $2  mode          — "trajectory" | "rollercoaster" | "invlog"
+#                       "invlog" → InvLogLength baseline (MBE velocity disabled).
 #   $3  scale         — float; sign matters. Pass "off" to disable velocity reward
 #                       (logs zeros). With clip=1.0, |reward| ≤ 1/|scale| = weight.
-#                       Negative scale → reward penalises high MBE velocity.
+#                       Negative scale → reward penalises high MBE velocity / length.
 # =============================================
 run_experiment() {
     local name=$1
@@ -154,10 +159,18 @@ run_experiment() {
     echo ">>> [${name}] mode=${mode}, scale=${scale}"
     echo ">>>   Output: ${run_dir}"
 
-    # Build velocity-reward args.
-    # Baseline: disable the reward entirely (no logging contribution either).
+    # Build reward-shaping args. Three regimes:
+    #   mode="invlog"        → InvLogLength on,  MBE velocity off.
+    #   scale="off"          → both off (pure GRPO baseline).
+    #   otherwise            → MBE velocity on,  InvLogLength off (default sweep).
     local velo_args=""
-    if [ "${scale}" = "off" ]; then
+    if [ "${mode}" = "invlog" ]; then
+        velo_args="--no-mbe_velocity_reward \
+            --inv_log_length_reward \
+            --inv_log_length_scale ${scale} \
+            --inv_log_length_clip ${VELO_CLIP} \
+            --mbe_velocity_stride ${VELO_STRIDE}"   # reused as the guard threshold
+    elif [ "${scale}" = "off" ]; then
         velo_args="--no-mbe_velocity_reward"
     else
         velo_args="--mbe_velocity_reward \
@@ -250,22 +263,34 @@ run_cell() {
 # =============================================
 # Experiments
 # =============================================
-# 1) Baseline GRPO (no MBE velocity reward).
-run_cell "baseline_grpo"             trajectory     off
+# NOTE: existing MBE velocity cells (baseline / traj_w* / roll_w* / *_neg_*)
+# are commented out for this run — only the new InvLogLength baseline ladder
+# is active. Re-enable them when running the full 12-cell sweep.
 
-# 2-7) Positive MBE velocity — 2 modes × 3 weight magnitudes (10, 100, 10000)
-#      scale = 1/w, so weight 10=0.1, 100=0.01, 10000=0.0001.
-run_cell "traj_w10"                  trajectory     0.1
-run_cell "traj_w100"                 trajectory     0.01
-run_cell "traj_w10000"               trajectory     0.0001
-run_cell "roll_w10"                  rollercoaster  0.1
-run_cell "roll_w100"                 rollercoaster  0.01
-run_cell "roll_w10000"               rollercoaster  0.0001
+# # 1) Baseline GRPO (no MBE velocity reward).
+# run_cell "baseline_grpo"             trajectory     off
+#
+# # 2-7) Positive MBE velocity — 2 modes × 3 weight magnitudes (10, 100, 10000)
+# #      scale = 1/w, so weight 10=0.1, 100=0.01, 10000=0.0001.
+# run_cell "traj_w10"                  trajectory     0.1
+# run_cell "traj_w100"                 trajectory     0.01
+# run_cell "traj_w10000"               trajectory     0.0001
+# run_cell "roll_w10"                  rollercoaster  0.1
+# run_cell "roll_w100"                 rollercoaster  0.01
+# run_cell "roll_w10000"               rollercoaster  0.0001
+#
+# # 8-9) "Negative" MBE velocity — penalise high MBE velocity, weight = 10000.
+# #      scale = -1/w → reward sign flipped.
+# run_cell "traj_neg_w10000"           trajectory     -0.0001
+# run_cell "roll_neg_w10000"           rollercoaster  -0.0001
 
-# 8-9) "Negative" MBE velocity — penalise high MBE velocity, weight = 10000.
-#      scale = -1/w → reward sign flipped.
-run_cell "traj_neg_w10000"           trajectory     -0.0001
-run_cell "roll_neg_w10000"           rollercoaster  -0.0001
+# 10-12) InvLogLength baseline — 1/log(min(T_comp, D)) with MBE velocity disabled.
+#        Same weight ladder as the positive MBE velocity arm so length-vs-acc curves
+#        can be overlaid directly. If these reproduce traj_w*'s length reduction,
+#        the diversity numerator is doing no work — see analysis note 2026-05-27.
+run_cell "invlog_w10"                invlog         0.1
+run_cell "invlog_w100"               invlog         0.01
+run_cell "invlog_w10000"             invlog         0.0001
 
 # =============================================
 # Final summary
