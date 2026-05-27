@@ -64,26 +64,147 @@ def game24_is_correct(completion_str: str, prompt_str: str) -> bool:
     nums = _nums_from_prompt(prompt_str)
     return bool(nums) and bool(verify_24(nums, extract_expr(completion_str)))
 
-# Progression reward, for correct trajectory
-def placeholder_per_token_reward(prompt_ids, completion_ids, completion_mask, *, tokenizer):
-    """Trajectory-correctness × relative progression. Sanity baseline only."""
+# ==========================================================================
+# Progression reward — distribute reward to each token based on its position
+# ==========================================================================
+# V0. (works well for Qwen3-0.6B, less for Qwen3-4B) only use correctness reward + progress distribution
+# V1. inherits full reward from GRPO trainer & distribute it across tokens
+# V3. scale further by 1 / cot_len, for each token, to encourage shorter response
+# V4. scale the main reward by clipped ver. of "p(a | q, o)", so as to reward more deterministic predictions. 
+# V5. scale the main reward by clipped ver. of "1 / p(a | q, o)", so as to reward rare correct case more
+# V6. per-token reward proportional to "logits entropy" on current token's "next token prediction logits"
+# V7. per-token reward proportional to "1 / (logits entropy)" on current token's "next token prediction logits"
+# V8. per-token reward proportional to "1 / (next token perplexity)" on current token
+# V9. per-token reward proportional to "next token perplexity" on current token
+# V10. per-token reward proportional to "1 / embedding gradient magnitude" on current token, over loss on answer token
+
+
+def progress_per_token_reward(
+    prompt_ids,
+    completion_ids,
+    completion_mask,
+    *,
+    tokenizer,
+    traj_reward=None,
+):
+    """Per-rollout scalar × relative progression ramp.
+
+    Parameters
+    ----------
+    traj_reward : Optional[(B,) tensor]
+        Per-rollout reward from the trainer (weighted sum of all reward
+        functions, before group baselining). When provided, used directly
+        as the per-rollout scale. When ``None``, falls back to internal
+        binary correctness on Game-of-24 — useful for unit testing the
+        reward shape without a trainer.
+    """
     B, T = completion_ids.shape
     device = completion_ids.device
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    traj_r = torch.zeros(B, device=device)
-    for i in range(B):
-        text = tokenizer.decode(
-            completion_ids[i][completion_mask[i].bool()], skip_special_tokens=True,
-        )
-        ptxt = tokenizer.decode(
-            [int(x) for x in prompt_ids[i].tolist() if x != pad_id], skip_special_tokens=True,
-        )
-        nums = _nums_from_prompt(ptxt)
-        traj_r[i] = float(verify_24(nums, extract_expr(text))) if nums else 0.0
+
+    if traj_reward is not None:
+        traj_r = traj_reward.to(device=device, dtype=torch.float32)
+    else:
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+        traj_r = torch.zeros(B, device=device)
+        for i in range(B):
+            text = tokenizer.decode(
+                completion_ids[i][completion_mask[i].bool()], skip_special_tokens=True,
+            )
+            ptxt = tokenizer.decode(
+                [int(x) for x in prompt_ids[i].tolist() if x != pad_id], skip_special_tokens=True,
+            )
+            nums = _nums_from_prompt(ptxt)
+            traj_r[i] = float(verify_24(nums, extract_expr(text))) if nums else 0.0
+
     T_eff = completion_mask.sum(dim=1).clamp(min=1).float()
     pos = torch.arange(T, device=device, dtype=torch.float32)
     ramp = pos.unsqueeze(0) / T_eff.unsqueeze(1)
     return ramp * traj_r.unsqueeze(1) * completion_mask.float()
+
+
+
+def game24_answer_mask(completion_ids, completion_mask, tokenizer):
+    """Mark tokens belonging to the *answer expression* True.
+
+    Used as ``answer_mask_fn`` on :class:`PerTokenAdvantageTrainer` so that
+    ``_embedding_grad_magnitude`` differentiates Σ NLL over answer tokens
+    only (V10 credit assignment) — credit is then attributed to whichever
+    *reasoning* tokens most influence the model's commitment to its final
+    expression.
+
+    Delegates answer extraction to :func:`src.game24utils.extract_expr` (the
+    canonical, reward-hack-hardened parser: requires the marker to live in
+    the post-``</think>`` region). Falls back to "all real tokens" when no
+    expression is found (truncated rollouts) so the gradient still has signal.
+
+    Returns a (B, T) bool tensor on the same device as ``completion_ids``.
+    """
+    B, T = completion_ids.shape
+    device = completion_ids.device
+    out = torch.zeros(B, T, dtype=torch.bool, device=device)
+    for b in range(B):
+        keep = completion_mask[b].bool()
+        n_real = int(keep.sum().item())
+        if n_real == 0:
+            continue
+        text = tokenizer.decode(
+            completion_ids[b][keep], skip_special_tokens=True,
+        )
+        expr = extract_expr(text)
+        if not expr:
+            out[b, :n_real] = True
+            continue
+        n_ans = min(
+            len(tokenizer.encode(expr, add_special_tokens=False)),
+            n_real,
+        )
+        if n_ans == 0:
+            out[b, :n_real] = True
+            continue
+        # Expression tokens are the trailing slice of the real-token span.
+        out[b, n_real - n_ans : n_real] = True
+    return out
+
+
+# ==========================================================================
+# V0–V10 reward variants — Game-of-24 instantiations of `src.reward_fn`
+# ==========================================================================
+# Each ``v*_reward`` here is a fully-wired callable that the trainer can use
+# directly as ``per_token_reward_fn``. V10 *additionally* requires the
+# trainer to be configured with ``answer_mask_fn=game24_answer_mask`` so
+# embedding-grad attribution targets the answer-token NLL only.
+
+from src.reward_fn import (
+    scale_by_inv_length,
+    scale_by_entropy,
+    scale_by_inv_entropy,
+    scale_by_perplexity,
+    scale_by_inv_perplexity,
+    scale_by_inv_grad_mag,
+    scale_by_answer_prob,
+)
+
+v0_reward  = progress_per_token_reward                                            # baseline
+v1_reward  = progress_per_token_reward                                            # alias: trainer always passes traj_reward
+v3_reward  = scale_by_inv_length(progress_per_token_reward)                       # 1 / cot_len
+v4_reward  = scale_by_answer_prob(progress_per_token_reward,                      # × p(a | q, o)
+                                  answer_mask_fn=game24_answer_mask)
+v5_reward  = scale_by_answer_prob(progress_per_token_reward,                      # × 1 / p(a | q, o)
+                                  answer_mask_fn=game24_answer_mask, invert=True)
+v6_reward  = scale_by_entropy(progress_per_token_reward)                          # × entropy
+v7_reward  = scale_by_inv_entropy(progress_per_token_reward)                      # × 1 / entropy
+v8_reward  = scale_by_inv_perplexity(progress_per_token_reward)                   # × 1 / perplexity
+v9_reward  = scale_by_perplexity(progress_per_token_reward)                       # × perplexity
+v10_reward = scale_by_inv_grad_mag(progress_per_token_reward)                     # × 1 / grad_mag
+
+#: Lookup table for variant-driven dispatch (e.g. CLI flag).
+REWARD_VARIANTS = {
+    "v0":  v0_reward,  "v1":  v1_reward,  "v3":  v3_reward,
+    "v4":  v4_reward,  "v5":  v5_reward,
+    "v6":  v6_reward,  "v7":  v7_reward,
+    "v8":  v8_reward,  "v9":  v9_reward,
+    "v10": v10_reward,
+}
 
 
 def game24_task_extras(completion_str: str, query_key) -> dict:
@@ -121,6 +242,9 @@ class EvalFlagCallback(TrainerCallback):
 
 def build_run_name(a) -> str:
     parts = [a.variant]
+    if a.variant == "pt-placeholder":
+        # V0–V10 ablation matters most for the placeholder variant; surface it.
+        parts.append(a.reward)
     if a.variant.startswith("pt-"):
         parts.append(f"adv-{a.adv_mode}")
     if a.variant == "pt-velocity-prefix":
@@ -172,6 +296,11 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", required=True,
                     choices=["grpo", "pt-placeholder", "pt-velocity", "pt-velocity-prefix"])
+    ap.add_argument("--reward", default="v0", choices=sorted(REWARD_VARIANTS.keys()),
+                    help="Per-token reward variant for `pt-placeholder` (ignored otherwise). "
+                         "V0/V1: ramp only. V3: /cot_len. V4/V5: ×p(a|q,o)^±1. "
+                         "V6/V7: ×entropy^±1. V8/V9: ×perplexity^∓1. "
+                         "V10: ×1/grad_mag (answer-token loss).")
     ap.add_argument("--model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
@@ -285,7 +414,20 @@ def main():
         )
 
         if a.variant == "pt-placeholder":
-            kw["per_token_reward_fn"] = placeholder_per_token_reward
+            kw["per_token_reward_fn"] = REWARD_VARIANTS[a.reward]
+            # Wire task-specific hooks so eval/train rollouts carry
+            # `correct`, `numbers`, `expr` — without these, eval accuracy
+            # is unmeasurable (correctness defaults to False everywhere).
+            kw.update(
+                is_correct=game24_is_correct,
+                query_key_fn=game24_query_key,
+                task_extras_fn=game24_task_extras,
+            )
+            # V10 attributes embedding-grad credit to answer-token NLL only.
+            # For every other variant this is a no-op (grad_mag isn't requested).
+            if a.reward == "v10":
+                kw["answer_mask_fn"] = game24_answer_mask
+            print(f"  reward variant: {a.reward}  needs={getattr(REWARD_VARIANTS[a.reward], 'needs', set())}")
         else:
             # velocity route — needs a seeded answer buffer
             answer_buffer = OnlineBuffer(capacity_per_query=a.answer_capacity)

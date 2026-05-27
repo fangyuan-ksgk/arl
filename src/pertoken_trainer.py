@@ -102,6 +102,7 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         is_correct: Optional[Callable[[str, str], bool]] = None,
         query_key_fn: Optional[Callable[[str], Hashable]] = None,
         task_extras_fn: Optional[Callable[[str, Hashable], dict]] = None,
+        answer_mask_fn: Optional[Callable] = None,
         prefix_buffer=None,
         adv_mode: str = "token",
         adv_n_chunks: int = 8,
@@ -125,6 +126,11 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         self.is_correct = is_correct
         self.query_key_fn = query_key_fn
         self.task_extras_fn = task_extras_fn
+        # ``answer_mask_fn(completion_ids, completion_mask, tokenizer)
+        # -> (B, T) bool/int`` — selects which completion tokens contribute
+        # NLL to the scalar that ``_embedding_grad_magnitude`` differentiates.
+        # When None: every real completion token contributes (V8 default).
+        self.answer_mask_fn = answer_mask_fn
         self.prefix_buffer = prefix_buffer
         self.adv_mode = adv_mode
         self.adv_n_chunks = adv_n_chunks
@@ -146,10 +152,166 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         self._inner_step = 0
         self._last_global_step = -1
 
+    # ------------------------------------------------------------------ reward capture
+    def _calculate_rewards(self, *args, **kwargs):
+        rpf = super()._calculate_rewards(*args, **kwargs)
+        # rpf is gathered across processes, shape (B*world_size, num_funcs).
+        self._last_rewards_per_func = rpf
+        return rpf
+
+    def _generate_and_score_completions(self, inputs):
+        self._last_rewards_per_func = None
+        out = super()._generate_and_score_completions(inputs)
+        rpf = getattr(self, "_last_rewards_per_func", None)
+        if rpf is not None:
+            device = rpf.device
+            weights = self.reward_weights.to(device).unsqueeze(0)
+            rewards_full = (rpf * weights).nansum(dim=1)  # (B*world_size,)
+            # Slice to local process — same convention TRL uses for advantages.
+            local = len(out["prompt_ids"])
+            start = self.accelerator.process_index * local
+            out["rewards"] = rewards_full[start : start + local].detach()
+        self._last_rewards_per_func = None
+        return out
+
+    # ------------------------------------------------------------------ token signals
+    #
+    # Per-token signals derived from the *live* policy (NLL/entropy from logits,
+    # gradient magnitude w.r.t. embeddings). Computed on demand based on what
+    # the configured `per_token_reward_fn` declares it needs via a `.needs`
+    # attribute (set of strings). Empty/missing `.needs` → zero overhead.
+    #
+    # All returned tensors are (B, T) aligned with `completion_ids`, masked by
+    # `completion_mask` (zeros at pad positions).
+
+    _SUPPORTED_SIGNALS = {"nll", "entropy", "grad_mag"}
+
+    def _compute_token_signals(self, prompt_ids, completion_ids, mask, needs):
+        if not needs:
+            return {}
+        bad = needs - self._SUPPORTED_SIGNALS
+        if bad:
+            raise ValueError(f"unsupported per-token signals: {sorted(bad)}")
+
+        out: dict = {}
+        model = self.accelerator.unwrap_model(self.model)
+        was_training = model.training
+        model.eval()
+        try:
+            # NLL and entropy share one forward pass — both derive from the
+            # same completion-position logits, so computing them together is
+            # free relative to either alone.
+            if needs & {"nll", "entropy"}:
+                with torch.no_grad():
+                    logits = self._forward_completion_logits(
+                        model, prompt_ids, completion_ids, mask,
+                    )  # (B, T, V) aligned with completion_ids
+                    logp = logits.log_softmax(dim=-1)
+                    m_f  = mask.float()
+                    if "nll" in needs:
+                        out["nll"] = -logp.gather(
+                            -1, completion_ids.unsqueeze(-1)
+                        ).squeeze(-1) * m_f
+                    if "entropy" in needs:
+                        out["entropy"] = -(logp.exp() * logp).sum(dim=-1) * m_f
+            if "grad_mag" in needs:
+                # Needs its own fwd+bwd path — incompatible with no_grad above.
+                # If the trainer was configured with an `answer_mask_fn`, use
+                # it to focus credit on influences on answer tokens only
+                # (V10). Otherwise fall back to all-token credit (V8).
+                loss_mask = None
+                if self.answer_mask_fn is not None:
+                    loss_mask = self.answer_mask_fn(
+                        completion_ids, mask, self.processing_class,
+                    )
+                    if loss_mask.shape != mask.shape:
+                        raise ValueError(
+                            f"answer_mask_fn returned shape {tuple(loss_mask.shape)}, "
+                            f"expected {tuple(mask.shape)}"
+                        )
+                out["grad_mag"] = self._embedding_grad_magnitude(
+                    model, prompt_ids, completion_ids, mask,
+                    loss_mask=loss_mask,
+                )
+        finally:
+            if was_training:
+                model.train()
+        return out
+
+    def _forward_completion_logits(self, model, prompt_ids, completion_ids, mask):
+        """Run one forward over (prompt ⊕ completion) and slice the logits that
+        predict each completion token.
+
+        Returns (B, T, V): position t predicts ``completion_ids[:, t]``.
+        """
+        tok = self.processing_class
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        Bp, Pl = prompt_ids.shape
+        _,  T  = completion_ids.shape
+
+        input_ids = torch.cat([prompt_ids, completion_ids], dim=1)            # (B, P+T)
+        attn      = torch.cat([
+            (prompt_ids != pad_id).long(),
+            mask.long(),
+        ], dim=1)                                                              # (B, P+T)
+        logits = model(input_ids=input_ids, attention_mask=attn).logits        # (B, P+T, V)
+        # logits[:, i] predicts token i+1 → completion tok t lives at index P-1+t.
+        return logits[:, Pl - 1 : Pl - 1 + T, :]
+
+    def _embedding_grad_magnitude(self, model, prompt_ids, completion_ids, mask,
+                                  loss_mask=None):
+        """Per-token L2 norm of ∂(Σ NLL_loss) / ∂(completion input embedding).
+        """
+        tok = self.processing_class
+        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        Bp, Pl = prompt_ids.shape
+        _,  T  = completion_ids.shape
+
+        attn = torch.cat([
+            (prompt_ids != pad_id).long(),
+            mask.long(),
+        ], dim=1)                                                              # (B, P+T)
+
+        embed = model.get_input_embeddings()
+
+        with torch.enable_grad():
+            with torch.no_grad():
+                prompt_embeds = embed(prompt_ids)                              # (B, P, H)
+            # Completion embeds: the gradient anchor.
+            completion_embeds = embed(completion_ids).detach().requires_grad_(True)  # (B, T, H)
+            inputs_embeds = torch.cat([prompt_embeds, completion_embeds], dim=1)     # (B, P+T, H)
+
+            logits = model(
+                inputs_embeds=inputs_embeds, attention_mask=attn,
+            ).logits                                                            # (B, P+T, V)
+            # logits[:, i] predicts token i+1 → completion tok t at index P-1+t.
+            comp_logits = logits[:, Pl - 1 : Pl - 1 + T, :]                     # (B, T, V)
+            logp = comp_logits.log_softmax(dim=-1)
+            nll  = -logp.gather(-1, completion_ids.unsqueeze(-1)).squeeze(-1)   # (B, T)
+            # Default: all real completion tokens contribute (V8). Override
+            # with `loss_mask` to attribute credit only to influences on a
+            # subset (V10: answer tokens only).
+            sel = (loss_mask if loss_mask is not None else mask).float()
+            loss = (nll * sel).sum()
+
+            (grad,) = torch.autograd.grad(
+                loss, completion_embeds,
+                retain_graph=False, create_graph=False,
+            )                                                                   # (B, T, H)
+
+        grad_mag = grad.norm(dim=-1) * mask.float()                             # (B, T)
+        return grad_mag.detach()
+
     # ------------------------------------------------------------------ reward
 
-    def _per_token_reward(self, prompt_ids, completion_ids, mask):
-        """Dispatch to whichever reward route was configured."""
+    def _per_token_reward(self, prompt_ids, completion_ids, mask, *, traj_reward=None):
+        """Dispatch to whichever reward route was configured.
+
+        ``traj_reward`` (Bp,) — TRL's per-rollout raw reward (weighted sum
+        across all reward functions, *no* group baseline). Forwarded to
+        ``per_token_reward_fn`` so callable rewards can ramp-distribute the
+        outcome signal directly instead of recomputing correctness internally.
+        """
         tok = self.processing_class
 
         if self.velocity_computer is not None:
@@ -226,11 +388,17 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
             return r_t, cot_mask
 
         if self.per_token_reward_fn is not None:
-            r_t = self.per_token_reward_fn(
-                prompt_ids, completion_ids, mask, tokenizer=tok,
+            # Reward fn opts into model-internal per-token signals by setting
+            # an iterable `.needs` attribute (e.g. {"nll", "entropy"}). When
+            # absent the fn gets no extra kwargs — zero forward-pass overhead.
+            needs = set(getattr(self.per_token_reward_fn, "needs", ()) or ())
+            signals = self._compute_token_signals(
+                prompt_ids, completion_ids, mask, needs,
             )
-            # Callable route has no CoT/answer split — treat all real tokens
-            # as CoT so advantage pooling is the existing single-pool behavior.
+            r_t = self.per_token_reward_fn(
+                prompt_ids, completion_ids, mask,
+                tokenizer=tok, traj_reward=traj_reward, **signals,
+            )
             return r_t, mask.long()
 
         return None
@@ -265,7 +433,10 @@ class PerTokenAdvantageTrainer(GRPOTrainer):
         mask           = inputs["completion_mask"]   # (Bp, T)
 
         with torch.no_grad():
-            out = self._per_token_reward(prompt_ids, completion_ids, mask)
+            out = self._per_token_reward(
+                prompt_ids, completion_ids, mask,
+                traj_reward=inputs.get("rewards"),
+            )
             if out is None:
                 return super()._compute_loss(model, inputs)
             r_t, cot_mask = out
