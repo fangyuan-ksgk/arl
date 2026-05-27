@@ -1,28 +1,29 @@
 #!/bin/bash
-# Sweep MBE *velocity* reward (+ InvLogLength baseline) for Qwen3-1.7B on GSM8K.
+# Sweep reward shaping designs for Qwen3-1.7B on GSM8K.
 # Layout: GPU 0 = vLLM server, GPU 1 = training (--vllm_mode server).
 #
-# Variants (12 runs total):
-#   1. baseline                       — pure GRPO (correctness + format), no MBE velocity
-#   2-7. positive MBE velocity        — modes ∈ {trajectory, rollercoaster}
-#                                       weights ∈ {10, 100, 10000}
-#                                       (raw reward ~0.01-0.03, vs correctness ~1.0
-#                                        and format ~0.1, so w<10 is too small to
-#                                        meaningfully affect group-relative advantage.)
-#   8-9. negative MBE velocity        — modes ∈ {trajectory, rollercoaster}
-#                                       weight = 10000 (penalises high MBE velocity)
-#   10-12. InvLogLength baseline      — pure 1/log(min(T_comp, D)), MBE velocity disabled.
-#                                       Tests whether the diversity numerator in MBE
-#                                       velocity adds signal beyond length normalisation;
-#                                       same weights {10, 100, 10000} as the positive arm.
+# Variants supported by run_experiment's mode switch:
+#   "trajectory"  / "rollercoaster"  — MBE velocity (hidden-state geometry).
+#                                       raw_v = MBE(q+r) − MBE(q)   [trajectory]
+#                                       or sum of positive MBE jumps  [rollercoaster].
+#   "invlog"                          — InvLogLength baseline (1/log(T_comp), no model fwd).
+#   "entvelo_roll" / "entvelo_traj"   — Rationale-internal entropy velocity.
+#                                       Per-token Δ_t = H(o_{t+1}) − H(o_t),
+#                                       aggregated rollercoaster (Σ max(0,Δ)) or trajectory
+#                                       (= H(o_last) − H(o_first)).
+#   "pplxvelo_roll" / "pplxvelo_traj" — Same shape, X = NLL of realised next token.
+#   "entdensity"                      — Phase contrast: mean(H over rationale) − mean(H over answer).
+#                                       "Reason hard, commit confidently."
+#   "predvelo"                        — Predictive velocity: log p(a|q,o) − log p(a|q),
+#                                       per-token & length-normalised. Two forward passes.
 #
-# Weight magnitude w is implemented via --mbe_velocity_scale = ±1/w with clip=1.0,
+# Weight magnitude w is implemented via --*_scale = ±1/w with clip=1.0,
 # so the reward is bounded in [-w, +w]. Negative scale flips sign of the reward.
 #
-# Eval is on every run; the MBE velocity reward function is *always* attached
-# (even on baseline, just for logging) so its mean/std appears in TRL logs as
-#   rewards/mbe_velocity_<mode>/{mean,std}.
-# To make it a no-op signal on baseline we set its scale extremely large.
+# Eval is on every run (--eval_steps), and the rollout logger writes train/eval
+# rollouts to <output_dir>/{rollouts,eval_rollout}.jsonl regardless of which
+# reward-shaping variant is active. TRL logs reward fns under their __name__:
+#   rewards/mbe_velocity_<mode>/{mean,std}, rewards/entropy_velocity/{...}, etc.
 #
 # Usage:
 #   bash script/sweep_mbe_velocity.sh
@@ -159,17 +160,53 @@ run_experiment() {
     echo ">>> [${name}] mode=${mode}, scale=${scale}"
     echo ">>>   Output: ${run_dir}"
 
-    # Build reward-shaping args. Three regimes:
-    #   mode="invlog"        → InvLogLength on,  MBE velocity off.
-    #   scale="off"          → both off (pure GRPO baseline).
-    #   otherwise            → MBE velocity on,  InvLogLength off (default sweep).
+    # Build reward-shaping args. Regimes (mutually exclusive — exactly one
+    # reward shaper is active per cell, others disabled):
+    #   mode="invlog"                       → InvLogLength baseline (no fwd).
+    #   mode="entvelo_roll"|"entvelo_traj"  → EntropyVelo with that aggregation.
+    #   mode="pplxvelo_roll"|"pplxvelo_traj"→ PerplexityVelo with that aggregation.
+    #   mode="entdensity"                   → EntropyDensity (phase contrast).
+    #   mode="predvelo"                     → PredictiveVelo (two forwards).
+    #   scale="off"                         → both off (pure GRPO baseline).
+    #   otherwise                           → MBE velocity (mode ∈ traj/roll).
+    # All non-MBE shapers reuse --mbe_velocity_stride as the guard threshold.
     local velo_args=""
     if [ "${mode}" = "invlog" ]; then
         velo_args="--no-mbe_velocity_reward \
             --inv_log_length_reward \
             --inv_log_length_scale ${scale} \
             --inv_log_length_clip ${VELO_CLIP} \
-            --mbe_velocity_stride ${VELO_STRIDE}"   # reused as the guard threshold
+            --mbe_velocity_stride ${VELO_STRIDE}"
+    elif [ "${mode}" = "entvelo_roll" ] || [ "${mode}" = "entvelo_traj" ]; then
+        local agg="rollercoaster"
+        [ "${mode}" = "entvelo_traj" ] && agg="trajectory"
+        velo_args="--no-mbe_velocity_reward \
+            --entropy_velocity_reward \
+            --entropy_velocity_scale ${scale} \
+            --entropy_velocity_clip ${VELO_CLIP} \
+            --entropy_velocity_aggregation ${agg} \
+            --mbe_velocity_stride ${VELO_STRIDE}"
+    elif [ "${mode}" = "pplxvelo_roll" ] || [ "${mode}" = "pplxvelo_traj" ]; then
+        local agg="rollercoaster"
+        [ "${mode}" = "pplxvelo_traj" ] && agg="trajectory"
+        velo_args="--no-mbe_velocity_reward \
+            --perplexity_velocity_reward \
+            --perplexity_velocity_scale ${scale} \
+            --perplexity_velocity_clip ${VELO_CLIP} \
+            --perplexity_velocity_aggregation ${agg} \
+            --mbe_velocity_stride ${VELO_STRIDE}"
+    elif [ "${mode}" = "entdensity" ]; then
+        velo_args="--no-mbe_velocity_reward \
+            --entropy_density_reward \
+            --entropy_density_scale ${scale} \
+            --entropy_density_clip ${VELO_CLIP} \
+            --mbe_velocity_stride ${VELO_STRIDE}"
+    elif [ "${mode}" = "predvelo" ]; then
+        velo_args="--no-mbe_velocity_reward \
+            --predictive_velocity_reward \
+            --predictive_velocity_scale ${scale} \
+            --predictive_velocity_clip ${VELO_CLIP} \
+            --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${scale}" = "off" ]; then
         velo_args="--no-mbe_velocity_reward"
     else
@@ -288,9 +325,69 @@ run_cell() {
 #        Same weight ladder as the positive MBE velocity arm so length-vs-acc curves
 #        can be overlaid directly. If these reproduce traj_w*'s length reduction,
 #        the diversity numerator is doing no work — see analysis note 2026-05-27.
-run_cell "invlog_w10"                invlog         0.1
-run_cell "invlog_w100"               invlog         0.01
-run_cell "invlog_w10000"             invlog         0.0001
+# run_cell "invlog_w10"              invlog         0.1
+# run_cell "invlog_w100"             invlog         0.01
+# run_cell "invlog_w10000"           invlog         0.0001
+
+# =============================================
+# Newly added reward shaping designs (2026-05-27)
+#
+# All four families use the same weight ladder {10, 100, 10000} ⇔ scale ∈
+# {0.1, 0.01, 0.0001} as the MBE velocity arm so length / accuracy curves can
+# be overlaid directly across families. Negative-scale variants (penalise
+# rather than reward) are commented out — uncomment if you want a sign-flip
+# ablation. Trajectory variants of the velocity rewards are also commented
+# out (rollercoaster is the recommended default — see class docstrings).
+#
+# Cost note:
+#   entvelo / pplxvelo / entdensity   → 1 forward pass per rollout (cheap).
+#   predvelo                          → 2 forward passes per rollout (~2× slow).
+# =============================================
+
+# 13-15) Entropy velocity (rollercoaster, default aggregation).
+#        Σ_t max(0, H(o_{t+1}) − H(o_t))   over rationale tokens.
+#        High reward ⇒ rationale entropy keeps surging upward (exploration).
+run_cell "entvelo_roll_w10"          entvelo_roll      0.1
+run_cell "entvelo_roll_w100"         entvelo_roll      0.01
+run_cell "entvelo_roll_w10000"       entvelo_roll      0.0001
+# # Trajectory aggregation: H(o_last) − H(o_first). Sign-bearing.
+# run_cell "entvelo_traj_w10000"     entvelo_traj      0.0001
+# # Negative scale: penalise rising rationale entropy.
+# run_cell "entvelo_roll_neg_w10000" entvelo_roll     -0.0001
+
+# 16-18) Perplexity velocity (rollercoaster, default aggregation).
+#        Σ_t max(0, NLL(o_{t+1}) − NLL(o_t))   over rationale tokens.
+#        High reward ⇒ rationale tokens become *more surprising* under the
+#        model's own distribution as it reasons (exploring less-predictable
+#        territory).
+run_cell "pplxvelo_roll_w10"         pplxvelo_roll     0.1
+run_cell "pplxvelo_roll_w100"        pplxvelo_roll     0.01
+run_cell "pplxvelo_roll_w10000"      pplxvelo_roll     0.0001
+# # Trajectory aggregation: NLL(o_last) − NLL(o_first). Sign-bearing.
+# run_cell "pplxvelo_traj_w10000"    pplxvelo_traj     0.0001
+# # Negative scale: penalise rising rationale NLL.
+# run_cell "pplxvelo_roll_neg_w10000" pplxvelo_roll   -0.0001
+
+# 19-21) Entropy density (phase contrast: rationale-mean H vs answer-mean H).
+#        raw_v = mean(H over rationale) − mean(H over answer).
+#        High reward ⇒ "reason hard, then commit" — uncertain rationale,
+#        decisive answer.
+run_cell "entdensity_w10"            entdensity        0.1
+run_cell "entdensity_w100"           entdensity        0.01
+run_cell "entdensity_w10000"         entdensity        0.0001
+# # Negative scale: invert contrast (decisive rationale, uncertain answer).
+# # Useful as a sanity check — should hurt accuracy.
+# run_cell "entdensity_neg_w10000"   entdensity       -0.0001
+
+# 22-24) Predictive velocity (information value of the rationale).
+#        raw_v = mean per-token log p(a|q,o) − log p(a|q).
+#        High reward ⇒ rationale measurably increases the model's confidence
+#        in its own answer. Two forward passes per rollout (~2× slower).
+run_cell "predvelo_w10"              predvelo          0.1
+run_cell "predvelo_w100"             predvelo          0.01
+run_cell "predvelo_w10000"           predvelo          0.0001
+# # Negative scale: penalise informative rationales (sanity / control).
+# run_cell "predvelo_neg_w10000"     predvelo         -0.0001
 
 # =============================================
 # Final summary

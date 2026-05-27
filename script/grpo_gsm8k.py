@@ -17,12 +17,14 @@ Note: vLLM colocate mode is single-GPU only. For multi-GPU, use --no_vllm
 """
 
 import argparse
+import json
 import os
 import re
+from pathlib import Path
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -78,6 +80,87 @@ def format_reward(completions, **kwargs):
         has_format = bool(re.search(r"####\s*[\d,\.\-]+", text))
         rewards.append(0.5 if has_format else 0.0)
     return rewards
+
+
+# ---------------------------------------------------------------------------
+# Rollout logging
+# ---------------------------------------------------------------------------
+# Reward-fn shim that dumps rollouts to JSONL. Returns 0.0 reward (no-op for
+# the optimizer). Routed by `EvalFlagCallback` to either the train log or the
+# eval log via the `in_eval` flag. Mirrors the pattern in
+# `script/run_game24_one.py` (Game24 driver) but adapted to GSM8K fields.
+class GSM8KRolloutLogger:
+    __name__ = "rollout_logger"
+
+    def __init__(self, train_path: Path, eval_path: Path, tokenizer):
+        self.train_path = train_path
+        self.eval_path  = eval_path
+        self.tokenizer  = tokenizer
+        self.in_eval    = False
+        self.train_step = 0
+        self.eval_step  = 0
+        # Trainer.state.global_step at the moment eval was triggered.
+        # Stamped by the driver's EvalFlagCallback; -1 before first step.
+        self.global_step = -1
+
+    def __call__(self, completions, gold_answer, **_):
+        path = self.eval_path if self.in_eval else self.train_path
+        step = self.eval_step if self.in_eval else self.train_step
+        with path.open("a") as f:
+            for i, (c, gold) in enumerate(zip(completions, gold_answer)):
+                text      = _completion_text(c)
+                predicted = extract_answer_from_completion(text)
+                try:
+                    correct = float(predicted) == float(gold)
+                except (ValueError, TypeError):
+                    correct = False
+                n_tok = len(self.tokenizer.encode(text, add_special_tokens=False))
+                # Rationale = everything before the answer marker (####). If no
+                # marker, the whole completion is treated as rationale.
+                m_ans = re.search(r"####", text)
+                cot_text  = text[: m_ans.start()] if m_ans else text
+                n_cot_tok = len(self.tokenizer.encode(cot_text, add_special_tokens=False))
+                f.write(json.dumps({
+                    "step":              step,
+                    "idx":               i,
+                    "gold_answer":       str(gold),
+                    "predicted_answer":  predicted,
+                    "completion":        text,
+                    "correct":           bool(correct),
+                    "n_tokens":          int(n_tok),
+                    "n_cot_tokens":      int(n_cot_tok),
+                    "has_answer_marker": bool(m_ans),
+                    "split":             "eval" if self.in_eval else "train",
+                    "global_step":       int(self.global_step),
+                }) + "\n")
+        if self.in_eval:
+            self.eval_step  += 1
+        else:
+            self.train_step += 1
+        return [0.0] * len(completions)
+
+
+class EvalFlagCallback(TrainerCallback):
+    """Routes reward-fn calls to the right rollout log around eval loops.
+
+    `on_prediction_step` fires per eval batch → flags `in_eval=True`.
+    `on_step_begin` fires at the start of each training step → clears it.
+    That ordering routes every reward-fn call within an eval pass to
+    `eval_rollout.jsonl`, and everything else to `rollouts.jsonl`.
+    """
+    def __init__(self, logger: GSM8KRolloutLogger):
+        self.logger = logger
+
+    def on_prediction_step(self, args, state, control, **kw):
+        self.logger.in_eval     = True
+        self.logger.global_step = state.global_step
+
+    def on_step_begin(self, args, state, control, **kw):
+        self.logger.in_eval     = False
+        self.logger.global_step = state.global_step
+
+    def on_evaluate(self, args, state, control, **kw):
+        self.logger.in_eval = False
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +273,53 @@ def main():
                         help="InvLogLength reward denominator (default 4.0 matches MBE velocity)")
     parser.add_argument("--inv_log_length_clip", type=float, default=1.0,
                         help="Two-sided clip on 1/log(min(T_comp, D))")
+    # Rationale-internal velocity rewards. Per-token velocity X(o_{t+1}) − X(o_t)
+    # summed (telescoping) into endpoint diff X(o_last) − X(o_first), then
+    # length-normalised by log(min(T_comp, D)). Negative scale flips sign.
+    parser.add_argument("--entropy_velocity_reward", action="store_true",
+                        help="Rationale-internal entropy velocity: "
+                             "clip((H(o_last) − H(o_first)) / log(min(T,D)), ±clip) / scale")
+    parser.add_argument("--entropy_velocity_scale", type=float, default=4.0)
+    parser.add_argument("--entropy_velocity_clip",  type=float, default=1.0)
+    parser.add_argument("--entropy_velocity_marker", type=str, default="####",
+                        help="Rationale/answer separator for entropy velocity (defaults to GSM8K convention).")
+    parser.add_argument("--entropy_velocity_aggregation", type=str, default="rollercoaster",
+                        choices=["rollercoaster", "trajectory"],
+                        help="How to aggregate per-token entropy deltas over the rationale. "
+                             "'rollercoaster' (default) sums positive jumps only; "
+                             "'trajectory' uses the endpoint diff H(o_last) − H(o_first).")
+    parser.add_argument("--perplexity_velocity_reward", action="store_true",
+                        help="Rationale-internal perplexity (NLL) velocity: "
+                             "clip((NLL(o_last) − NLL(o_first)) / log(min(T,D)), ±clip) / scale")
+    parser.add_argument("--perplexity_velocity_scale", type=float, default=4.0)
+    parser.add_argument("--perplexity_velocity_clip",  type=float, default=1.0)
+    parser.add_argument("--perplexity_velocity_marker", type=str, default="####",
+                        help="Rationale/answer separator for perplexity velocity (defaults to GSM8K convention).")
+    parser.add_argument("--perplexity_velocity_aggregation", type=str, default="rollercoaster",
+                        choices=["rollercoaster", "trajectory"],
+                        help="How to aggregate per-token NLL deltas over the rationale. "
+                             "'rollercoaster' (default) sums positive jumps only; "
+                             "'trajectory' uses the endpoint diff NLL(o_last) − NLL(o_first).")
+    # Predictive velocity — two forward passes per rollout: log p(a|q,o) − log p(a|q).
+    # Splits completion on `--predictive_marker` (default "####", GSM8K convention).
+    parser.add_argument("--predictive_velocity_reward", action="store_true",
+                        help="Add length-normalised predictive velocity reward: "
+                             "clip((log p(a|q,o) − log p(a|q)) / log(min(T,D)), ±clip) / scale")
+    parser.add_argument("--predictive_velocity_scale", type=float, default=4.0)
+    parser.add_argument("--predictive_velocity_clip",  type=float, default=1.0)
+    parser.add_argument("--predictive_marker", type=str, default="####",
+                        help="Substring that separates rationale from answer in the completion.")
+    # Entropy density — phase contrast "reason hard, then commit".
+    # raw_v = mean(H over rationale)  −  mean(H over answer)
+    # High reward at positive scale = rationale is uncertain, answer is
+    # decisive. Length-normalised by log(min(T_comp, D)).
+    parser.add_argument("--entropy_density_reward", action="store_true",
+                        help="Add entropy density contrast reward: "
+                             "clip((mean H_o − mean H_a) / log(min(T,D)), ±clip) / scale")
+    parser.add_argument("--entropy_density_scale",    type=float, default=4.0)
+    parser.add_argument("--entropy_density_clip",     type=float, default=1.0)
+    parser.add_argument("--entropy_density_marker", type=str, default="####",
+                        help="Rationale/answer separator (defaults to GSM8K convention).")
     # Prefix-conditioned rollout exploration (PCRE)
     parser.add_argument("--prefix_rollout", action="store_true",
                         help="Enable prefix-conditioned rollout exploration")
@@ -247,6 +377,13 @@ def main():
     if args.eval_steps > 0:
         config_kwargs["eval_strategy"] = "steps"
         config_kwargs["eval_steps"] = args.eval_steps
+        # Pre-training baseline eval at global_step=0.
+        config_kwargs["eval_on_start"] = True
+        # Eval forward materialises [batch, seq, vocab] logits and intermediate
+        # softmax tensors. Pin per-device eval batch to one generation group —
+        # the smallest value that satisfies TRL's eval_batch % num_generations
+        # == 0 requirement and keeps eval-side memory comparable to train.
+        config_kwargs["per_device_eval_batch_size"] = args.num_generations
 
     config = GRPOConfig(**config_kwargs)
 
@@ -390,12 +527,96 @@ def main():
         print(f"InvLogLength reward enabled: scale={args.inv_log_length_scale}, "
               f"clip=±{args.inv_log_length_clip}, stride={args.mbe_velocity_stride}")
 
+    # Entropy / perplexity / predictive velocity rewards. All three share the
+    # MBE velocity guard threshold (--mbe_velocity_stride) so guard-failed
+    # rollouts behave consistently across rewards.
+    entropy_velo_obj = None
+    if args.entropy_velocity_reward:
+        from src.mbe_reward import EntropyVeloReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        entropy_velo_obj = EntropyVeloReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale=args.entropy_velocity_scale,
+            clip=args.entropy_velocity_clip,
+            marker=args.entropy_velocity_marker,
+            aggregation=args.entropy_velocity_aggregation,
+        )
+        reward_funcs.append(entropy_velo_obj)
+        print(f"Entropy velocity reward enabled: scale={args.entropy_velocity_scale}, "
+              f"clip=±{args.entropy_velocity_clip}, marker='{args.entropy_velocity_marker}', "
+              f"aggregation='{args.entropy_velocity_aggregation}'")
+
+    perplexity_velo_obj = None
+    if args.perplexity_velocity_reward:
+        from src.mbe_reward import PerplexityVeloReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        perplexity_velo_obj = PerplexityVeloReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale=args.perplexity_velocity_scale,
+            clip=args.perplexity_velocity_clip,
+            marker=args.perplexity_velocity_marker,
+            aggregation=args.perplexity_velocity_aggregation,
+        )
+        reward_funcs.append(perplexity_velo_obj)
+        print(f"Perplexity velocity reward enabled: scale={args.perplexity_velocity_scale}, "
+              f"clip=±{args.perplexity_velocity_clip}, marker='{args.perplexity_velocity_marker}', "
+              f"aggregation='{args.perplexity_velocity_aggregation}'")
+
+    entropy_density_obj = None
+    if args.entropy_density_reward:
+        from src.mbe_reward import EntropyDensityReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        entropy_density_obj = EntropyDensityReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale=args.entropy_density_scale,
+            clip=args.entropy_density_clip,
+            marker=args.entropy_density_marker,
+        )
+        reward_funcs.append(entropy_density_obj)
+        print(f"Entropy density reward enabled: scale={args.entropy_density_scale}, "
+              f"clip=±{args.entropy_density_clip}, marker='{args.entropy_density_marker}'")
+
+    predictive_velo_obj = None
+    if args.predictive_velocity_reward:
+        from src.mbe_reward import PredictiveVeloReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        predictive_velo_obj = PredictiveVeloReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale=args.predictive_velocity_scale,
+            clip=args.predictive_velocity_clip,
+            marker=args.predictive_marker,
+        )
+        reward_funcs.append(predictive_velo_obj)
+        print(f"Predictive velocity reward enabled: scale={args.predictive_velocity_scale}, "
+              f"clip=±{args.predictive_velocity_clip}, marker='{args.predictive_marker}'")
+
     eval_dataset = None
     if args.eval_steps > 0:
         eval_dataset = test_dataset
         if args.eval_samples is not None:
             eval_dataset = test_dataset.select(range(min(args.eval_samples, len(test_dataset))))
         print(f"Eval enabled: {len(eval_dataset)} samples every {args.eval_steps} steps")
+
+    # Rollout logger: dumps every train/eval rollout to JSONL via the reward-fn
+    # shim pattern. Returns 0.0 reward (no-op for the optimizer). Routed to the
+    # eval log during eval loops via `EvalFlagCallback`.
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    train_rollout_path = out_dir / "rollouts.jsonl"
+    eval_rollout_path  = out_dir / "eval_rollout.jsonl"
+    train_rollout_path.write_text("")
+    eval_rollout_path.write_text("")
+    rollout_logger = GSM8KRolloutLogger(
+        train_rollout_path, eval_rollout_path,
+        AutoTokenizer.from_pretrained(args.model),
+    )
+    reward_funcs.append(rollout_logger)
+    print(f"Rollout logger enabled → train: {train_rollout_path}\n"
+          f"                         eval:  {eval_rollout_path}")
 
     trainer = GRPOTrainer(
         model=model,
@@ -404,6 +625,7 @@ def main():
         train_dataset=prefix_dataset if prefix_dataset is not None else train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
+        callbacks=[EvalFlagCallback(rollout_logger)],
     )
 
     # Bind model ref for MBE forward passes (MBEDynamicsLogger only, not RolloutRecorder)
@@ -415,10 +637,21 @@ def main():
         mbe_velo_reward_obj.set_model(trainer.model)
     if inv_log_len_reward_obj is not None:
         inv_log_len_reward_obj.set_model(trainer.model)
+    if entropy_velo_obj is not None:
+        entropy_velo_obj.set_model(trainer.model)
+    if perplexity_velo_obj is not None:
+        perplexity_velo_obj.set_model(trainer.model)
+    if entropy_density_obj is not None:
+        entropy_density_obj.set_model(trainer.model)
+    if predictive_velo_obj is not None:
+        predictive_velo_obj.set_model(trainer.model)
 
     trainer.train()
-    trainer.save_model(args.output_dir)
-    print(f"Training complete. Model saved to {args.output_dir}")
+    if args.save_strategy != "no":
+        trainer.save_model(args.output_dir)
+        print(f"Training complete. Model saved to {args.output_dir}")
+    else:
+        print(f"Training complete. (--save_strategy=no, model not saved.)")
 
 
 if __name__ == "__main__":

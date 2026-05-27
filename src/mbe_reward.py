@@ -406,6 +406,517 @@ class InvLogLengthReward:
         return rewards
 
 
+# ---------------------------------------------------------------------------
+# Rationale-internal velocity rewards (entropy + perplexity).
+#
+# Per-token velocity over the rationale o:
+#       Δ_t = X(o_{t+1}) − X(o_t)        X ∈ {entropy, NLL}
+#
+# Two aggregation modes:
+#   "trajectory":   raw_v = X(o_last) − X(o_first)
+#                          = Σ_t Δ_t                   (telescoping sum)
+#                   Endpoint diff. Insensitive to the path between endpoints.
+#
+#   "rollercoaster" (default): raw_v = Σ_t max(0, Δ_t)
+#                   Sum of positive jumps. Captures sustained upward motion
+#                   along the rationale; oscillation contributes through the
+#                   positive half-swings only. Parallel to MBEVeloReward's
+#                   rollercoaster mode.
+#
+# Both forms then divided by log(min(T_comp, D))   (MBE-velocity convention).
+#
+# Sign conventions ("entropy" mode):
+#   positive raw_v ⇒ model is *exploring* through the rationale (entropy is
+#                    rising or oscillating upward).
+#   negative raw_v ⇒ model is *converging* through the rationale (only
+#                    possible in trajectory mode; rollercoaster floors at 0).
+# "nll" mode: same shape on the realised-token-NLL signal.
+#
+# Distinct from :class:`EntropyDensityReward`, which contrasts rationale-mean
+# vs answer-mean (phase contrast). These rewards measure trends *within* the
+# rationale, with no answer-side dependence.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _compute_rationale_velocity_for_completion(model, tokenizer, prompt,
+                                                completion_text,
+                                                mode: str = "entropy",
+                                                aggregation: str = "rollercoaster",
+                                                marker: str = "####",
+                                                stride: int = 8):
+    """Length-normalised per-token velocity over the rationale.
+
+    Per-token velocity Δ_t = X(o_{t+1}) − X(o_t),   X ∈ {entropy, NLL}.
+
+    aggregation="trajectory":     raw_v = X(o_last) − X(o_first)
+    aggregation="rollercoaster":  raw_v = Σ_t max(0, Δ_t)
+
+    return raw_v / log(min(T_comp, D))   (MBE-velocity-style log normalisation)
+
+    Returns 0.0 if marker absent, rationale too short, or guard fails.
+    """
+    assert mode in ("entropy", "nll"), f"unknown mode: {mode}"
+    assert aggregation in ("trajectory", "rollercoaster"), \
+        f"unknown aggregation: {aggregation}"
+    if marker not in completion_text:
+        return 0.0
+    pre, _ = completion_text.split(marker, 1)
+    rationale_text = pre
+    if not rationale_text.strip():
+        return 0.0
+
+    device = next(model.parameters()).device
+    prompt_text = tokenizer.apply_chat_template(
+        prompt, tokenize=False, add_generation_prompt=True
+    )
+
+    full_text         = prompt_text + completion_text
+    full_ids          = tokenizer(full_text, return_tensors="pt")["input_ids"].to(device)
+    prompt_ids        = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    rationale_end_ids = tokenizer(prompt_text + rationale_text, return_tensors="pt")["input_ids"]
+
+    prompt_len    = prompt_ids.shape[1]
+    rationale_end = rationale_end_ids.shape[1]
+    T_total       = full_ids.shape[1]
+    T_rationale   = rationale_end - prompt_len
+    T_comp        = T_total - prompt_len
+
+    # Need at least 2 rationale tokens to define an endpoint difference.
+    if T_rationale < max(2, 2 * stride) or prompt_len < 2:
+        return 0.0
+
+    logits = model(full_ids, use_cache=False).logits[0]      # (T_total, V)
+    log_p  = torch.log_softmax(logits[:-1].float(), dim=-1)  # (T_total-1, V)
+
+    if mode == "entropy":
+        X_all = -(log_p.exp() * log_p).sum(dim=-1)
+    else:  # "nll"
+        targets = full_ids[0, 1:]
+        X_all   = -log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+    # X[i] is the per-position quantity for the distribution that *generates*
+    # token i+1. So rationale tokens (full_ids[prompt_len .. rationale_end))
+    # are predicted at positions [prompt_len-1 .. rationale_end-1).
+    X_rationale = X_all[prompt_len - 1 : rationale_end - 1]
+    if X_rationale.numel() < 2:
+        return 0.0
+
+    # Δ_t = X(o_{t+1}) − X(o_t) over rationale tokens
+    deltas = X_rationale[1:] - X_rationale[:-1]
+    if aggregation == "trajectory":
+        raw_v = deltas.sum().item()                          # = X[-1] − X[0]
+    else:  # "rollercoaster"
+        raw_v = torch.clamp(deltas, min=0.0).sum().item()
+    D           = logits.shape[-1]
+    length_norm = math.log(min(T_comp, D))
+    return raw_v / length_norm
+
+
+class EntropyVeloReward:
+    """Rationale-internal entropy velocity reward.
+
+    Per-token velocity Δ_t = H(o_{t+1}) − H(o_t) over rationale, aggregated
+    by `aggregation`:
+
+        "rollercoaster" (default):  raw_v = Σ_t max(0, Δ_t)
+        "trajectory":               raw_v = Σ_t Δ_t = H(o_last) − H(o_first)
+
+        reward = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+
+    Rollercoaster default rationale: it captures sustained upward motion in
+    rationale entropy and floors at 0 (no negative half-swings), which we
+    found stabilises training relative to the trajectory endpoint diff.
+
+    Sign at positive scale (rollercoaster mode is non-negative):
+      large reward ⇒ rationale entropy has many upward jumps (exploration).
+      ~0 reward    ⇒ entropy is monotone non-increasing across the trace.
+    For trajectory mode, negative reward indicates convergent reasoning.
+    Pass negative scale to flip the preferred direction.
+
+    Splits completion on `marker` (default "####") to identify the rationale.
+    Returns 0.0 reward for format-violating completions without the marker.
+
+    Distinct from :class:`EntropyDensityReward` (phase contrast: rationale vs
+    answer) — this one measures dynamics *within* the rationale.
+
+    Cost: one forward pass per rollout.
+    """
+
+    def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
+                 clip: float = 1.0, marker: str = "####",
+                 aggregation: str = "rollercoaster"):
+        self.__name__ = "entropy_velocity"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale = scale
+        self.clip = clip
+        self.marker = marker
+        self.aggregation = aggregation
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+        if self.model is None:
+            return [0.0] * len(completions)
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            completion_text = completion[0]["content"]
+            v = _compute_rationale_velocity_for_completion(
+                self.model, self.tokenizer, prompt, completion_text,
+                mode="entropy", aggregation=self.aggregation,
+                marker=self.marker, stride=self.stride,
+            )
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / self.scale)
+        return rewards
+
+
+class PerplexityVeloReward:
+    """Rationale-internal perplexity (NLL) velocity reward.
+
+    Per-token velocity Δ_t = NLL(o_{t+1}) − NLL(o_t) over rationale,
+    aggregated by `aggregation`:
+
+        "rollercoaster" (default):  raw_v = Σ_t max(0, Δ_t)
+        "trajectory":               raw_v = Σ_t Δ_t = NLL(o_last) − NLL(o_first)
+
+        reward = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+
+    Rollercoaster default rationale: it captures sustained upward motion in
+    rationale NLL and floors at 0 (no negative half-swings), which we found
+    stabilises training relative to the trajectory endpoint diff.
+
+    Sign at positive scale (rollercoaster mode is non-negative):
+      large reward ⇒ rationale tokens repeatedly become *more surprising*
+                     under the model's own distribution (exploring less-
+                     predictable territory).
+      ~0 reward    ⇒ NLL is monotone non-increasing across the trace.
+    For trajectory mode, negative reward indicates the model finds its
+    rationale more predictable as it goes.
+    Pass negative scale to flip the preferred direction.
+
+    Splits completion on `marker` (default "####") to identify the rationale.
+    Returns 0.0 reward for format-violating completions without the marker.
+
+    Distinct from any phase-contrast reward — this measures dynamics *within*
+    the rationale, not across the rationale/answer boundary.
+
+    Cost: one forward pass per rollout.
+    """
+
+    def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
+                 clip: float = 1.0, marker: str = "####",
+                 aggregation: str = "rollercoaster"):
+        self.__name__ = "perplexity_velocity"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale = scale
+        self.clip = clip
+        self.marker = marker
+        self.aggregation = aggregation
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+        if self.model is None:
+            return [0.0] * len(completions)
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            completion_text = completion[0]["content"]
+            v = _compute_rationale_velocity_for_completion(
+                self.model, self.tokenizer, prompt, completion_text,
+                mode="nll", aggregation=self.aggregation,
+                marker=self.marker, stride=self.stride,
+            )
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / self.scale)
+        return rewards
+
+
+# ---------------------------------------------------------------------------
+# Phase-contrast rewards (entropy density + perplexity density).
+#
+# Both rewards share the same skeleton: split the completion on `marker`
+# (default "####"), compute a per-position quantity X (entropy or NLL),
+# contrast its mean over the rationale tokens vs the answer tokens, and
+# normalise by log(min(T_comp, D)) — the MBE-velocity convention.
+#
+#       raw_v  = mean(X over rationale)  −  mean(X over answer)
+#       reward = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+#
+# X="entropy" → high reward when rationale is uncertain, answer decisive
+#               (explore-then-commit).
+# X="nll"     → high reward when rationale tokens are surprising (high NLL,
+#               model didn't predict its own choices well = exploratory)
+#               and answer tokens are predictable (low NLL = decisive).
+# Both modes encode the "reason hard, commit confidently" intuition.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _compute_phase_contrast_for_completion(model, tokenizer, prompt,
+                                            completion_text,
+                                            mode: str = "entropy",
+                                            marker: str = "####",
+                                            stride: int = 8):
+    """Length-normalised rationale-vs-answer contrast for a single rollout.
+
+    mode="entropy":  X = Shannon entropy of softmax(logits) at each position.
+    mode="nll":      X = -log p(realised next token) at each position.
+
+    raw_v  = mean X over rationale predictions − mean X over answer predictions
+    return raw_v / log(min(T_comp, D))   (MBE-velocity-style log normalisation)
+
+    Returns 0.0 if marker absent, rationale/answer too short, or guard fails.
+    """
+    assert mode in ("entropy", "nll"), f"unknown mode: {mode}"
+    if marker not in completion_text:
+        return 0.0
+    pre, post = completion_text.split(marker, 1)
+    rationale_text = pre
+    answer_text    = marker + post
+    if not rationale_text.strip() or not answer_text.strip():
+        return 0.0
+
+    device = next(model.parameters()).device
+    prompt_text = tokenizer.apply_chat_template(
+        prompt, tokenize=False, add_generation_prompt=True
+    )
+
+    # Tokenisation boundaries:
+    #   prompt_len    = where rationale starts (in full_ids)
+    #   rationale_end = where answer starts   (in full_ids)
+    #   T_total       = full sequence length
+    full_text         = prompt_text + completion_text
+    full_ids          = tokenizer(full_text, return_tensors="pt")["input_ids"].to(device)
+    prompt_ids        = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    rationale_end_ids = tokenizer(prompt_text + rationale_text, return_tensors="pt")["input_ids"]
+
+    prompt_len    = prompt_ids.shape[1]
+    rationale_end = rationale_end_ids.shape[1]
+    T_total       = full_ids.shape[1]
+    T_rationale   = rationale_end - prompt_len
+    T_answer      = T_total - rationale_end
+    T_comp        = T_total - prompt_len
+
+    if T_rationale < 2 * stride or T_answer < 1 or prompt_len < 2:
+        return 0.0
+
+    logits = model(full_ids, use_cache=False).logits[0]      # (T_total, V)
+
+    # X[i] is the per-position quantity for the distribution that *generates*
+    # token i+1. So rationale tokens (full_ids[prompt_len .. rationale_end))
+    # are predicted at positions [prompt_len-1 .. rationale_end-1).
+    log_p = torch.log_softmax(logits[:-1].float(), dim=-1)   # (T_total-1, V)
+    if mode == "entropy":
+        X_all = -(log_p.exp() * log_p).sum(dim=-1)           # (T_total-1,)
+    else:  # "nll"
+        targets = full_ids[0, 1:]                            # (T_total-1,)
+        X_all   = -log_p.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+    X_rationale = X_all[prompt_len - 1 : rationale_end - 1]
+    X_answer    = X_all[rationale_end - 1 : T_total - 1]
+    if X_rationale.numel() < 1 or X_answer.numel() < 1:
+        return 0.0
+
+    raw_v       = X_rationale.mean().item() - X_answer.mean().item()
+    D           = logits.shape[-1]
+    length_norm = math.log(min(T_comp, D))
+    return raw_v / length_norm
+
+
+class EntropyDensityReward:
+    """Length-normalised entropy contrast reward.
+
+    raw_v   = mean(H over rationale)  −  mean(H over answer)
+    reward  = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+
+    Encodes: "reason uncertainly, commit confidently". Same log-length
+    normalisation as MBE / entropy / perplexity velocity for direct
+    comparability; gentle length pressure rather than aggressive linear.
+
+    Splits completion on `marker` (default "####", GSM8K convention). Returns
+    0.0 reward for completions without the marker, so format-violators are
+    silently skipped (consistent with PredictiveVeloReward).
+
+    Magnitude note: raw_v ~ O(1) in nats; log(min(T_comp, D)) ~ 5-7 → raw
+    reward typically ~0.1-0.5 before scaling. Default scale=4.0 (matching
+    MBE velocity) gives reward magnitudes ~0.025-0.125 after clip. Bump
+    scale smaller (e.g. 0.4 ≡ w=10) for stronger weighting.
+
+    Cost: one forward pass per rollout.
+    """
+
+    def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
+                 clip: float = 1.0, marker: str = "####"):
+        self.__name__ = "entropy_density"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale = scale
+        self.clip = clip
+        self.marker = marker
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+        if self.model is None:
+            return [0.0] * len(completions)
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            completion_text = completion[0]["content"]
+            v = _compute_phase_contrast_for_completion(
+                self.model, self.tokenizer, prompt, completion_text,
+                mode="entropy", marker=self.marker, stride=self.stride,
+            )
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / self.scale)
+        return rewards
+
+
+# ---------------------------------------------------------------------------
+# Predictive velocity — measures the information value of the rationale.
+#
+#   raw_v = log p(a | q, o) − log p(a | q)
+#
+# Two forward passes per rollout: one with rationale, one without. The
+# rationale o is everything in the completion *before* the "####" marker;
+# the answer a is everything after. For GSM8K specifically, this isolates
+# whether the chain-of-thought is actually contributing to answer-likelihood.
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def _compute_predictive_velocity_for_completion(model, tokenizer, prompt,
+                                                 completion_text,
+                                                 stride: int = 8,
+                                                 marker: str = "####"):
+    """Length-normalised predictive velocity for a single rollout.
+
+    Splits completion on `marker` (default "####", GSM8K convention) into
+    rationale `o` and answer-region `a`. Computes log p(a | q, o) and
+    log p(a | q) via two forward passes, then returns
+        ( log p(a|q,o) − log p(a|q) ) / log(min(T_comp, D)).
+
+    Returns 0.0 if:
+      - completion contains no marker (unparseable)
+      - rationale or answer is empty after split
+      - T_comp < 2·stride or prompt_len < 2 (parity with MBE velocity guard)
+      - either tokenisation produces zero answer tokens
+    """
+    if marker not in completion_text:
+        return 0.0
+    pre, post = completion_text.split(marker, 1)
+    rationale_text = pre
+    # Keep marker on the answer side so both sequences see "####" before `a`.
+    # This isolates the rationale's contribution rather than confounding it
+    # with the model's prior on the marker token itself.
+    answer_text = marker + post
+    if not rationale_text.strip() or not answer_text.strip():
+        return 0.0
+
+    device = next(model.parameters()).device
+    prompt_text = tokenizer.apply_chat_template(
+        prompt, tokenize=False, add_generation_prompt=True
+    )
+
+    # Sequence A: q + o + a   (rationale present)
+    seq_a_text = prompt_text + rationale_text + answer_text
+    # Sequence B: q + a       (rationale ablated)
+    seq_b_text = prompt_text + answer_text
+
+    qoa_ids   = tokenizer(seq_a_text, return_tensors="pt")["input_ids"].to(device)
+    qa_ids    = tokenizer(seq_b_text, return_tensors="pt")["input_ids"].to(device)
+    q_ids     = tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+    qo_ids    = tokenizer(prompt_text + rationale_text, return_tensors="pt")["input_ids"]
+
+    prompt_len = q_ids.shape[1]
+    T_total    = qoa_ids.shape[1]
+    T_comp     = T_total - prompt_len
+    if T_comp < 2 * stride or prompt_len < 2:
+        return 0.0
+
+    # Answer span boundaries — the answer tokens are everything after the
+    # rationale in each sequence. We compute log p only over those positions.
+    a_start_in_qoa = qo_ids.shape[1]
+    a_start_in_qa  = q_ids.shape[1]
+    n_ans_qoa      = qoa_ids.shape[1] - a_start_in_qoa
+    n_ans_qa       = qa_ids.shape[1]  - a_start_in_qa
+    if n_ans_qoa < 1 or n_ans_qa < 1:
+        return 0.0
+
+    def _seq_answer_logp(input_ids, a_start, n_ans):
+        # logits[t] predicts token t+1 → answer token at idx i in input_ids
+        # is predicted by logits[i-1]. We want positions [a_start-1 .. T-2]
+        # (length n_ans) and target tokens [a_start .. T-1].
+        logits = model(input_ids, use_cache=False).logits[0]   # (T, V)
+        log_p  = torch.log_softmax(logits[a_start - 1 : a_start - 1 + n_ans].float(), dim=-1)
+        targets = input_ids[0, a_start : a_start + n_ans]
+        return log_p.gather(1, targets.unsqueeze(1)).squeeze(1).sum().item()
+
+    logp_a_given_qo = _seq_answer_logp(qoa_ids, a_start_in_qoa, n_ans_qoa)
+    logp_a_given_q  = _seq_answer_logp(qa_ids,  a_start_in_qa,  n_ans_qa)
+
+    # Per-token normalisation across the two sequences keeps raw_v on a
+    # comparable scale even when retokenisation makes n_ans differ slightly
+    # between (q + o + a) and (q + a) — common when leading whitespace
+    # gets re-merged at the rationale/answer boundary.
+    raw_v = (logp_a_given_qo / max(n_ans_qoa, 1)) - (logp_a_given_q / max(n_ans_qa, 1))
+
+    D = model.config.hidden_size
+    length_norm = math.log(min(T_comp, D))
+    return raw_v / length_norm
+
+
+class PredictiveVeloReward:
+    """Length-normalised *predictive velocity* reward.
+
+    raw_v   = mean log p(a | q, o) − mean log p(a | q)
+    reward  = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+
+    Splits the completion on `marker` (default "####") into rationale (`o`)
+    and answer (`a`). Two forward passes per rollout. Positive reward at
+    positive scale rewards rationales that *increase* the model's
+    confidence in the answer; negative scale rewards rationales that
+    *decrease* it (a sanity-check direction — should hurt accuracy).
+
+    Cost: 2× the forward passes of EntropyVelo / PerplexityVelo. Skips
+    rollouts without a `####` marker (returns 0.0), so format-violating
+    rollouts contribute neither signal nor noise.
+    """
+
+    def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
+                 clip: float = 1.0, marker: str = "####"):
+        self.__name__ = "predictive_velocity"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale = scale
+        self.clip = clip
+        self.marker = marker
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+        if self.model is None:
+            return [0.0] * len(completions)
+        rewards = []
+        for prompt, completion in zip(prompts, completions):
+            completion_text = completion[0]["content"]
+            v = _compute_predictive_velocity_for_completion(
+                self.model, self.tokenizer, prompt, completion_text,
+                stride=self.stride, marker=self.marker,
+            )
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / self.scale)
+        return rewards
+
+
 class CorrectnessGatedMBEReward:
     """
     Correctness-gated MBE reward with clipping and scaling.
