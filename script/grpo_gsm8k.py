@@ -273,6 +273,23 @@ def main():
                         help="InvLogLength reward denominator (default 4.0 matches MBE velocity)")
     parser.add_argument("--inv_log_length_clip", type=float, default=1.0,
                         help="Two-sided clip on 1/log(min(T_comp, D))")
+    # Correctness-gated InvLogLength: sign of the reward flipped by whether the
+    # rollout's answer matches the gold answer.
+    # Operationalises the asymmetric shaping hypothesis (analysis note
+    # 2026-05-27): longer CoT for failed cases, shorter for successful ones.
+    parser.add_argument("--gated_inv_log_length_reward", action="store_true",
+                        help="Add correctness-gated InvLogLength reward: "
+                             "reward = clip(1/log(min(T,D)),±clip) / scale_correct "
+                             "if correct, else / scale_incorrect. With "
+                             "scale_correct=+0.1, scale_incorrect=-0.1: correct "
+                             "rollouts get pushed shorter, incorrect ones longer.")
+    parser.add_argument("--gated_inv_log_length_scale_correct",   type=float, default=0.1,
+                        help="Reward divisor for correct rollouts (default 0.1 → w_correct=+10)")
+    parser.add_argument("--gated_inv_log_length_scale_incorrect", type=float, default=-0.1,
+                        help="Reward divisor for incorrect rollouts (default -0.1 → w_incorrect=-10). "
+                             "Set to 0 to disable the incorrect arm (= pure 'reward short when right').")
+    parser.add_argument("--gated_inv_log_length_clip",            type=float, default=1.0,
+                        help="Two-sided clip on 1/log(min(T_comp, D))")
     # Rationale-internal velocity rewards. Per-token velocity X(o_{t+1}) − X(o_t)
     # summed (telescoping) into endpoint diff X(o_last) − X(o_first), then
     # length-normalised by log(min(T_comp, D)). Negative scale flips sign.
@@ -526,6 +543,25 @@ def main():
         reward_funcs.append(inv_log_len_reward_obj)
         print(f"InvLogLength reward enabled: scale={args.inv_log_length_scale}, "
               f"clip=±{args.inv_log_length_clip}, stride={args.mbe_velocity_stride}")
+
+    # Correctness-gated InvLogLength (asymmetric shaping: sign flipped by correctness).
+    gated_inv_log_len_obj = None
+    if args.gated_inv_log_length_reward:
+        from src.mbe_reward import CorrectnessGatedInvLogLengthReward
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        sc_inc = args.gated_inv_log_length_scale_incorrect
+        gated_inv_log_len_obj = CorrectnessGatedInvLogLengthReward(
+            tokenizer,
+            stride=args.mbe_velocity_stride,
+            scale_correct=args.gated_inv_log_length_scale_correct,
+            scale_incorrect=(None if sc_inc == 0.0 else sc_inc),
+            clip=args.gated_inv_log_length_clip,
+        )
+        reward_funcs.append(gated_inv_log_len_obj)
+        print(f"Gated InvLogLength reward enabled: "
+              f"scale_correct={args.gated_inv_log_length_scale_correct}, "
+              f"scale_incorrect={sc_inc}, "
+              f"clip=±{args.gated_inv_log_length_clip}, stride={args.mbe_velocity_stride}")
 
     # Entropy / perplexity / predictive velocity rewards. All three share the
     # MBE velocity guard threshold (--mbe_velocity_stride) so guard-failed

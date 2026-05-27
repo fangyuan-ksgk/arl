@@ -207,6 +207,19 @@ run_experiment() {
             --predictive_velocity_scale ${scale} \
             --predictive_velocity_clip ${VELO_CLIP} \
             --mbe_velocity_stride ${VELO_STRIDE}"
+    elif [ "${mode}" = "longshort" ]; then
+        # Correctness-gated InvLogLength (asymmetric shaping):
+        #   scale_correct   = +${scale}   → e.g. 0.1 ⇒ w_correct = +10
+        #   scale_incorrect = -${scale}   → e.g. 0.1 ⇒ w_incorrect = -10
+        # Reward is positive on correct rollouts (push shorter) and negative
+        # on incorrect ones (push longer). Symmetric magnitude.
+        local sc_inc=$(python -c "print(-(${scale}))")
+        velo_args="--no-mbe_velocity_reward \
+            --gated_inv_log_length_reward \
+            --gated_inv_log_length_scale_correct ${scale} \
+            --gated_inv_log_length_scale_incorrect ${sc_inc} \
+            --gated_inv_log_length_clip ${VELO_CLIP} \
+            --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${scale}" = "off" ]; then
         velo_args="--no-mbe_velocity_reward"
     else
@@ -325,9 +338,17 @@ run_cell() {
 #        Same weight ladder as the positive MBE velocity arm so length-vs-acc curves
 #        can be overlaid directly. If these reproduce traj_w*'s length reduction,
 #        the diversity numerator is doing no work — see analysis note 2026-05-27.
-# run_cell "invlog_w10"              invlog         0.1
-# run_cell "invlog_w100"             invlog         0.01
-# run_cell "invlog_w10000"           invlog         0.0001
+# Positive scale: reward 1/log(T) is positive → optimizer drives T DOWN → short CoT.
+run_cell "invlog_short_w10"        invlog          0.1
+run_cell "invlog_short_w100"       invlog          0.01
+run_cell "invlog_short_w10000"     invlog          0.0001
+
+# Negative scale: reward 1/log(T) is negative (penalty for being short) →
+# optimizer drives T UP → long CoT. Same magnitude ladder for fair comparison.
+run_cell "invlog_long_w10"         invlog         -0.1
+run_cell "invlog_long_w100"        invlog         -0.01
+run_cell "invlog_long_w10000"      invlog         -0.0001
+
 
 # =============================================
 # Newly added reward shaping designs (2026-05-27)
@@ -344,50 +365,36 @@ run_cell() {
 #   predvelo                          → 2 forward passes per rollout (~2× slow).
 # =============================================
 
-# 13-15) Entropy velocity (rollercoaster, default aggregation).
-#        Σ_t max(0, H(o_{t+1}) − H(o_t))   over rationale tokens.
-#        High reward ⇒ rationale entropy keeps surging upward (exploration).
-run_cell "entvelo_roll_w10"          entvelo_roll      0.1
-run_cell "entvelo_roll_w100"         entvelo_roll      0.01
-run_cell "entvelo_roll_w10000"       entvelo_roll      0.0001
-# # Trajectory aggregation: H(o_last) − H(o_first). Sign-bearing.
-# run_cell "entvelo_traj_w10000"     entvelo_traj      0.0001
-# # Negative scale: penalise rising rationale entropy.
-# run_cell "entvelo_roll_neg_w10000" entvelo_roll     -0.0001
+# 13-15) Entropy velocity (rollercoaster). Σ_t max(0, H(o_{t+1}) − H(o_t)).
+# run_cell "entvelo_roll_w10"          entvelo_roll      0.1
+# run_cell "entvelo_roll_w100"         entvelo_roll      0.01
+# run_cell "entvelo_roll_w10000"       entvelo_roll      0.0001
 
-# 16-18) Perplexity velocity (rollercoaster, default aggregation).
-#        Σ_t max(0, NLL(o_{t+1}) − NLL(o_t))   over rationale tokens.
-#        High reward ⇒ rationale tokens become *more surprising* under the
-#        model's own distribution as it reasons (exploring less-predictable
-#        territory).
-run_cell "pplxvelo_roll_w10"         pplxvelo_roll     0.1
-run_cell "pplxvelo_roll_w100"        pplxvelo_roll     0.01
-run_cell "pplxvelo_roll_w10000"      pplxvelo_roll     0.0001
-# # Trajectory aggregation: NLL(o_last) − NLL(o_first). Sign-bearing.
-# run_cell "pplxvelo_traj_w10000"    pplxvelo_traj     0.0001
-# # Negative scale: penalise rising rationale NLL.
-# run_cell "pplxvelo_roll_neg_w10000" pplxvelo_roll   -0.0001
+# 16-18) Perplexity velocity (rollercoaster). Σ_t max(0, NLL(o_{t+1}) − NLL(o_t)).
+# run_cell "pplxvelo_roll_w10"         pplxvelo_roll     0.1
+# run_cell "pplxvelo_roll_w100"        pplxvelo_roll     0.01
+# run_cell "pplxvelo_roll_w10000"      pplxvelo_roll     0.0001
 
-# 19-21) Entropy density (phase contrast: rationale-mean H vs answer-mean H).
-#        raw_v = mean(H over rationale) − mean(H over answer).
-#        High reward ⇒ "reason hard, then commit" — uncertain rationale,
-#        decisive answer.
-run_cell "entdensity_w10"            entdensity        0.1
-run_cell "entdensity_w100"           entdensity        0.01
-run_cell "entdensity_w10000"         entdensity        0.0001
-# # Negative scale: invert contrast (decisive rationale, uncertain answer).
-# # Useful as a sanity check — should hurt accuracy.
-# run_cell "entdensity_neg_w10000"   entdensity       -0.0001
+# 19-21) Entropy density (mean H rationale − mean H answer).
+# run_cell "entdensity_w10"            entdensity        0.1
+# run_cell "entdensity_w100"           entdensity        0.01
+# run_cell "entdensity_w10000"         entdensity        0.0001
 
-# 22-24) Predictive velocity (information value of the rationale).
-#        raw_v = mean per-token log p(a|q,o) − log p(a|q).
-#        High reward ⇒ rationale measurably increases the model's confidence
-#        in its own answer. Two forward passes per rollout (~2× slower).
+# 22-24) Predictive velocity (log p(a|q,o) − log p(a|q)). Two forwards/rollout.
 run_cell "predvelo_w10"              predvelo          0.1
-run_cell "predvelo_w100"             predvelo          0.01
-run_cell "predvelo_w10000"           predvelo          0.0001
-# # Negative scale: penalise informative rationales (sanity / control).
-# run_cell "predvelo_neg_w10000"     predvelo         -0.0001
+# run_cell "predvelo_w100"             predvelo          0.01
+# run_cell "predvelo_w10000"           predvelo          0.0001
+
+# =============================================
+# Active cells (2026-05-28) — longshort gated InvLogLength only.
+# Asymmetric shaping: longer CoT for failed cases, shorter for successful ones.
+# scale 0.1 ⇒ w_correct=+10, w_incorrect=−10 (handled in run_experiment's
+# `longshort` branch).
+# =============================================
+run_cell "longshort_w10"             longshort         0.1
+run_cell "longshort_w100"            longshort         0.01
+run_cell "longshort_w10000"          longshort         0.0001
+
 
 # =============================================
 # Final summary

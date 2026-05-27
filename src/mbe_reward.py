@@ -2,8 +2,11 @@
 # --------------------------------------------------
 
 import math
-import torch
 import re
+from typing import Optional
+
+import torch
+
 from src.mbe import mbe_reverse_gram
 
 
@@ -403,6 +406,96 @@ class InvLogLengthReward:
             v = 1.0 / length_norm
             v = max(-self.clip, min(v, self.clip))            # parity w/ MBEVeloReward
             rewards.append(v / self.scale)
+        return rewards
+
+
+class CorrectnessGatedInvLogLengthReward:
+    """InvLogLength reward with the sign of the reward gated on correctness.
+
+    Operationalises the *asymmetric shaping* hypothesis: "longer CoT for
+    failed cases, shorter for successful ones".
+
+    For each completion:
+        is_correct → reward = clip(+1/log(min(T_comp, D)), ±clip) / scale_correct
+        else       → reward = clip(+1/log(min(T_comp, D)), ±clip) / scale_incorrect
+
+    Typical use:
+        scale_correct   = +1/w_correct    (e.g. +0.1 → w_correct=+10)
+        scale_incorrect = +1/w_incorrect  (e.g. -0.1 → w_incorrect=-10)
+
+    With ``scale_correct=+0.1`` and ``scale_incorrect=-0.1`` the reward is
+    positive on correct rollouts (the optimizer shortens them) and negative
+    on incorrect rollouts (the optimizer lengthens them). Setting
+    ``scale_incorrect=None`` makes incorrect rollouts contribute 0 reward
+    (pure "reward short when right" mode).
+
+    Mirrors :class:`InvLogLengthReward` for tokenisation / guard logic so
+    the length-pressure component is identical to the ungated baseline.
+    Correctness is decided by ``extract_answer_from_completion`` + float
+    compare against ``gold_answer`` (GSM8K convention).
+    """
+
+    def __init__(self, tokenizer, stride: int = 8,
+                 scale_correct: float = 0.1,
+                 scale_incorrect: Optional[float] = -0.1,
+                 clip: float = 1.0):
+        self.__name__ = "gated_inv_log_length"
+        self.model = None
+        self.tokenizer = tokenizer
+        self.stride = stride
+        self.scale_correct = scale_correct
+        self.scale_incorrect = scale_incorrect
+        self.clip = clip
+
+    def set_model(self, model):
+        self.model = model
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, gold_answer=None, **kwargs) -> list[float]:
+        if gold_answer is None:
+            return [0.0] * len(completions)
+
+        D = getattr(getattr(self.model, "config", None), "hidden_size", 2048) \
+            if self.model is not None else 2048
+
+        rewards = []
+        for prompt, completion, gold in zip(prompts, completions, gold_answer):
+            completion_text = completion[0]["content"]
+
+            # Correctness gate (GSM8K-style: extract `#### <num>` and float-compare).
+            predicted = extract_answer_from_completion(completion_text)
+            try:
+                is_correct = float(predicted) == float(gold)
+            except (ValueError, TypeError):
+                is_correct = False
+
+            sc = self.scale_correct if is_correct else self.scale_incorrect
+            if sc is None or sc == 0.0:
+                rewards.append(0.0)
+                continue
+
+            # Tokenisation mirrors InvLogLengthReward so T_comp is identical.
+            try:
+                prompt_text = self.tokenizer.apply_chat_template(
+                    prompt, tokenize=False, add_generation_prompt=True,
+                )
+            except Exception:
+                prompt_text = prompt if isinstance(prompt, str) else str(prompt)
+            full_text  = prompt_text + completion_text
+            prompt_ids = self.tokenizer(prompt_text, return_tensors="pt")["input_ids"]
+            full_ids   = self.tokenizer(full_text,   return_tensors="pt")["input_ids"]
+            prompt_len = prompt_ids.shape[1]
+            T_total    = full_ids.shape[1]
+            T_comp     = T_total - prompt_len
+
+            if T_comp < 2 * self.stride or prompt_len < 2:
+                rewards.append(0.0)
+                continue
+
+            length_norm = math.log(min(T_comp, D))            # > 0
+            v = 1.0 / length_norm
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / sc)
         return rewards
 
 
