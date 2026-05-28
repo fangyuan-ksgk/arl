@@ -286,6 +286,10 @@ def main():
                         help="Run eval every N steps (0 to disable)")
     parser.add_argument("--eval_samples", type=int, default=None,
                         help="Subsample N test examples for eval (default: full test set)")
+    parser.add_argument("--eval_batch_size", type=int, default=None,
+                        help="per_device_eval_batch_size. Default = num_generations*16. "
+                             "Larger = better vLLM batching → much faster eval. "
+                             "Must be a multiple of num_generations.")
     # MBE dynamics logging
     parser.add_argument("--mbe_log", action="store_true",
                         help="Log MBE dynamics (correct vs incorrect) to JSONL during training")
@@ -459,11 +463,15 @@ def main():
         config_kwargs["eval_steps"] = args.eval_steps
         # Pre-training baseline eval at global_step=0.
         config_kwargs["eval_on_start"] = True
-        # Eval forward materialises [batch, seq, vocab] logits and intermediate
-        # softmax tensors. Pin per-device eval batch to one generation group —
-        # the smallest value that satisfies TRL's eval_batch % num_generations
-        # == 0 requirement and keeps eval-side memory comparable to train.
-        config_kwargs["per_device_eval_batch_size"] = args.num_generations
+        # FastEvalGRPOTrainer skips the local forward, so eval-side memory is
+        # not the constraint — vLLM throughput is. Send big batches per call so
+        # vLLM can actually batch & schedule across prompts; otherwise eval
+        # serializes into one tiny call per prompt-group and dispatch overhead
+        # dominates (1319 calls × ~7s ≈ 2.7h on full GSM8K). Must satisfy
+        # eval_batch % num_generations == 0.
+        config_kwargs["per_device_eval_batch_size"] = (
+            args.eval_batch_size or args.num_generations * 16
+        )
 
     config = GRPOConfig(**config_kwargs)
 

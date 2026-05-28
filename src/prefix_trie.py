@@ -209,12 +209,15 @@ def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=
                     f"{node['count_correct']}/{node['count']}  ({rate:.0%})  L={node['cum_len']}",
                     fontsize=6.5, ha="center", va="top",
                     parse_math=False, color="#222")
-            # Mean trajectory advantage (if tracked).
+            # Sum of advantages over rollouts passing through this prefix.
+            # This is the quantity that appears as the coefficient on
+            # log pi_theta(s_{1:p}) in the GRPO loss decomposition:
+            #   L_{prefix,S} = -(sum_{i in S} A_i) / (G L) * log pi(s_{1:p}).
             if node.get("adv_n", 0) > 0:
-                mean_adv = node["adv_sum"] / node["adv_n"]
-                adv_color = "#1e7e34" if mean_adv > 0 else ("#b00020" if mean_adv < 0 else "#444")
+                adv_sum = node["adv_sum"]
+                adv_color = "#1e7e34" if adv_sum > 0 else ("#b00020" if adv_sum < 0 else "#444")
                 ax.text(x, y - 0.50,
-                        f"adv={mean_adv:+.2f}",
+                        f"ΣA={adv_sum:+.2f}",
                         fontsize=6.5, ha="center", va="top",
                         parse_math=False, color=adv_color, fontweight="bold")
 
@@ -559,6 +562,8 @@ def build_interactive_overlay_html(
     query_col="query_id",
     gold_col="gold_answer",
     advantage_col="advantage",
+    reward_col="reward",
+    n_cot_tokens_col="n_cot_tokens",
 ):
     """Write a self-contained HTML page for interactively browsing prefix tries
     across queries and global steps.
@@ -592,6 +597,20 @@ def build_interactive_overlay_html(
         gold = sub.iloc[0][gold_col] if gold_col and gold_col in sub.columns else None
 
         has_adv = advantage_col is not None and advantage_col in sub.columns
+        has_reward = reward_col is not None and reward_col in sub.columns
+        has_len = n_cot_tokens_col is not None and n_cot_tokens_col in sub.columns
+
+        # Per-step aggregate stats for the title bar.
+        step_stats = {}
+        for s in steps:
+            sub_s = sub[sub[step_col] == s]
+            stats = {"acc": float(sub_s[correct_col].mean()) if len(sub_s) else 0.0}
+            if has_len:
+                stats["mean_len"] = float(sub_s[n_cot_tokens_col].mean())
+            if has_reward:
+                stats["mean_r"] = float(sub_s[reward_col].mean())
+            step_stats[s] = stats
+
         multi = MultiStepTrie()
         for step in steps:
             sub_s = sub[sub[step_col] == step]
@@ -791,9 +810,31 @@ def build_interactive_overlay_html(
                 title_bits.append(f"view: overlay of all {n_steps} steps")
             else:
                 title_bits.append(f"view: step {view_step}")
+
+            def _fmt_stats(s):
+                st = step_stats[s]
+                bits = [f"acc={st['acc']:.2f}"]
+                if "mean_len" in st:
+                    bits.append(f"len={st['mean_len']:.0f}")
+                if "mean_r" in st:
+                    bits.append(f"R={st['mean_r']:+.2f}")
+                return f"s{s}:" + ", ".join(bits)
+
+            if view_step is None:
+                stats_line = "  ".join(_fmt_stats(s) for s in steps)
+            else:
+                stats_line = _fmt_stats(view_step)
+
+            formula_line = ("R = 10·InvLogLen + correctness + format"
+                            "   ·   adv = (R − μ_g) / (σ_g + ε)")
+            full_title = (" · ".join(title_bits)
+                          + "<br><span style='font-size:11px'>"
+                          + stats_line + "</span>"
+                          + "<br><span style='font-size:10px;color:#666'>"
+                          + formula_line + "</span>")
             all_data[str(qid)]["views"][view_key] = {
                 "traces": traces,
-                "title": " · ".join(title_bits),
+                "title": full_title,
             }
 
     json_data = json.dumps(all_data, cls=PlotlyJSONEncoder)
@@ -857,7 +898,7 @@ function render() {{
     hovermode: 'closest',
     xaxis: {{ visible: false, zeroline: false }},
     yaxis: {{ visible: false, zeroline: false }},
-    margin: {{ t: 50, l: 10, r: 60, b: 10 }},
+    margin: {{ t: 90, l: 10, r: 60, b: 10 }},
     paper_bgcolor: 'white',
     plot_bgcolor: 'white',
     hoverlabel: {{ bgcolor: 'white', font: {{ family: 'ui-monospace, Menlo, monospace', size: 11 }} }},
