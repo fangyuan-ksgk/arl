@@ -173,10 +173,24 @@ def load_gsm8k():
         match = re.search(r"####\s*(.+)", answer_text)
         if match:
             return match.group(1).strip().replace(",", "")
+        numbers = re.findall(r"-?[\d,]+\.?\d*", answer_text)
+        if numbers:
+            return numbers[-1].replace(",", "")
         return ""
 
+    answer_format_instruction = (
+        "Solve the problem step by step inside <think>...</think>. "
+        "After </think>, give a brief final explanation and end your response "
+        "with a line of the exact form:\n#### <number>\n"
+        "where <number> is the final numeric answer with no units, no commas, "
+        "and no extra text."
+    )
+
     def format_example(example):
-        example["prompt"] = [{"role": "user", "content": example["question"] + " /no_think"}]
+        user_content = (
+            f"{example['question']}\n\n{answer_format_instruction} /think"
+        )
+        example["prompt"] = [{"role": "user", "content": user_content}]
         example["gold_answer"] = extract_gold_answer(example["answer"])
         return example
 

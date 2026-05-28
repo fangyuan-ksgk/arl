@@ -51,7 +51,7 @@ VLLM_LOG_DIR="${PROJECT_DIR}/output/sweep_mbe_velocity/vllm_logs"
 MAX_TOKENS=1024
 LR=5e-6
 NUM_GEN=8
-GRAD_ACCUM=8
+GRAD_ACCUM=8b
 MAX_STEPS=200
 EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
 EVAL_EVERY=50               # log eval (incl. MBE velocity) every N steps
@@ -318,11 +318,11 @@ run_cell() {
 # is active. Re-enable them when running the full 12-cell sweep.
 
 # # 1) Baseline GRPO (no MBE velocity reward).
-# run_cell "baseline_grpo"             trajectory     off
+run_cell "baseline_grpo"             trajectory     off
 #
 # # 2-7) Positive MBE velocity — 2 modes × 3 weight magnitudes (10, 100, 10000)
 # #      scale = 1/w, so weight 10=0.1, 100=0.01, 10000=0.0001.
-# run_cell "traj_w10"                  trajectory     0.1
+run_cell "traj_w10"                  trajectory     0.1
 # run_cell "traj_w100"                 trajectory     0.01
 # run_cell "traj_w10000"               trajectory     0.0001
 # run_cell "roll_w10"                  rollercoaster  0.1
@@ -340,14 +340,14 @@ run_cell() {
 #        the diversity numerator is doing no work — see analysis note 2026-05-27.
 # Positive scale: reward 1/log(T) is positive → optimizer drives T DOWN → short CoT.
 run_cell "invlog_short_w10"        invlog          0.1
-run_cell "invlog_short_w100"       invlog          0.01
-run_cell "invlog_short_w10000"     invlog          0.0001
+# run_cell "invlog_short_w100"       invlog          0.01
+# run_cell "invlog_short_w10000"     invlog          0.0001
 
 # Negative scale: reward 1/log(T) is negative (penalty for being short) →
 # optimizer drives T UP → long CoT. Same magnitude ladder for fair comparison.
 run_cell "invlog_long_w10"         invlog         -0.1
-run_cell "invlog_long_w100"        invlog         -0.01
-run_cell "invlog_long_w10000"      invlog         -0.0001
+# run_cell "invlog_long_w100"        invlog         -0.01
+# run_cell "invlog_long_w10000"      invlog         -0.0001
 
 
 # =============================================
@@ -392,8 +392,8 @@ run_cell "predvelo_w10"              predvelo          0.1
 # `longshort` branch).
 # =============================================
 run_cell "longshort_w10"             longshort         0.1
-run_cell "longshort_w100"            longshort         0.01
-run_cell "longshort_w10000"          longshort         0.0001
+# run_cell "longshort_w100"            longshort         0.01
+# run_cell "longshort_w10000"          longshort         0.0001
 
 
 # =============================================
