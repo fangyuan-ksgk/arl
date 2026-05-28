@@ -103,7 +103,7 @@ def _collapse(raw):
     return out
 
 
-def _annotate(tree, layer=0, parent_n_children=1, _state=None):
+def _annotate(tree, layer=0, parent_n_children=1, parent_cum_len=0, _state=None):
     if _state is None:
         _state = {"counter": [0], "all": []}
     tree["id"] = _state["counter"][0]
@@ -111,11 +111,16 @@ def _annotate(tree, layer=0, parent_n_children=1, _state=None):
     tree["layer"] = layer
     tree["forked_parent"] = parent_n_children > 1
     tree.setdefault("parent_id", None)
+    # Accumulated prefix length (in space-split tokens) from root to this node,
+    # inclusive of this node's own collapsed token segment. The root carries
+    # any shared prefix tokens that all rollouts go through.
+    tree["cum_len"] = parent_cum_len + len(tree["tokens"])
     _state["all"].append(tree)
     n_kids = len(tree["children"])
     for child in tree["children"].values():
         child["parent_id"] = tree["id"]
-        _annotate(child, layer + 1, parent_n_children=n_kids, _state=_state)
+        _annotate(child, layer + 1, parent_n_children=n_kids,
+                  parent_cum_len=tree["cum_len"], _state=_state)
     return _state
 
 
@@ -201,7 +206,7 @@ def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=
         if node["count"] > 0:
             rate = node["count_correct"] / node["count"]
             ax.text(x, y - 0.30,
-                    f"{node['count_correct']}/{node['count']}  ({rate:.0%})",
+                    f"{node['count_correct']}/{node['count']}  ({rate:.0%})  L={node['cum_len']}",
                     fontsize=6.5, ha="center", va="top",
                     parse_math=False, color="#222")
             # Mean trajectory advantage (if tracked).
@@ -400,9 +405,10 @@ def draw_overlay_trie(ax, multi_trie, steps, max_edge_chars=22,
                     fontsize=7, ha="right", va="center", parse_math=False, zorder=4,
                     bbox=dict(boxstyle="round,pad=0.2", fc="#f5f5f5", ec="#bbb", lw=0.5))
 
-        # Compact K/N label
+        # Compact K/N label + accumulated prefix length (in tokens) from root
         if total_cnt > 0:
-            ax.text(x, y - 0.28, f"{n_present}/{n_steps}",
+            ax.text(x, y - 0.28,
+                    f"{n_present}/{n_steps}  L={node['cum_len']}",
                     fontsize=7.5, ha="center", va="top",
                     parse_math=False, color="#111", fontweight="bold")
 

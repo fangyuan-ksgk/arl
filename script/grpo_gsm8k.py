@@ -163,15 +163,13 @@ class FastEvalGRPOTrainer(GRPOTrainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         prompts = [x["prompt"] for x in inputs]
-        (
-            _prompt_ids_list,
-            completion_ids_list,
-            _tool_mask_list,
-            completions,
-            _num_items_in_batch,
-            _sampling_per_token_logps_list,
-            extra_fields,
-        ) = self._generate(prompts)
+        # TRL versions differ in `_generate`'s return arity (7 in 0.29, more in
+        # later releases). The first four positions and the last position
+        # (extra_fields) have been stable, so index defensively.
+        result = self._generate(prompts)
+        completion_ids_list = result[1]
+        completions = result[3]
+        extra_fields = result[-1] if isinstance(result[-1], dict) else {}
 
         # Merge rollout_func extras into inputs the same way the parent does
         # before _calculate_rewards, so any reward fn that reads extras still
