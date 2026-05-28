@@ -140,6 +140,57 @@ class GSM8KRolloutLogger:
         return [0.0] * len(completions)
 
 
+class FastEvalGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer with a fast eval path.
+
+    TRL's default `prediction_step` runs `compute_loss`, which triggers two
+    full-model forwards per eval batch (one for `old_per_token_logps` inside
+    `_generate_and_score_completions`, one for the policy logp/entropy inside
+    `_compute_loss`). At vocab≈151k and `max_completion_length` long enough
+    to matter, that local forward dominates wall-clock; evaluating the full
+    GSM8K test set (1319 samples × `num_generations` rollouts) takes ~2h on a
+    single GPU even with vLLM driving generation.
+
+    For our use-case eval only needs (a) completions and (b) reward-function
+    callbacks (so the rollout logger fires). We don't backprop, don't need
+    importance-sampling ratios, and we report no loss metric. So skip both
+    forwards entirely: generate via vLLM, call reward funcs, return 0.
+
+    `num_generations` still works because TRL's eval sampler
+    (`_get_eval_sampler`) already repeats each prompt `num_generations_eval`
+    times, and `_generate` returns one completion per repeated prompt.
+    """
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        prompts = [x["prompt"] for x in inputs]
+        (
+            _prompt_ids_list,
+            completion_ids_list,
+            _tool_mask_list,
+            completions,
+            _num_items_in_batch,
+            _sampling_per_token_logps_list,
+            extra_fields,
+        ) = self._generate(prompts)
+
+        # Merge rollout_func extras into inputs the same way the parent does
+        # before _calculate_rewards, so any reward fn that reads extras still
+        # works on the fast eval path.
+        if extra_fields:
+            for i, inp in enumerate(inputs):
+                for key, values in extra_fields.items():
+                    if isinstance(values, list) and i < len(values):
+                        inp[key] = values[i]
+                    elif not isinstance(values, list):
+                        inp[key] = values
+
+        # Fires reward funcs (including the rollout logger shim).
+        self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+
+        loss = torch.zeros((), device=self.accelerator.device)
+        return loss, None, None
+
+
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops.
 
@@ -668,7 +719,7 @@ def main():
     print(f"Rollout logger enabled → train: {train_rollout_path}\n"
           f"                         eval:  {eval_rollout_path}")
 
-    trainer = GRPOTrainer(
+    trainer = FastEvalGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=config,
