@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -163,6 +164,16 @@ class FastEvalGRPOTrainer(GRPOTrainer):
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         prompts = [x["prompt"] for x in inputs]
+        # Per-batch progress line. HF Trainer's built-in tqdm gets buried under
+        # the GRPO log dicts and tee buffering, so print explicitly: which call,
+        # how many prompts in flight, wall time per call. Lets us watch vLLM
+        # batching behaviour live and project total eval time.
+        if not hasattr(self, "_eval_call_idx"):
+            self._eval_call_idx = 0
+            self._eval_t0 = time.time()
+        self._eval_call_idx += 1
+        _t = time.time()
+
         # TRL versions differ in `_generate`'s return arity (7 in 0.29, more in
         # later releases). The first four positions and the last position
         # (extra_fields) have been stable, so index defensively.
@@ -170,6 +181,21 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         completion_ids_list = result[1]
         completions = result[3]
         extra_fields = result[-1] if isinstance(result[-1], dict) else {}
+
+        dt = time.time() - _t
+        elapsed = time.time() - self._eval_t0
+        n_total = len(self.eval_dataset) if self.eval_dataset is not None else None
+        bs_unique = len(prompts) // max(1, self.args.num_generations)
+        if n_total:
+            done = self._eval_call_idx * bs_unique
+            eta = elapsed * (n_total - done) / max(1, done)
+            print(f"[eval] call {self._eval_call_idx}: {len(prompts)} gens "
+                  f"({bs_unique} prompts) in {dt:.1f}s | "
+                  f"~{done}/{n_total} prompts | elapsed {elapsed/60:.1f}m | "
+                  f"ETA {eta/60:.1f}m", flush=True)
+        else:
+            print(f"[eval] call {self._eval_call_idx}: {len(prompts)} gens in {dt:.1f}s",
+                  flush=True)
 
         # Merge rollout_func extras into inputs the same way the parent does
         # before _calculate_rewards, so any reward fn that reads extras still
