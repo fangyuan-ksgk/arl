@@ -147,17 +147,23 @@ trap stop_vllm_server EXIT INT TERM
 #   $3  scale         — float; sign matters. Pass "off" to disable velocity reward
 #                       (logs zeros). With clip=1.0, |reward| ≤ 1/|scale| = weight.
 #                       Negative scale → reward penalises high MBE velocity / length.
+#   $4  clip          — optional; raw-value clip (default $VELO_CLIP). |reward| ≤ clip/|scale|.
+#                       Raise to escape saturation (e.g. predvelo railed at ±1.0).
+#   $5  norm_mode     — optional; predvelo length denominator: log_total (default)
+#                       or cot_len (=> log[p/p]/(l_a·l_o), linear CoT-length pressure).
 # =============================================
 run_experiment() {
     local name=$1
     local mode=$2
     local scale=$3
+    local clip=${4:-$VELO_CLIP}
+    local norm_mode=${5:-log_total}
     local run_dir="${BASE_OUTPUT}/${name}"
     local train_log="${run_dir}/train.log"
     mkdir -p "${run_dir}"
 
     echo ""
-    echo ">>> [${name}] mode=${mode}, scale=${scale}"
+    echo ">>> [${name}] mode=${mode}, scale=${scale}, clip=${clip}, norm_mode=${norm_mode}"
     echo ">>>   Output: ${run_dir}"
 
     # Build reward-shaping args. Regimes (mutually exclusive — exactly one
@@ -175,7 +181,7 @@ run_experiment() {
         velo_args="--no-mbe_velocity_reward \
             --inv_log_length_reward \
             --inv_log_length_scale ${scale} \
-            --inv_log_length_clip ${VELO_CLIP} \
+            --inv_log_length_clip ${clip} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${mode}" = "entvelo_roll" ] || [ "${mode}" = "entvelo_traj" ]; then
         local agg="rollercoaster"
@@ -183,7 +189,7 @@ run_experiment() {
         velo_args="--no-mbe_velocity_reward \
             --entropy_velocity_reward \
             --entropy_velocity_scale ${scale} \
-            --entropy_velocity_clip ${VELO_CLIP} \
+            --entropy_velocity_clip ${clip} \
             --entropy_velocity_aggregation ${agg} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${mode}" = "pplxvelo_roll" ] || [ "${mode}" = "pplxvelo_traj" ]; then
@@ -192,20 +198,21 @@ run_experiment() {
         velo_args="--no-mbe_velocity_reward \
             --perplexity_velocity_reward \
             --perplexity_velocity_scale ${scale} \
-            --perplexity_velocity_clip ${VELO_CLIP} \
+            --perplexity_velocity_clip ${clip} \
             --perplexity_velocity_aggregation ${agg} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${mode}" = "entdensity" ]; then
         velo_args="--no-mbe_velocity_reward \
             --entropy_density_reward \
             --entropy_density_scale ${scale} \
-            --entropy_density_clip ${VELO_CLIP} \
+            --entropy_density_clip ${clip} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${mode}" = "predvelo" ]; then
         velo_args="--no-mbe_velocity_reward \
             --predictive_velocity_reward \
             --predictive_velocity_scale ${scale} \
-            --predictive_velocity_clip ${VELO_CLIP} \
+            --predictive_velocity_clip ${clip} \
+            --predictive_norm_mode ${norm_mode} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${mode}" = "longshort" ]; then
         # Correctness-gated InvLogLength (asymmetric shaping):
@@ -218,7 +225,7 @@ run_experiment() {
             --gated_inv_log_length_reward \
             --gated_inv_log_length_scale_correct ${scale} \
             --gated_inv_log_length_scale_incorrect ${sc_inc} \
-            --gated_inv_log_length_clip ${VELO_CLIP} \
+            --gated_inv_log_length_clip ${clip} \
             --mbe_velocity_stride ${VELO_STRIDE}"
     elif [ "${scale}" = "off" ]; then
         velo_args="--no-mbe_velocity_reward"
@@ -226,7 +233,7 @@ run_experiment() {
         velo_args="--mbe_velocity_reward \
             --mbe_velocity_mode ${mode} \
             --mbe_velocity_scale ${scale} \
-            --mbe_velocity_clip ${VELO_CLIP} \
+            --mbe_velocity_clip ${clip} \
             --mbe_velocity_stride ${VELO_STRIDE} \
             --mbe_velocity_layers ${VELO_LAYERS}"
     fi
@@ -294,6 +301,8 @@ run_cell() {
     local name=$1
     local mode=$2
     local scale=$3
+    local clip=${4:-$VELO_CLIP}
+    local norm_mode=${5:-log_total}
     local vllm_log="${VLLM_LOG_DIR}/${name}.log"
 
     if ! start_vllm_server "${vllm_log}"; then
@@ -302,7 +311,7 @@ run_cell() {
         return
     fi
 
-    if ! run_experiment "${name}" "${mode}" "${scale}"; then
+    if ! run_experiment "${name}" "${mode}" "${scale}" "${clip}" "${norm_mode}"; then
         echo ">>> [${name}] ✗ training failed; continuing sweep"
         FAILED_RUNS="${FAILED_RUNS} ${name}:train"
     fi
@@ -318,11 +327,11 @@ run_cell() {
 # is active. Re-enable them when running the full 12-cell sweep.
 
 # # 1) Baseline GRPO (no MBE velocity reward).
-run_cell "baseline_grpo"             trajectory     off
+# run_cell "baseline_grpo"             trajectory     off
 #
 # # 2-7) Positive MBE velocity — 2 modes × 3 weight magnitudes (10, 100, 10000)
 # #      scale = 1/w, so weight 10=0.1, 100=0.01, 10000=0.0001.
-run_cell "traj_w10"                  trajectory     0.1
+# run_cell "traj_w10"                  trajectory     0.1
 # run_cell "traj_w100"                 trajectory     0.01
 # run_cell "traj_w10000"               trajectory     0.0001
 # run_cell "roll_w10"                  rollercoaster  0.1
@@ -339,13 +348,13 @@ run_cell "traj_w10"                  trajectory     0.1
 #        can be overlaid directly. If these reproduce traj_w*'s length reduction,
 #        the diversity numerator is doing no work — see analysis note 2026-05-27.
 # Positive scale: reward 1/log(T) is positive → optimizer drives T DOWN → short CoT.
-run_cell "invlog_short_w10"        invlog          0.1
+# run_cell "invlog_short_w10"        invlog          0.1
 # run_cell "invlog_short_w100"       invlog          0.01
 # run_cell "invlog_short_w10000"     invlog          0.0001
 
 # Negative scale: reward 1/log(T) is negative (penalty for being short) →
 # optimizer drives T UP → long CoT. Same magnitude ladder for fair comparison.
-run_cell "invlog_long_w10"         invlog         -0.1
+# run_cell "invlog_long_w10"         invlog         -0.1
 # run_cell "invlog_long_w100"        invlog         -0.01
 # run_cell "invlog_long_w10000"      invlog         -0.0001
 
@@ -381,9 +390,31 @@ run_cell "invlog_long_w10"         invlog         -0.1
 # run_cell "entdensity_w10000"         entdensity        0.0001
 
 # 22-24) Predictive velocity (log p(a|q,o) − log p(a|q)). Two forwards/rollout.
-run_cell "predvelo_w10"              predvelo          0.1
+# run_cell "predvelo_w10"              predvelo          0.1
 # run_cell "predvelo_w100"             predvelo          0.01
 # run_cell "predvelo_w10000"           predvelo          0.0001
+
+# 25) Predictive velocity with a LARGER clip (1.0 -> 5.0) to escape saturation.
+#     predvelo_w10 railed raw v at ±1.0 (logged reward pinned ~9-10/10) => near-
+#     zero within-group variance => GRPO cancels it. Raising the clip lets v keep
+#     earning reward up to ±5, restoring the gradient.
+#     CAUTION: bound = clip/scale = 5/0.1 = ±50, i.e. ~5x the correctness(±1) /
+#     format(±0.5) terms => predvelo will dominate the summed reward. That is the
+#     intended "stronger control"; watch that eval accuracy doesn't collapse. If
+#     it does, hold the bound fixed instead (clip=5, scale=0.5 => bound ±10) to
+#     de-saturate without inflating the weight.
+#     args: run_cell <name> <mode> <scale> <clip> <norm_mode>
+run_cell "predvelo_clip5_w10"        predvelo          0.1   5.0
+
+# 26) Stronger length regularization for CoT shortening: norm_mode=cot_len makes
+#     the reward = log[p(a|q,o)/p(a|q)] / (l_a*l_o), adding *linear* CoT-length
+#     pressure on top of the predictive signal. The default log-normalised form
+#     (predvelo_w10) did NOT shorten CoT (~470 tok ~ baseline).
+#     SCALE IS PROVISIONAL (w=50). The cot_len raw value is ~100x smaller, so
+#     clip=1.0 essentially never binds; pick scale principally via
+#     script/calibrate_predictive_cotlen.py (match within-group std to correctness).
+run_cell "predvelo_cotlen_w50"       predvelo          0.02  1.0   cot_len
+
 
 # =============================================
 # Active cells (2026-05-28) — longshort gated InvLogLength only.
@@ -391,7 +422,7 @@ run_cell "predvelo_w10"              predvelo          0.1
 # scale 0.1 ⇒ w_correct=+10, w_incorrect=−10 (handled in run_experiment's
 # `longshort` branch).
 # =============================================
-run_cell "longshort_w10"             longshort         0.1
+# run_cell "longshort_w10"             longshort         0.1
 # run_cell "longshort_w100"            longshort         0.01
 # run_cell "longshort_w10000"          longshort         0.0001
 

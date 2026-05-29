@@ -886,13 +886,32 @@ class EntropyDensityReward:
 def _compute_predictive_velocity_for_completion(model, tokenizer, prompt,
                                                  completion_text,
                                                  stride: int = 8,
-                                                 marker: str = "####"):
+                                                 marker: str = "####",
+                                                 norm_mode: str = "log_total"):
     """Length-normalised predictive velocity for a single rollout.
 
     Splits completion on `marker` (default "####", GSM8K convention) into
     rationale `o` and answer-region `a`. Computes log p(a | q, o) and
-    log p(a | q) via two forward passes, then returns
-        ( log p(a|q,o) − log p(a|q) ) / log(min(T_comp, D)).
+    log p(a | q) via two forward passes. The per-answer-token mean log-ratio
+        raw_v = (1/l_a) log p(a|q,o) - (1/l_a) log p(a|q)
+    is then divided by a length denominator selected by `norm_mode`:
+
+      - "log_total" (default, original behaviour):
+            denom = log(min(T_comp, D))            # T_comp = l_o + l_a
+        Weak (logarithmic) length dependence; in practice the reward
+        saturates against the ±clip ceiling and contributes no length signal
+        once GRPO subtracts the group mean.
+
+      - "cot_len" (double length normalisation):
+            denom = l_o                            # rationale token count
+        Combined with the built-in 1/l_a this yields
+            log[p(a|q,o)/p(a|q)] / (l_a * l_o),
+        an information-density reward (answer-confidence gain per rationale
+        token). ~100x smaller than "log_total" so it escapes clip saturation,
+        and imposes *linear* shortening pressure on the rationale. Note 1/l_o
+        is a deliberate density/penalty term, NOT a sum-averaging normaliser
+        like 1/l_a, so it can degenerate into a pure length penalty when raw_v
+        is roughly constant across rollouts.
 
     Returns 0.0 if:
       - completion contains no marker (unparseable)
@@ -959,16 +978,32 @@ def _compute_predictive_velocity_for_completion(model, tokenizer, prompt,
     # gets re-merged at the rationale/answer boundary.
     raw_v = (logp_a_given_qo / max(n_ans_qoa, 1)) - (logp_a_given_q / max(n_ans_qa, 1))
 
-    D = model.config.hidden_size
-    length_norm = math.log(min(T_comp, D))
-    return raw_v / length_norm
+    if norm_mode == "log_total":
+        D = model.config.hidden_size
+        denom = math.log(min(T_comp, D))
+    elif norm_mode == "cot_len":
+        # l_o = rationale length in tokens (prompt-stripped). raw_v already
+        # carries 1/l_a, so dividing by l_o gives log[p/p]/(l_a*l_o).
+        l_o = max(a_start_in_qoa - prompt_len, 1)
+        denom = float(l_o)
+    else:
+        raise ValueError(f"unknown norm_mode={norm_mode!r}")
+    return raw_v / denom
 
 
 class PredictiveVeloReward:
     """Length-normalised *predictive velocity* reward.
 
-    raw_v   = mean log p(a | q, o) − mean log p(a | q)
-    reward  = clip(raw_v / log(min(T_comp, D)), ±clip) / scale
+    raw_v   = mean log p(a | q, o) − mean log p(a | q)      # per-token (1/l_a)
+    reward  = clip(raw_v / denom(norm_mode), ±clip) / scale
+
+    `norm_mode` selects the length denominator (see
+    `_compute_predictive_velocity_for_completion`):
+      - "log_total": denom = log(min(T_comp, D))  (original; saturation-prone)
+      - "cot_len":   denom = l_o  => log[p/p]/(l_a*l_o), an info-density reward
+                     with linear shortening pressure (recalibrate scale: the
+                     raw value is ~100x smaller, so a much smaller scale is
+                     needed to keep |reward| off the clip).
 
     Splits the completion on `marker` (default "####") into rationale (`o`)
     and answer (`a`). Two forward passes per rollout. Positive reward at
@@ -982,7 +1017,8 @@ class PredictiveVeloReward:
     """
 
     def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
-                 clip: float = 1.0, marker: str = "####"):
+                 clip: float = 1.0, marker: str = "####",
+                 norm_mode: str = "log_total"):
         self.__name__ = "predictive_velocity"
         self.model = None
         self.tokenizer = tokenizer
@@ -990,6 +1026,7 @@ class PredictiveVeloReward:
         self.scale = scale
         self.clip = clip
         self.marker = marker
+        self.norm_mode = norm_mode
 
     def set_model(self, model):
         self.model = model
@@ -1004,6 +1041,7 @@ class PredictiveVeloReward:
             v = _compute_predictive_velocity_for_completion(
                 self.model, self.tokenizer, prompt, completion_text,
                 stride=self.stride, marker=self.marker,
+                norm_mode=self.norm_mode,
             )
             v = max(-self.clip, min(v, self.clip))
             rewards.append(v / self.scale)

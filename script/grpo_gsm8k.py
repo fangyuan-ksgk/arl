@@ -419,6 +419,11 @@ def main():
     parser.add_argument("--predictive_velocity_clip",  type=float, default=1.0)
     parser.add_argument("--predictive_marker", type=str, default="####",
                         help="Substring that separates rationale from answer in the completion.")
+    parser.add_argument("--predictive_norm_mode", type=str, default="log_total",
+                        choices=["log_total", "cot_len"],
+                        help="Length denominator: 'log_total' = /log(min(T,D)) (original); "
+                             "'cot_len' = /l_o => log[p/p]/(l_a*l_o) info-density reward "
+                             "(~100x smaller, recalibrate --predictive_velocity_scale).")
     # Entropy density — phase contrast "reason hard, then commit".
     # raw_v = mean(H over rationale)  −  mean(H over answer)
     # High reward at positive scale = rationale is uncertain, answer is
@@ -722,10 +727,12 @@ def main():
             scale=args.predictive_velocity_scale,
             clip=args.predictive_velocity_clip,
             marker=args.predictive_marker,
+            norm_mode=args.predictive_norm_mode,
         )
         reward_funcs.append(predictive_velo_obj)
         print(f"Predictive velocity reward enabled: scale={args.predictive_velocity_scale}, "
-              f"clip=±{args.predictive_velocity_clip}, marker='{args.predictive_marker}'")
+              f"clip=±{args.predictive_velocity_clip}, marker='{args.predictive_marker}', "
+              f"norm_mode='{args.predictive_norm_mode}'")
 
     eval_dataset = None
     if args.eval_steps > 0:
