@@ -16,6 +16,13 @@ Per-node counters on the raw trie:
     _cc  : pass-through correct count
     _t   : termination count at this node
     _tc  : termination correct count
+    _adv : pass-through advantage sum
+    _an  : pass-through advantage count
+    _rmax: max-continuation value V*(node) = max advantage over all
+           rollouts passing through this node (falls back to correctness
+           when no advantage is given). An optimistic backup: a prefix is
+           valued by its single best achievable continuation, in contrast
+           to the averaging _cc / _adv counters.
 """
 from __future__ import annotations
 
@@ -40,7 +47,8 @@ def tokenize(text):
 
 
 def _new_node():
-    return {"_c": 0, "_cc": 0, "_t": 0, "_tc": 0, "_adv": 0.0, "_an": 0}
+    return {"_c": 0, "_cc": 0, "_t": 0, "_tc": 0, "_adv": 0.0, "_an": 0,
+            "_rmax": float("-inf")}
 
 
 class Trie:
@@ -52,20 +60,26 @@ class Trie:
     def insert(self, toks, correct, advantage=None):
         c = int(bool(correct))
         a = None if advantage is None else float(advantage)
+        # Per-rollout value used for the max-continuation backup V*.
+        # V* = max advantage over reachable rollouts (falls back to correctness).
+        r = a if a is not None else float(c)
         n = self.root
         n["_c"] += 1; n["_cc"] += c
         if a is not None:
             n["_adv"] += a; n["_an"] += 1
+        if r > n["_rmax"]: n["_rmax"] = r
         for t in toks:
             n = n.setdefault(t, _new_node())
             n["_c"] += 1; n["_cc"] += c
             if a is not None:
                 n["_adv"] += a; n["_an"] += 1
+            if r > n["_rmax"]: n["_rmax"] = r
         n["_t"] += 1; n["_tc"] += c
 
 
 def build_trie_with_correctness(rows):
-    """rows: iterable of (token_seq, correct_bool) or (token_seq, correct_bool, advantage)."""
+    """rows: iterable of (token_seq, correct_bool) or (token_seq, correct_bool, advantage).
+    `advantage` feeds both ΣA and the V* (max-advantage) backup."""
     t = Trie()
     for row in rows:
         if len(row) == 2:
@@ -82,6 +96,7 @@ def _collapse(raw):
     out = {"tokens": [], "count": raw["_c"], "count_correct": raw["_cc"],
            "terminal": raw["_t"], "terminal_correct": raw["_tc"],
            "adv_sum": raw.get("_adv", 0.0), "adv_n": raw.get("_an", 0),
+           "v_star": raw.get("_rmax", float("-inf")),
            "children": {}}
     cur = raw
     while True:
@@ -92,6 +107,7 @@ def _collapse(raw):
             out["count"] = child["_c"];  out["count_correct"] = child["_cc"]
             out["terminal"] = child["_t"];  out["terminal_correct"] = child["_tc"]
             out["adv_sum"] = child.get("_adv", 0.0); out["adv_n"] = child.get("_an", 0)
+            out["v_star"] = child.get("_rmax", float("-inf"))
             cur = child
         else:
             break
@@ -220,6 +236,15 @@ def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=
                         f"ΣA={adv_sum:+.2f}",
                         fontsize=6.5, ha="center", va="top",
                         parse_math=False, color=adv_color, fontweight="bold")
+            # Max-continuation value V* = best advantage still reachable
+            # from this prefix (optimistic backup, vs the averaging ΣA above).
+            v_star = node.get("v_star", float("-inf"))
+            if v_star != float("-inf"):
+                v_color = "#1e7e34" if v_star > 0 else ("#b00020" if v_star < 0 else "#444")
+                ax.text(x, y - 0.68,
+                        f"V*={v_star:+.2f}",
+                        fontsize=6.5, ha="center", va="top",
+                        parse_math=False, color=v_color)
 
         # Leaf marker: ✓ / ✗ to the right.
         if not node["children"] and node["terminal"] > 0:
@@ -252,14 +277,15 @@ def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=
 class MultiStepTrie:
     """Prefix trie that tracks counts per `step` key (e.g., global_step).
 
-    Each node stores 4 dicts (step -> int): _c, _cc, _t, _tc.
+    Each node stores per-step dicts (step -> value): _c, _cc, _t, _tc,
+    _adv, _an, and _rmax (max-continuation value V* per step).
     """
     __slots__ = ("root",)
 
     @staticmethod
     def _empty():
         return {"_c": {}, "_cc": {}, "_t": {}, "_tc": {},
-                "_adv": {}, "_an": {}}
+                "_adv": {}, "_an": {}, "_rmax": {}}
 
     def __init__(self):
         self.root = self._empty()
@@ -267,12 +293,15 @@ class MultiStepTrie:
     def insert(self, toks, correct, step, advantage=None):
         c = int(bool(correct))
         a = None if advantage is None else float(advantage)
+        # Per-rollout value for the max-continuation backup V* (= max advantage).
+        r = a if a is not None else float(c)
         n = self.root
         n["_c"][step] = n["_c"].get(step, 0) + 1
         n["_cc"][step] = n["_cc"].get(step, 0) + c
         if a is not None:
             n["_adv"][step] = n["_adv"].get(step, 0.0) + a
             n["_an"][step] = n["_an"].get(step, 0) + 1
+        if r > n["_rmax"].get(step, float("-inf")): n["_rmax"][step] = r
         for t in toks:
             n = n.setdefault(t, self._empty())
             n["_c"][step] = n["_c"].get(step, 0) + 1
@@ -280,6 +309,7 @@ class MultiStepTrie:
             if a is not None:
                 n["_adv"][step] = n["_adv"].get(step, 0.0) + a
                 n["_an"][step] = n["_an"].get(step, 0) + 1
+            if r > n["_rmax"].get(step, float("-inf")): n["_rmax"][step] = r
         n["_t"][step] = n["_t"].get(step, 0) + 1
         n["_tc"][step] = n["_tc"].get(step, 0) + c
 
@@ -292,6 +322,7 @@ def _collapse_multi(raw):
            "terminal_correct_per_step": dict(raw["_tc"]),
            "adv_sum_per_step": dict(raw.get("_adv", {})),
            "adv_n_per_step": dict(raw.get("_an", {})),
+           "v_star_per_step": dict(raw.get("_rmax", {})),
            "children": {}}
     cur = raw
     while True:
@@ -305,6 +336,7 @@ def _collapse_multi(raw):
             out["terminal_correct_per_step"] = dict(child["_tc"])
             out["adv_sum_per_step"] = dict(child.get("_adv", {}))
             out["adv_n_per_step"] = dict(child.get("_an", {}))
+            out["v_star_per_step"] = dict(child.get("_rmax", {}))
             cur = child
         else:
             break
@@ -754,6 +786,20 @@ def build_interactive_overlay_html(
                                     f"{asum_total / an_total:+.3f} "
                                     f"(n={an_total})<br>")
 
+                # Max-continuation value V* = best advantage (falls back to
+                # correctness) still reachable from this prefix.
+                # Optimistic backup, complementing the averaging lines above.
+                rmax_per_step = node.get("v_star_per_step", {})
+                if view_step is None:
+                    vals = [v for v in rmax_per_step.values() if v != float("-inf")]
+                    v_star = max(vals) if vals else None
+                else:
+                    v_star = rmax_per_step.get(view_step)
+                    if v_star == float("-inf"):
+                        v_star = None
+                v_line = "" if v_star is None else (
+                    f"<b>V* (max advantage):</b> {v_star:+.3f}<br>")
+
                 pref = prefix_text[node["id"]] or "(root, empty prefix)"
                 pref_wrapped = "<br>".join(_wrap_text(pref, 90, 40))
 
@@ -763,6 +809,7 @@ def build_interactive_overlay_html(
                     f"<b>Aggregate:</b> {total_correct}/{total} "
                     f"({rate * 100:.0f}%)<br>"
                     f"{adv_line}"
+                    f"{v_line}"
                     f"<b>Per-step:</b><br>" + "<br>".join(per_step_lines) +
                     f"<br><br><b>Accumulated prefix:</b><br>{pref_wrapped}"
                 )

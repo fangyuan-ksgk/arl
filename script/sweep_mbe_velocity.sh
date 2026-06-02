@@ -406,6 +406,19 @@ run_cell() {
 #     args: run_cell <name> <mode> <scale> <clip> <norm_mode>
 run_cell "predvelo_clip5_w10"        predvelo          0.1   5.0
 
+# 25b) Bigger-w ladder at the de-saturated clip=5.0. With clip=1.0 the raw value
+#      railed, so increasing w only rescaled a near-constant (GRPO-cancelled)
+#      reward and showed no effect. At clip=5.0 raw v can keep earning up to ±5,
+#      so this ladder finally isolates what the predictive-velocity TERM does as
+#      its weight grows. bound = clip/scale = 5·w:
+#        w=10 -> scale 0.1  -> bound ±50   (== predvelo_clip5_w10 above)
+#        w=20 -> scale 0.05 -> bound ±100
+#        w=50 -> scale 0.02 -> bound ±250
+#      CAUTION: these increasingly dominate correctness(±1)/format(±0.5); the
+#      point is to see the term's pull on length/accuracy, so watch eval acc.
+run_cell "predvelo_clip5_w20"        predvelo          0.05  5.0
+run_cell "predvelo_clip5_w50"        predvelo          0.02  5.0
+
 # 26) Stronger length regularization for CoT shortening: norm_mode=cot_len makes
 #     the reward = log[p(a|q,o)/p(a|q)] / (l_a*l_o), adding *linear* CoT-length
 #     pressure on top of the predictive signal. The default log-normalised form
