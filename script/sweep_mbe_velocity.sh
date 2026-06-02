@@ -417,7 +417,7 @@ run_cell "predvelo_clip5_w10"        predvelo          0.1   5.0
 #      CAUTION: these increasingly dominate correctness(±1)/format(±0.5); the
 #      point is to see the term's pull on length/accuracy, so watch eval acc.
 run_cell "predvelo_clip5_w20"        predvelo          0.05  5.0
-run_cell "predvelo_clip5_w50"        predvelo          0.02  5.0
+# run_cell "predvelo_clip5_w50"        predvelo          0.02  5.0
 
 # 26) Stronger length regularization for CoT shortening: norm_mode=cot_len makes
 #     the reward = log[p(a|q,o)/p(a|q)] / (l_a*l_o), adding *linear* CoT-length
@@ -426,7 +426,7 @@ run_cell "predvelo_clip5_w50"        predvelo          0.02  5.0
 #     SCALE IS PROVISIONAL (w=50). The cot_len raw value is ~100x smaller, so
 #     clip=1.0 essentially never binds; pick scale principally via
 #     script/calibrate_predictive_cotlen.py (match within-group std to correctness).
-run_cell "predvelo_cotlen_w50"       predvelo          0.02  1.0   cot_len
+# run_cell "predvelo_cotlen_w50"       predvelo          0.02  1.0   cot_len
 
 
 # =============================================
