@@ -43,42 +43,56 @@ __all__ = ["optimistic_prefix_advantages", "PrefixTrie", "TreeTrainer"]
 class PrefixTrie:
     """Lightweight prefix trie keyed on hashable tokens (e.g. token ids).
 
-    Each node tracks ``a_max`` = the maximum scalar advantage over every
-    sequence whose path passes through it (the Optimistic Prefix Advantage,
-    A*). ``a_max`` is a running max, so the same trie can be updated
-    incrementally across batches to act as a persistent global trie.
+    Each node tracks ``a_max`` and ``a_min`` = the maximum / minimum scalar
+    advantage over every sequence whose path passes through it. ``a_max`` is the
+    Optimistic Prefix Advantage (A*, optimistic backup); ``a_min`` is the
+    pessimistic backup (worst reachable continuation). Both are running
+    extrema, so the same trie can be updated incrementally across batches to act
+    as a persistent global trie regardless of which credit mode is read out.
     """
 
-    __slots__ = ("children", "a_max")
+    __slots__ = ("children", "a_max", "a_min")
 
     def __init__(self):
         self.children: dict = {}
         self.a_max: float = float("-inf")
+        self.a_min: float = float("inf")
 
     def insert(self, toks: Sequence[Hashable], adv: float) -> None:
         adv = float(adv)
         node = self
         if adv > node.a_max:
             node.a_max = adv
+        if adv < node.a_min:
+            node.a_min = adv
         for t in toks:
             node = node.children.setdefault(t, PrefixTrie())
             if adv > node.a_max:
                 node.a_max = adv
+            if adv < node.a_min:
+                node.a_min = adv
 
-    def walk_amax(self, toks: Sequence[Hashable]) -> List[float]:
-        """A* at each prefix: position t is A*(tokens[:t+1]).
+    def walk(self, toks: Sequence[Hashable], mode: str = "max") -> List[float]:
+        """Per-prefix backup at each prefix: position t is the backup of
+        ``tokens[:t+1]``. ``mode='max'`` reads the optimistic A* (``a_max``);
+        ``mode='min'`` reads the pessimistic backup (``a_min``).
 
         Stops early (truncates) if a prefix is absent from the trie. When the
         sequence was inserted into this trie, the walk is always complete.
         """
+        attr = "a_min" if mode == "min" else "a_max"
         out: List[float] = []
         node = self
         for t in toks:
             node = node.children.get(t)
             if node is None:
                 break
-            out.append(node.a_max)
+            out.append(getattr(node, attr))
         return out
+
+    def walk_amax(self, toks: Sequence[Hashable]) -> List[float]:
+        """A* (optimistic backup) at each prefix. Thin wrapper over ``walk``."""
+        return self.walk(toks, mode="max")
 
     def token_node_breakdown(self) -> dict:
         """Classify every non-root node (each = one token in the dedup'd trie).
@@ -128,6 +142,7 @@ def optimistic_prefix_advantages(
     token_seqs: Sequence[Sequence[Hashable]],
     scalar_advs: Sequence[float],
     return_trie: bool = False,
+    mode: str = "max",
 ):
     """Per-token Optimistic Prefix Advantage for one GRPO group.
 
@@ -155,7 +170,7 @@ def optimistic_prefix_advantages(
     root = PrefixTrie()
     for toks, a in zip(token_seqs, scalar_advs):
         root.insert(toks, a)
-    per_token = [root.walk_amax(toks) for toks in token_seqs]
+    per_token = [root.walk(toks, mode=mode) for toks in token_seqs]
     if return_trie:
         return per_token, root
     return per_token
@@ -195,11 +210,15 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         trainer.train()
     """
 
-    def __init__(self, *args, use_global_tree: bool = False, **kwargs):
+    def __init__(self, *args, use_global_tree: bool = False,
+                 credit_mode: str = "max", **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
+        if credit_mode not in ("max", "min"):
+            raise ValueError(f"credit_mode must be 'max' or 'min', got {credit_mode!r}")
         super().__init__(*args, **kwargs)
         self.use_global_tree = use_global_tree
+        self.credit_mode = credit_mode
         # prompt-key -> PrefixTrie, persisted across batches when enabled.
         self._global_tries: dict = {}
 
@@ -214,6 +233,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         *,
         use_global_tree: bool = False,
         global_tries: Optional[dict] = None,
+        credit_mode: str = "max",
     ):
         """The credit-assignment core of :meth:`_compute_loss`.
 
@@ -260,9 +280,9 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 trie = global_tries.setdefault(pkey, PrefixTrie())
                 for toks, a in zip(g_seqs, g_advs):
                     trie.insert(toks, a)
-                per_tok = [trie.walk_amax(toks) for toks in g_seqs]
+                per_tok = [trie.walk(toks, mode=credit_mode) for toks in g_seqs]
             else:
-                per_tok = optimistic_prefix_advantages(g_seqs, g_advs)
+                per_tok = optimistic_prefix_advantages(g_seqs, g_advs, mode=credit_mode)
 
             # (4) Scatter back into the (Bp, T) tensor.
             for i, vals in zip(idxs, per_tok):
@@ -298,6 +318,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 prompt_ids, completion_ids, mask, adv_scalar, pad_id,
                 use_global_tree=self.use_global_tree,
                 global_tries=self._global_tries,
+                credit_mode=self.credit_mode,
             )
 
         inputs = dict(inputs)

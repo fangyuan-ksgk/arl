@@ -345,6 +345,15 @@ class RolloutLogger:
         # Trainer.state.global_step at the moment eval was triggered.
         # Stamped by the driver's EvalFlagCallback; -1 before first step.
         self.global_step = -1
+        # "sample" (T=1 pass@K) or "greedy" (T=0 pass@1). Flipped by the
+        # fast-eval trainer around each generation pass.
+        self.decoding = "sample"
+        # Sampling temperature of the current pass (~0.0 for greedy, the
+        # configured eval temperature for sample). Stamped by the trainer.
+        self.temperature = None
+        # Name of the validation split being evaluated (e.g. "eval", "probe").
+        # Stamped by the trainer's `evaluate` override for dict eval datasets.
+        self.eval_dataset_name = "eval"
         self.tokenizer = tokenizer
 
     def __call__(self, completions, numbers, **_):
@@ -379,6 +388,10 @@ class RolloutLogger:
                     "has_answer_marker": bool(m_ans),
                     "has_think_close": bool(think_idx >= 0),
                     "split": "eval" if self.in_eval else "train",
+                    "eval_dataset": (self.eval_dataset_name if self.in_eval else None),
+                    "decoding": self.decoding,
+                    "temperature": (None if self.temperature is None
+                                    else float(self.temperature)),
                     "global_step": int(self.global_step),
                 }) + "\n")
         if self.in_eval:

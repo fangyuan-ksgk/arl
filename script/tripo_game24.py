@@ -48,6 +48,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import random
 import sys
@@ -182,6 +183,10 @@ class TreeSamplingMixin:
 
     # ------------------------------------------------------------------
     def _generate(self, prompts: list):
+        # Greedy eval pass (pass@1): bypass tree sampling entirely and defer to
+        # the base trainer's deterministic single-sample generation.
+        if getattr(self, "_greedy_pass", False):
+            return super()._generate(prompts)
         # Tree sampling is implemented on the colocate vLLM engine only.
         if not (getattr(self, "use_vllm", False)
                 and getattr(self, "vllm_mode", None) == "colocate"):
@@ -257,10 +262,127 @@ class TreeSamplingMixin:
         )
 
 
+# ---------------------------------------------------------------------------
+# Fast dual-pass eval: sampled (T=eval) pass@K + greedy (T=0) pass@1.
+# Ported from script/grpo_gsm8k.py (FastEvalGRPOTrainer), adapted to the
+# Game-of-24 rollout-logger signature (keyed on `numbers`).
+# ---------------------------------------------------------------------------
+class FastEvalMixin:
+    """Override the eval path so each eval call generates twice per prompt:
+
+      1. **sampled pass@K** — T = eval temperature, ``num_generations_eval``
+         rollouts/prompt (drives the offline ``pass@k`` estimator, incl.
+         t=1 pass@8). Routed through the full reward pipeline so every reward
+         fn (and the rollout logger) sees it.
+      2. **greedy pass@1** — T = 0, one deterministic rollout per *unique*
+         prompt. Logged directly via the rollout logger.
+
+    Skips the local loss forward entirely (eval cost is vLLM generation, not the
+    loss). When ``eval_dataset`` is a dict of validation splits, ``evaluate``
+    stamps the split name onto the rollout logger so each rollout is tagged.
+    """
+
+    @contextlib.contextmanager
+    def _greedy_eval(self):
+        """Force greedy decoding (T=0, 1 generation/prompt) within the block."""
+        old_neval = getattr(self, "num_generations_eval", self.num_generations)
+        self.num_generations_eval = 1
+        self._greedy_pass = True               # tree sampler falls back to base
+        vg = getattr(self, "vllm_generation", None)
+        gc = getattr(self, "generation_config", None)
+        old_vg_t = getattr(vg, "temperature", None) if vg is not None else None
+        old_gc = (gc.temperature, gc.do_sample) if gc is not None else None
+        if vg is not None:
+            vg.temperature = 0.0
+        if gc is not None:
+            gc.do_sample = False
+        try:
+            yield
+        finally:
+            self.num_generations_eval = old_neval
+            self._greedy_pass = False
+            if vg is not None:
+                vg.temperature = old_vg_t
+            if gc is not None:
+                gc.temperature, gc.do_sample = old_gc
+
+    def _current_temperature(self):
+        vg = getattr(self, "vllm_generation", None)
+        if vg is not None and getattr(vg, "temperature", None) is not None:
+            return float(vg.temperature)
+        gc = getattr(self, "generation_config", None)
+        if gc is not None and getattr(gc, "temperature", None) is not None:
+            return float(gc.temperature)
+        return getattr(getattr(self, "args", None), "temperature", None)
+
+    def _eval_generate(self, prompts, inputs, *, decoding):
+        logger = getattr(self, "_rollout_logger", None)
+        if logger is not None:
+            logger.decoding = decoding
+            logger.temperature = self._current_temperature()
+        _t = time.time()
+        result = self._generate(prompts)
+        completion_ids_list = result[1]
+        completions = result[3]
+        dt = time.time() - _t
+        if decoding == "greedy":
+            if logger is not None:
+                logger(completions=completions,
+                       numbers=[x["numbers"] for x in inputs])
+        else:
+            self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        return dt, len(completions)
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        import torch
+        prompts = [x["prompt"] for x in inputs]
+
+        # Route every rollout here to the EVAL log. `prediction_step` runs only
+        # during evaluation, so this is the robust signal (the EvalFlagCallback's
+        # on_prediction_step fires *after* this method, one batch too late).
+        logger = getattr(self, "_rollout_logger", None)
+        if logger is not None:
+            logger.in_eval = True
+            logger.global_step = self.state.global_step
+
+        # Pass 1: sampled pass@K (T=eval, num_generations_eval rollouts/prompt).
+        dt, n_gen = self._eval_generate(prompts, inputs, decoding="sample")
+
+        # Pass 2: greedy pass@1 (T=0, one rollout per unique prompt). The eval
+        # sampler repeats each prompt G times; slice back to uniques.
+        G = max(1, getattr(self, "num_generations_eval", self.num_generations))
+        uniq_inputs = inputs[::G]
+        uniq_prompts = prompts[::G]
+        with self._greedy_eval():
+            dt_g, _ = self._eval_generate(uniq_prompts, uniq_inputs, decoding="greedy")
+
+        split = getattr(getattr(self, "_rollout_logger", None), "eval_dataset_name", "eval")
+        print(f"[eval:{split}] {n_gen} sample + {len(uniq_prompts)} greedy gens "
+              f"in {dt:.1f}s+{dt_g:.1f}s", flush=True)
+
+        loss = torch.zeros((), device=self.accelerator.device)
+        return loss, None, None
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # When eval_dataset is a dict, transformers recurses with
+        # metric_key_prefix=f"eval_{name}"; capture that to tag the split.
+        logger = getattr(self, "_rollout_logger", None)
+        if logger is not None:
+            name = metric_key_prefix
+            if name.startswith("eval_"):
+                name = name[len("eval_"):]
+            logger.eval_dataset_name = name or "eval"
+        return super().evaluate(eval_dataset=eval_dataset, ignore_keys=ignore_keys,
+                                metric_key_prefix=metric_key_prefix)
+
+
 def build_trainer_class(base, tree_sampling: bool):
-    if not tree_sampling:
-        return base
-    return type("TreeSamplingTrainer", (TreeSamplingMixin, base), {})
+    """Compose the trainer: FastEvalMixin (dual-pass eval) always on top, then
+    optional TreeSamplingMixin, then the base (TreeTrainer or GRPOTrainer)."""
+    mixins = (FastEvalMixin,)
+    if tree_sampling:
+        mixins = mixins + (TreeSamplingMixin,)
+    return type("TriPOTrainer", mixins + (base,), {})
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +420,19 @@ def main() -> None:
     train_puzzles, eval_puzzles, hard_probe = make_splits(
         easy, medium, hard, eval_frac=args.eval_frac, probe_frac=0.40,
     )
-    train_ds, eval_ds, _probe_ds = build_datasets(train_puzzles, eval_puzzles, hard_probe)
+    train_ds, eval_ds, probe_ds = build_datasets(train_puzzles, eval_puzzles, hard_probe)
     print(f"[data] train={len(train_puzzles)} eval={len(eval_puzzles)} "
           f"probe={len(hard_probe)}", flush=True)
+
+    # Evaluate on ALL validation datasets: the in-distribution eval split and
+    # the held-out hard probe (D3). Passing a dict makes HF Trainer loop over
+    # each; the FastEvalMixin tags every rollout with its split name.
+    eval_datasets = {"eval": eval_ds}
+    if len(probe_ds) > 0:
+        eval_datasets["probe"] = probe_ds
+
+    # Eval group size for the sampled pass@K (defaults to --num-generations).
+    num_generations_eval = args.num_generations_eval or args.num_generations
 
     # GRPO requires the train *global* batch to be a multiple of num_generations.
     train_global = args.per_device_batch_size * args.grad_accum
@@ -339,7 +471,8 @@ def main() -> None:
         num_generations=args.num_generations,
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=args.num_generations,
+        num_generations_eval=num_generations_eval,
+        per_device_eval_batch_size=num_generations_eval,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
@@ -378,14 +511,18 @@ def main() -> None:
         reward_funcs=[correctness_reward, format_reward, rollout_logger],
         args=config,
         train_dataset=train_ds,
-        eval_dataset=eval_ds if args.eval_steps > 0 else None,
+        eval_dataset=(eval_datasets if args.eval_steps > 0 else None),
         processing_class=tokenizer,
         callbacks=[EvalFlagCallback(rollout_logger)],
     )
     if args.trainer == "tree":
         trainer_kwargs["use_global_tree"] = args.use_global_tree
+        trainer_kwargs["credit_mode"] = args.credit_mode
 
     trainer = trainer_cls(**trainer_kwargs)
+
+    # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
+    trainer._rollout_logger = rollout_logger
 
     # Wire tree-sampling knobs onto the live trainer (read at generation time).
     if args.tree_sampling:
@@ -396,7 +533,10 @@ def main() -> None:
     print(f"[trainer] {base_cls.__name__}"
           f"{' + TreeSampling' if args.tree_sampling else ''}"
           f"{' (global trie)' if (args.trainer == 'tree' and args.use_global_tree) else ''}"
-          f" | num_generations={args.num_generations}", flush=True)
+          f"{f' credit={args.credit_mode}' if args.trainer == 'tree' else ''}"
+          f" | num_generations={args.num_generations}"
+          f" eval(sample@{num_generations_eval} t={args.temperature} + greedy@1 t=0)"
+          f" splits={list(eval_datasets) if args.eval_steps > 0 else []}", flush=True)
     if args.tree_sampling:
         bs = args.tree_block_size or max(1, args.max_completion_length // args.tree_steps)
         print(f"[tree-sampling] branch={args.tree_branch} steps={args.tree_steps} "
@@ -425,6 +565,10 @@ def parse_args() -> argparse.Namespace:
     # Tree-credit (OPA) options
     p.add_argument("--use-global-tree", action="store_true",
                    help="(tree trainer) persist the prefix trie across batches.")
+    p.add_argument("--credit-mode", choices=["max", "min"], default="max",
+                   help="(tree trainer) per-prefix advantage backup: 'max' = "
+                        "Optimistic Prefix Advantage (best reachable "
+                        "continuation); 'min' = pessimistic (worst reachable).")
     # Tree sampling options
     p.add_argument("--tree-sampling", action="store_true",
                    help="Breadth-first block sampling on the colocate vLLM engine.")
@@ -437,6 +581,10 @@ def parse_args() -> argparse.Namespace:
     # Training / generation
     p.add_argument("--max-steps", type=int, default=200)
     p.add_argument("--num-generations", type=int, default=8)
+    p.add_argument("--num-generations-eval", type=int, default=None,
+                   help="Rollouts/prompt for the sampled (t=1) eval pass@K "
+                        "(default: --num-generations, i.e. pass@8). The greedy "
+                        "pass@1 always uses 1 deterministic rollout/prompt.")
     p.add_argument("--max-completion-length", type=int, default=512)
     p.add_argument("--per-device-batch-size", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=4)
