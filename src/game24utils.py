@@ -34,8 +34,8 @@ __all__ = [
     # prompt formatting
     "SYSTEM_PROMPT", "to_chat", "build_datasets",
     # rewards
-    "completion_text", "_text", "extract_expr",
-    "correctness_reward", "format_reward",
+    "completion_text", "_text", "extract_expr", "extract_expr_candidates",
+    "normalize_math", "correctness_reward", "format_reward",
 ]
 
 
@@ -62,12 +62,14 @@ def safe_eval(expr: str) -> Optional[float]:
         return None
 
 
-def verify_24(numbers: Sequence[int], expr: str) -> bool:
-    """True iff `expr` uses each integer in `numbers` exactly once and evaluates to 24."""
+def verify_24(numbers: Sequence[int], expr: str, target: float = TARGET) -> bool:
+    """True iff `expr` uses each integer in `numbers` exactly once and evaluates
+    to `target` (default :data:`TARGET` = 24). Pass `target` to study easier/
+    harder variants (e.g. a 2-number "Game of 10") without monkeypatching."""
     val = safe_eval(expr)
     if not isinstance(val, (int, float)) or isinstance(val, bool):
         return False
-    if abs(val - TARGET) > _EPS:
+    if abs(val - target) > _EPS:
         return False
     used = [int(x) for x in re.findall(r"\d+", expr)]
     return sorted(used) == sorted(numbers)
@@ -94,8 +96,9 @@ def _ast_key(expr: str) -> Optional[str]:
 def enumerate_solutions(
     numbers: Tuple[int, ...],
     max_solutions: Optional[int] = None,
+    target: float = TARGET,
 ) -> List[str]:
-    """All distinct AST-canonical expressions over `numbers` that evaluate to 24.
+    """All distinct AST-canonical expressions over `numbers` that evaluate to `target`.
 
     Brute-forces every (permutation × op-triple × bracket-template) candidate,
     filters by `verify_24`, and de-duplicates by AST canonical form so that
@@ -113,7 +116,7 @@ def enumerate_solutions(
         for op1, op2, op3 in itertools.product(_OPS, repeat=3):
             for tmpl in _TEMPLATES:
                 expr = tmpl.format(a=a, b=b, c=c, d=d, o1=op1, o2=op2, o3=op3)
-                if not verify_24(list(numbers), expr):
+                if not verify_24(list(numbers), expr, target):
                     continue
                 k = _ast_key(expr)
                 if k is None or k in by_ast:
@@ -130,6 +133,7 @@ def enumerate_solutions(
 def build_puzzle_pool(
     max_n: int = 9,
     max_solutions: Optional[int] = None,
+    target: float = TARGET,
 ) -> List[Dict[str, Any]]:
     """Enumerate all solvable 4-tuples drawn from {1, ..., max_n} with replacement.
 
@@ -140,7 +144,7 @@ def build_puzzle_pool(
     """
     pool: List[Dict[str, Any]] = []
     for tup in itertools.combinations_with_replacement(range(1, max_n + 1), 4):
-        sols = enumerate_solutions(tup, max_solutions=max_solutions)
+        sols = enumerate_solutions(tup, max_solutions=max_solutions, target=target)
         if sols:
             pool.append({
                 "numbers":     list(tup),
@@ -214,7 +218,7 @@ def to_chat(puzzle: Dict[str, Any]) -> Dict[str, Any]:
     num_str = ",".join(map(str, puzzle["numbers"]))
     user = (
         f"Given numbers: {num_str}. Make 24. "
-        "Think step by step, then give your final expression on the last line after '#### '."
+        "After thinking, give your final expression on the last line after '#### '."
     )
     return {
         "prompt": [
@@ -255,26 +259,60 @@ def completion_text(completion: Any) -> str:
 _text = completion_text
 
 
-def extract_expr(text: str) -> str:
-    """Return the expression after '#### ' in the post-``</think>`` region.
+# Arithmetic candidate: must start with a digit or '(' then ASCII math chars.
+# '.' and newline are NOT in the class, so a match never crosses lines and never
+# swallows letters → an answer can't be reward-hacked out of CoT prose.
+_MATH_RE = re.compile(r"[0-9(][0-9+\-*/(). ]*")
 
-    The model's chat template ends thinking with ``</think>``; the answer line
-    ``#### <expr>`` is expected to live after that tag. Restricting the search
-    to ``text.split("</think>")[-1]`` mirrors the reward-hacking guard in
-    ``velocity._find_answer_marker``: a literal ``####`` inside the CoT must
-    not be picked up. When ``</think>`` is absent (e.g. truncated rollouts or
-    non-thinking models), ``split`` returns the whole string, so we fall back
-    to scanning everything. Returns the empty string on miss.
+
+def normalize_math(s: str) -> str:
+    """Map common LaTeX/markdown math notation onto ``safe_eval``'s ASCII
+    alphabet so cosmetic formatting (×, \\times, $…$, **bold**) doesn't sink an
+    otherwise-correct expression. Correctness measures MATH, not notation —
+    notation compliance is ``format_reward``'s job."""
+    s = s.replace("\\times", "*").replace("\\cdot", "*").replace("\\div", "/")
+    s = s.replace("\\left", "").replace("\\right", "").replace("\\,", " ")
+    s = s.replace("×", "*").replace("·", "*").replace("÷", "/")
+    s = s.replace("$", " ")
+    return s
+
+
+def extract_expr_candidates(text: str) -> List[str]:
+    """All arithmetic substrings in the post-``####`` region of the post-
+    ``</think>`` tail.
+
+    Requiring the answer to live after ``####`` mirrors the reward-hacking guard
+    in ``velocity._find_answer_marker``: a literal ``####`` inside the CoT (or
+    bare CoT arithmetic when no marker is emitted) must not be picked up. Each
+    candidate is notation-normalized, has its trailing ``= 24`` stripped, and
+    must contain at least one digit and one operator. Empty list on miss.
     """
     tail = text.split("</think>")[-1]
-    m = re.search(r"####\s*(.+?)\s*$", tail.strip())
-    return m.group(1).strip() if m else ""
+    if "####" not in tail:
+        return []                                  # no answer marker → no credit
+    region = normalize_math(tail.split("####")[-1])  # text after the LAST '####'
+    cands: List[str] = []
+    for m in _MATH_RE.findall(region):
+        c = m.strip().rstrip("=").strip()          # drop trailing "= 24"
+        if c and re.search(r"\d", c) and re.search(r"[+\-*/]", c):
+            cands.append(c)
+    return cands
 
 
-def correctness_reward(completions, numbers, **_) -> List[float]:
+def extract_expr(text: str) -> str:
+    """Best-effort single expression for display/logging: the first candidate
+    after ``####`` (notation-normalized), or the empty string on miss. For
+    correctness use ``correctness_reward`` / ``extract_expr_candidates``, which
+    consider every candidate."""
+    cands = extract_expr_candidates(text)
+    return cands[0] if cands else ""
+
+
+def correctness_reward(completions, numbers, target: float = TARGET, **_) -> List[float]:
     rewards = []
     for c, nums in zip(completions, numbers):
-        rewards.append(1.0 if verify_24(list(nums), extract_expr(completion_text(c))) else 0.0)
+        cands = extract_expr_candidates(completion_text(c))
+        rewards.append(1.0 if any(verify_24(list(nums), e, target) for e in cands) else 0.0)
     return rewards
 
 
@@ -315,8 +353,12 @@ class RolloutLogger:
         with path.open("a") as f:
             for i, (c, nums) in enumerate(zip(completions, numbers)):
                 text = _text(c)
-                expr = extract_expr(text)
-                correct = verify_24(list(nums), expr)
+                cands = extract_expr_candidates(text)
+                # `correct` matches correctness_reward (any candidate verifies);
+                # `expr` is the first verifying one, else the first candidate.
+                correct = any(verify_24(list(nums), e) for e in cands)
+                expr = next((e for e in cands if verify_24(list(nums), e)),
+                            cands[0] if cands else "")
                 n_tok = len(self.tokenizer.encode(text, add_special_tokens=False))
 
                 think_idx = text.find("</think>")

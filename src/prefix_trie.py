@@ -215,7 +215,15 @@ def _node_size(count, n_total):
 # ---------------------------------------------------------------------------
 # Drawing
 # ---------------------------------------------------------------------------
-def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=60):
+def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=60,
+                         value_mode="vstar"):
+    """value_mode controls the value line under each node:
+      - "vstar": optimistic backup V* = max advantage reachable from the prefix.
+      - "mean" : honest expected value V̄ = ΣA / n over rollouts through the
+                 prefix (can be negative; on a single-rollout leaf it equals
+                 that rollout's own advantage, so it transitions smoothly).
+      - "none" : hide the value line.
+    """
     tree = _collapse(raw_trie.root)
     state = _annotate(tree)
     _compute_y(tree)
@@ -277,15 +285,23 @@ def draw_compressed_trie(ax, raw_trie, max_edge_chars=22, root_prefix_max_chars=
                         f"ΣA={adv_sum:+.2f}",
                         fontsize=6.5, ha="center", va="top",
                         parse_math=False, color=adv_color, fontweight="bold")
-            # Max-continuation value V* = best advantage still reachable
-            # from this prefix (optimistic backup, vs the averaging ΣA above).
-            v_star = node.get("v_star", float("-inf"))
-            if v_star != float("-inf"):
-                v_color = "#1e7e34" if v_star > 0 else ("#b00020" if v_star < 0 else "#444")
-                ax.text(x, y - 0.68,
-                        f"V*={v_star:+.2f}",
+            # Value line: optimistic backup V* (max reachable advantage) or the
+            # honest expected value V̄ = ΣA / n (mean over rollouts through the
+            # prefix; equals the rollout's own advantage on a single-rollout
+            # leaf, so per-step figures transition smoothly into the final one).
+            if value_mode == "vstar":
+                val = node.get("v_star", float("-inf"))
+                if val != float("-inf"):
+                    vc = "#1e7e34" if val > 0 else ("#b00020" if val < 0 else "#444")
+                    ax.text(x, y - 0.68, f"V*={val:+.2f}",
+                            fontsize=6.5, ha="center", va="top",
+                            parse_math=False, color=vc)
+            elif value_mode == "mean" and node.get("adv_n", 0) > 0:
+                val = node["adv_sum"] / node["adv_n"]
+                vc = "#1e7e34" if val > 0 else ("#b00020" if val < 0 else "#444")
+                ax.text(x, y - 0.68, f"V̄={val:+.2f}",
                         fontsize=6.5, ha="center", va="top",
-                        parse_math=False, color=v_color)
+                        parse_math=False, color=vc)
 
         # Leaf marker: ✓ / ✗ to the right.
         if not node["children"] and node["terminal"] > 0:
@@ -530,6 +546,151 @@ def overlay_legend_handles(steps):
                       label="solid: still present at last step"),
     ]
     return handles
+
+
+# ---------------------------------------------------------------------------
+# Prefix-node scoring
+# ---------------------------------------------------------------------------
+def _quantile(sorted_vals, q):
+    """Linear-interpolated quantile of an already-sorted list."""
+    if not sorted_vals:
+        return 0.0
+    if q <= 0:
+        return sorted_vals[0]
+    if q >= 1:
+        return sorted_vals[-1]
+    pos = q * (len(sorted_vals) - 1)
+    lo = int(pos)
+    frac = pos - lo
+    if lo + 1 < len(sorted_vals):
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[lo + 1] * frac
+    return sorted_vals[lo]
+
+
+def _minmax_norm(records, field, out_field):
+    """Min-max normalize `field` across records into `out_field` (in [0,1])."""
+    vals = [r[field] for r in records]
+    if not vals:
+        return
+    lo, hi = min(vals), max(vals)
+    span = hi - lo
+    for r in records:
+        r[out_field] = (r[field] - lo) / span if span > 0 else 0.0
+
+
+def score_prefix_nodes(
+    multi_trie,
+    *,
+    adv_quantile=(0.25, 0.75),
+    w_rarity=1.0,
+    w_few_children=1.0,
+    w_success_rarity=1.0,
+    require_positive_adv=True,
+    include_root=False,
+    eps=1e-8,
+):
+    """Score every prefix node of a ``MultiStepTrie`` (higher = more interesting).
+
+    A prefix is treated as a promising / rare "gadget" when:
+
+    - **rarity**: it has a *small pass-through frequency* (few rollouts traverse
+      it) -> higher score. Encoded as ``-log(freq)`` then min-max normalized.
+    - **few children**: it is *committal* (forks into few continuations) ->
+      higher score. Encoded as ``1 / (1 + n_children)``.
+    - **positive advantage gate**: only nodes whose aggregate mean advantage is
+      ``> 0`` are eligible (when ``require_positive_adv``); ineligible nodes get
+      ``score = -inf``.
+    - **success rarity inside the global band**: among positive-advantage nodes,
+      those whose mean advantage falls inside the global inter-quantile band
+      ``[q_lo, q_hi]`` get an extra bonus, and within that band a *rarer success*
+      (lower success rate) scores higher (``1 - success_rate``).
+
+    Aggregation is over all steps stored in the node's per-step dicts.
+
+    Returns a list of per-node record dicts sorted by ``score`` descending. Each
+    record carries the full ``prefix`` string, ``tokens`` (this node's collapsed
+    segment), ``cum_len``, raw stats (``count``, ``freq``, ``correct``,
+    ``success_rate``, ``n_children``, ``adv_sum``, ``mean_adv``), the individual
+    score components, ``in_adv_band``, ``eligible`` and the final ``score``.
+    """
+    import math
+
+    tree = _collapse_multi(multi_trie.root)
+    state = _annotate(tree)
+    nodes = state["all"]
+
+    # Accumulate the full prefix string from root to each node.
+    prefix_text = {}
+
+    def _walk(node, parent_pref):
+        seg = " ".join(node["tokens"])
+        cur = (parent_pref + " " + seg).strip() if seg else parent_pref
+        prefix_text[node["id"]] = cur
+        for ch in node["children"].values():
+            _walk(ch, cur)
+
+    _walk(tree, "")
+
+    n_total = sum(tree["count_per_step"].values()) or 1
+
+    records = []
+    for node in nodes:
+        is_root = node["parent_id"] is None
+        if is_root and not include_root:
+            continue
+        count = sum(node["count_per_step"].values())
+        if count == 0:
+            continue
+        correct = sum(node["count_correct_per_step"].values())
+        adv_sum = sum(node["adv_sum_per_step"].values())
+        adv_n = sum(node["adv_n_per_step"].values())
+        mean_adv = adv_sum / adv_n if adv_n else 0.0
+        n_children = len(node["children"])
+        records.append({
+            "id": node["id"],
+            "prefix": prefix_text[node["id"]],
+            "tokens": list(node["tokens"]),
+            "cum_len": node["cum_len"],
+            "count": count,
+            "freq": count / n_total,
+            "correct": correct,
+            "success_rate": correct / count,
+            "n_children": n_children,
+            "adv_sum": adv_sum,
+            "mean_adv": mean_adv,
+            "is_root": is_root,
+            "is_leaf": n_children == 0,
+        })
+
+    if not records:
+        return []
+
+    # Global inter-quantile band over the mean advantage of positive-adv nodes.
+    pos_adv = sorted(r["mean_adv"] for r in records if r["mean_adv"] > 0)
+    q_lo = _quantile(pos_adv, adv_quantile[0])
+    q_hi = _quantile(pos_adv, adv_quantile[1])
+
+    # Component scores.
+    for r in records:
+        r["s_rarity"] = -math.log(r["freq"] + eps)
+        r["s_few_children"] = 1.0 / (1.0 + r["n_children"])
+        r["s_success_rarity"] = 1.0 - r["success_rate"]
+        r["eligible"] = (r["mean_adv"] > 0) if require_positive_adv else True
+        r["in_adv_band"] = (r["mean_adv"] > 0) and (q_lo <= r["mean_adv"] <= q_hi)
+
+    _minmax_norm(records, "s_rarity", "s_rarity_norm")
+
+    for r in records:
+        if not r["eligible"]:
+            r["score"] = float("-inf")
+            continue
+        sc = w_rarity * r["s_rarity_norm"] + w_few_children * r["s_few_children"]
+        if r["in_adv_band"]:
+            sc += w_success_rarity * r["s_success_rarity"]
+        r["score"] = sc
+
+    records.sort(key=lambda r: r["score"], reverse=True)
+    return records
 
 
 # ---------------------------------------------------------------------------
