@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Length-Regularized GRPO on GSM8K — Why Compression Costs Accuracy</title>
+<style>
+  :root{
+    --bg:#fbfaf7; --fg:#1d2127; --muted:#5c6470; --line:#e3e0d8;
+    --accent:#2e6f4e; --bad:#c0392b; --good:#27ae60; --neutral:#7a7f87;
+    --card:#ffffff; --code:#f3f1ea;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0; background:var(--bg); color:var(--fg);
+    font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  .wrap{max-width:1180px; margin:0 auto; padding:40px 28px 80px;}
+  header.title{border-bottom:2px solid var(--line); padding-bottom:22px; margin-bottom:36px;}
+  h1{font-size:30px; line-height:1.25; margin:0 0 10px;}
+  .subtitle{color:var(--muted); font-size:16px; margin:0;}
+  .tag{display:inline-block; font-size:12px; letter-spacing:.04em; text-transform:uppercase;
+       color:var(--accent); background:#e8f1ec; border:1px solid #cfe3d8;
+       padding:2px 9px; border-radius:999px; margin-bottom:14px; font-weight:600;}
+  h2{font-size:22px; margin:46px 0 6px; padding-top:10px;}
+  h2 .num{color:var(--accent); font-variant-numeric:tabular-nums;}
+  h3{font-size:17px; margin:26px 0 6px; color:#2b2f36;}
+  p{margin:10px 0;}
+  .lede{font-size:17px; color:#2b2f36;}
+  .muted{color:var(--muted);}
+  strong{font-weight:650;}
+  table{border-collapse:collapse; width:100%; margin:18px 0; font-size:15px;
+        background:var(--card); border:1px solid var(--line); border-radius:10px; overflow:hidden;}
+  caption{caption-side:top; text-align:left; color:var(--muted); font-size:13px; margin-bottom:8px;}
+  th,td{padding:10px 14px; border-bottom:1px solid var(--line); text-align:right; font-variant-numeric:tabular-nums;}
+  th:first-child,td:first-child{text-align:left;}
+  thead th{background:#f0ede5; font-weight:650; color:#2b2f36;}
+  tbody tr:last-child td{border-bottom:none;}
+  tr.highlight td{background:#fcf3f1;}
+  .delta-bad{color:var(--bad); font-weight:650;}
+  .delta-good{color:var(--good); font-weight:650;}
+  .cards{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin:22px 0;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px;}
+  .card .k{font-size:26px; font-weight:700; line-height:1;}
+  .card .l{font-size:13px; color:var(--muted); margin-top:6px;}
+  .card.bad .k{color:var(--bad);} .card.good .k{color:var(--good);}
+  figure{margin:24px 0; background:var(--card); border:1px solid var(--line);
+          border-radius:12px; padding:16px;}
+  figure img{width:100%; height:auto; display:block; border-radius:6px;}
+  figcaption{font-size:14px; color:var(--muted); margin-top:12px;}
+  figcaption b{color:#2b2f36;}
+  .fig-grid{display:grid; grid-template-columns:1fr 1fr; gap:20px;}
+  .callout{background:#eef5f1; border:1px solid #cfe3d8; border-left:4px solid var(--accent);
+           border-radius:8px; padding:16px 18px; margin:22px 0;}
+  .callout h3{margin-top:0; color:var(--accent);}
+  .hyp{background:#fff; border:1px solid var(--line); border-radius:10px; padding:18px 20px; margin:18px 0;}
+  .hyp .label{font-size:12px; text-transform:uppercase; letter-spacing:.05em; color:var(--accent); font-weight:650;}
+  code{background:var(--code); padding:1px 6px; border-radius:5px; font-size:14px;
+       font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;}
+  ul{margin:10px 0 10px 2px; padding-left:20px;} li{margin:6px 0;}
+  .footer{margin-top:60px; padding-top:18px; border-top:1px solid var(--line);
+          color:var(--muted); font-size:13px;}
+  @media (max-width:760px){ .cards{grid-template-columns:repeat(2,1fr);} .fig-grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="title">
+    <h1>When CoT Compression Costs Accuracy &mdash; Length-Regularized GRPO on GSM8K</h1>
+    <p class="subtitle">Qwen3-1.7B · GSM8K val (1303 queries × 8 rollouts) · GRPO + InvLength reward · 300 steps</p>
+  </header>
+
+  <div class="callout">
+    <h3>The maze</h3>
+    <p>
+      If you know what the exit looks like, being lost in a maze makes you keep searching.
+      If you do not know what the exit looks like, you may walk into a dead end and think you are done.
+    </p>
+    <p style="margin-bottom:0">
+      A long chain-of-thought is the model wandering the maze. When it has a good sense of the exit,
+      <b>wrong rollouts run long</b> &mdash; it knows it has not arrived &mdash; while
+      <b>correct rollouts are short</b> because it recognizes the answer. When that sense is missing,
+      <b>wrong answers can be short too</b>: the model mistakes a dead end for the exit. We report analysis on GRPO with extra rewards on shortness.
+    </p>
+  </div>
+
+  <table>
+    <caption>Table 1. Length-regularized GRPO (InvLength) vs. plain GRPO baseline, step 0 &rarr; 300.
+      Of 1303 queries: <b>105 regressed</b> (acc&nbsp;&ge;0.75&rarr;&le;0.25), <b>37 improved</b> (acc&nbsp;&le;0.25&rarr;&ge;0.75).</caption>
+    <thead>
+      <tr><th>Configuration</th><th>Acc @0</th><th>Acc @300</th><th>&Delta; Acc</th><th>Len @0</th><th>Len @300</th><th>&Delta; Len</th></tr>
+    </thead>
+    <tbody>
+      <tr class="highlight">
+        <td>GRPO + InvLength <span class="muted">(this run)</span></td>
+        <td>79.8%</td><td>69.7%</td><td class="delta-bad">&minus;10.1 pp</td>
+        <td>569</td><td>85</td><td class="delta-good">&minus;85%</td>
+      </tr>
+      <tr>
+        <td>GRPO baseline</td>
+        <td>79.8%</td><td>83.9%</td><td class="delta-good">+4.1 pp</td>
+        <td>569</td><td>478</td><td>&minus;16%</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <figure>
+    <img src="figures/0529-q16-gsm8k-lenreg-len.png" alt="CoT length, correct vs wrong, by group" />
+    <figcaption><b>Fig. 1 — CoT length</b> (correct vs. wrong rollouts, per group, across steps).</figcaption>
+  </figure>
+
+  <table>
+    <caption>Table 2. Mean CoT length, wrong vs. correct rollouts (all 1303 queries).
+      Wrong rollouts are consistently longer — most starkly at step 0.</caption>
+    <thead>
+      <tr><th>Step</th><th>Correct len</th><th>Wrong len</th><th>Gap (wrong &minus; correct)</th></tr>
+    </thead>
+    <tbody>
+      <tr class="highlight"><td>0</td><td>475</td><td>937</td><td class="delta-good">+462&nbsp;&nbsp;(≈2×)</td></tr>
+      <tr><td>100</td><td>148</td><td>271</td><td class="delta-good">+123</td></tr>
+      <tr><td>200</td><td>88</td><td>118</td><td>+30</td></tr>
+      <tr><td>300</td><td>78</td><td>101</td><td>+23</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <h3>Core hypothesis</h3>
+    <p style="margin-bottom:0">
+      <b>The model stops when it thinks it has reached the exit, and keeps walking when it has not.</b>
+      At step 0 a wrong answer takes ≈2× the tokens of a correct one: the model can still tell it
+      is lost, so it searches longer. The size of this gap is its sense of the exit &mdash; and it
+      is exactly what length regularization puts under pressure.
+    </p>
+  </div>
+
+  <figure>
+    <img src="figures/0529-q16-gsm8k-lenreg-lengap.png" alt="Length gap wrong minus correct by group" />
+    <figcaption><b>Fig. 2 — Length gap</b> (wrong &minus; correct). Regressed collapses toward/below zero; improved grows above average.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="figures/0529-q16-gsm8k-explore-gram.png" alt="Frequency of different exploration n-grams" />
+    <figcaption><b>Fig. 3 — Exploration n-gram vocabulary.</b> Frequency of the individual
+      markers tracked (&ldquo;wait&rdquo;, &ldquo;let me check again&rdquo;, &ldquo;make sure&rdquo;,
+      &ldquo;I made a mistake&rdquo;, &hellip;) &mdash; the search/verify language whose
+      correct-vs-wrong split is analyzed below.</figcaption>
+  </figure>
+
+  <figure>
+    <img src="figures/0529-q16-gsm8k-lenreg-ngram.png" alt="Exploration n-gram counts, correct vs wrong, by group" />
+    <figcaption><b>Fig. 4 — Exploration n-grams per rollout</b> (correct vs. wrong, per group).</figcaption>
+  </figure>
+
+  <figure>
+    <img src="figures/0529-q16-gsm8k-lenreg-ngramgap.png" alt="Exploration n-gram gap wrong minus correct by group" />
+    <figcaption><b>Fig. 5 — n-gram gap</b> (wrong &minus; correct). Mirrors Fig. 2.</figcaption>
+  </figure>
+
+  <div class="callout">
+    <h3>Conclusion</h3>
+    <p>
+      The wrong&minus;correct gap &mdash; in length and in exploration n-grams &mdash; is the
+      model&rsquo;s sense of the exit made measurable:
+    </p>
+    <ul style="margin:0">
+      <li><b>Regressed</b> &mdash; the gap shrinks, even flips negative (Figs. 2, 5): the model has
+        lost sight of the exit, so it stops at dead ends as readily as at the answer. Compression
+        cuts the very wandering it needed, and accuracy collapses.</li>
+      <li><b>Improved</b> &mdash; the gap widens past average: the model learns what the exit looks
+        like, walks straight out when right and keeps searching when wrong &mdash; and accuracy rises.</li>
+    </ul>
+    <p style="margin-bottom:0">
+      <b>Harmful compression is not about how short the path gets, but whether the model can still
+      recognize the exit.</b> Keep that gap alive &mdash; use it to gate the length penalty &mdash;
+      and we get compression without the dead ends.
+    </p>
+  </div>
+
+  <div class="footer">
+    Qwen3-1.7B · GSM8K val · R = 10·InvLogLen + correctness + format · steps {0,100,200,300} · figures from <code>tree.ipynb</code>.
+  </div>
+
+</div>
+</body>
+</html>
