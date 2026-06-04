@@ -31,6 +31,7 @@ __all__ = [
     "TARGET", "safe_eval", "verify_24", "enumerate_solutions",
     # dataset construction
     "build_puzzle_pool", "bucket_by_difficulty", "make_splits",
+    "split_train_eval", "make_dataset",
     # prompt formatting
     "SYSTEM_PROMPT", "to_chat", "build_datasets",
     # rewards
@@ -85,10 +86,53 @@ _TEMPLATES = (
 _OPS = ("+", "-", "*", "/")
 
 
+def _canon_node(node):
+    """Canonical key collapsing associativity + commutativity (the human /
+    reference notion of a distinct solution): rewrite ``a-b`` as ``a+(-b)`` and
+    ``a/b`` as ``a*(1/b)``, then flatten ``+``/``*`` chains into sorted
+    commutative multisets. Equivalent solutions (e.g. ``(8+2)+10+4`` and
+    ``8+(2+10)+4``) map to the same key."""
+    if isinstance(node, ast.Expression):
+        return _canon_node(node.body)
+    if isinstance(node, ast.Constant):
+        return ("n", node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+        return ("neg", _canon_node(node.operand))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+        return _canon_node(node.operand)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            terms = []
+
+            def collect(n, sign):
+                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Add, ast.Sub)):
+                    collect(n.left, sign)
+                    collect(n.right, sign if isinstance(n.op, ast.Add) else -sign)
+                else:
+                    terms.append((sign, _canon_node(n)))
+
+            collect(node, 1)
+            return ("add", tuple(sorted(repr((s, k)) for s, k in terms)))
+        if isinstance(node.op, (ast.Mult, ast.Div)):
+            facs = []
+
+            def collect(n, inv):
+                if isinstance(n, ast.BinOp) and isinstance(n.op, (ast.Mult, ast.Div)):
+                    collect(n.left, inv)
+                    collect(n.right, inv if isinstance(n.op, ast.Mult) else (1 - inv))
+                else:
+                    facs.append((inv, _canon_node(n)))
+
+            collect(node, 0)
+            return ("mul", tuple(sorted(repr((i, k)) for i, k in facs)))
+    raise ValueError(ast.dump(node))
+
+
 def _ast_key(expr: str) -> Optional[str]:
-    """Canonical AST dump of `expr`, used for dedup. None if unparseable."""
+    """Canonical key of `expr` for dedup, collapsing associativity and
+    commutativity. None if unparseable."""
     try:
-        return ast.dump(ast.parse(expr, mode="eval").body)
+        return repr(_canon_node(ast.parse(expr, mode="eval")))
     except Exception:
         return None
 
@@ -241,6 +285,31 @@ def build_datasets(
         Dataset.from_list([to_chat(p) for p in eval_puzzles]),
         Dataset.from_list([to_chat(p) for p in probe_puzzles]),
     )
+
+
+def split_train_eval(
+    pool: List[Dict[str, Any]],
+    *,
+    eval_frac: float = 0.40,
+    eval_min: int = 400,
+    rng: Optional[random.Random] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Flat (no difficulty buckets) train/eval split.
+
+    Validation size = ``max(round(eval_frac * N), eval_min)``, capped at ``N``;
+    the remainder is training. The pool is shuffled first.
+    """
+    rng = rng or random
+    pool = list(pool)
+    rng.shuffle(pool)
+    n = len(pool)
+    n_eval = min(n, max(round(eval_frac * n), eval_min))
+    return pool[n_eval:], pool[:n_eval]
+
+
+def make_dataset(puzzles: List[Dict[str, Any]]) -> Dataset:
+    """Wrap a puzzle list as a HuggingFace `Dataset` ready for `GRPOTrainer`."""
+    return Dataset.from_list([to_chat(p) for p in puzzles])
 
 
 # ---------------------------------------------------------------------------

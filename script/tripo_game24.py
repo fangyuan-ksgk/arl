@@ -24,9 +24,11 @@ breadth-first: every active leaf spawns ``--tree-branch`` continuations of
 ``--tree-block-size`` tokens, identical continuations collapse, and leaves that
 emit EOS are carried forward (never re-expanded). After ``--tree-steps`` steps
 the leaves are reconciled to exactly ``num_generations`` completions/prompt so
-GRPO's group structure is preserved. This reuses TRL's **colocate vLLM engine**
-(``self.vllm_generation.llm``) — no second model, no HF ``generate``.
-Requires ``--vllm-mode colocate``.
+GRPO's group structure is preserved. Backend-agnostic: it drives the **colocate
+vLLM engine** (``self.vllm_generation.llm.generate`` with token-id prompts) or,
+in **server** mode, the vLLM HTTP client (``self.vllm_generation.vllm_client``,
+text prompts) — no second model, no HF ``generate``. Works with either
+``--vllm-mode colocate`` or ``--vllm-mode server``.
 
 Examples
 --------
@@ -116,6 +118,67 @@ class TreeSamplingMixin:
             from vllm.inputs import TokensPrompt  # type: ignore
         return [TokensPrompt(prompt_token_ids=list(p)) for p in prefixes]
 
+    def _tree_server_sampling_kwargs(self, max_tokens: int) -> dict:
+        """SamplingParams (as kwargs) for the vLLM HTTP server client."""
+        a = self.args
+        return dict(
+            n=self.tree_branch,
+            repetition_penalty=getattr(a, "repetition_penalty", 1.0),
+            temperature=getattr(a, "temperature", 1.0),
+            top_p=getattr(a, "top_p", 1.0),
+            top_k=getattr(a, "top_k", 0),
+            min_p=getattr(a, "min_p", None) or 0.0,
+            max_tokens=max_tokens,
+            logprobs=0,
+        )
+
+    # ------------------------------------------------------------------
+    # Backend-agnostic block expansion: generate `tree_branch` continuations
+    # (<= block_size tokens) for each token-id prefix. Works against either the
+    # in-process colocate vLLM engine OR the vLLM HTTP server client.
+    # ------------------------------------------------------------------
+    def _expand_prefixes(self, prefixes, block_size):
+        """Return, per prefix, a list of ``(continuation_token_ids, done)``."""
+        if getattr(self, "vllm_mode", None) == "server":
+            return self._expand_prefixes_server(prefixes, block_size)
+        return self._expand_prefixes_colocate(prefixes, block_size)
+
+    def _expand_prefixes_colocate(self, prefixes, block_size):
+        llm = self.vllm_generation.llm
+        sp = self._tree_sampling_params(block_size)
+        outs = llm.generate(self._as_token_prompts(prefixes),
+                            sampling_params=sp, use_tqdm=False)
+        # finish_reason == "length" => hit block cap (not done);
+        # "stop"/"abort"/None-with-eos => terminated.
+        return [[(list(o.token_ids), o.finish_reason != "length")
+                 for o in out.outputs]
+                for out in outs]
+
+    def _expand_prefixes_server(self, prefixes, block_size):
+        # The TRL server's /generate/ endpoint accepts TEXT prompts only, so we
+        # decode each token-id prefix (special tokens kept) and re-send. Leaves
+        # are extended with our own tracked ids + the server's completion ids,
+        # so the stored token sequence stays self-consistent.
+        client = self.vllm_generation.vllm_client
+        tok = self.processing_class
+        texts = [tok.decode(p, skip_special_tokens=False) for p in prefixes]
+        out = client.generate(prompts=texts,
+                              **self._tree_server_sampling_kwargs(block_size))
+        comp = out["completion_ids"]            # prompt-major, `n` contiguous each
+        n = self.tree_branch
+        eos = tok.eos_token_id
+        results = []
+        for i in range(len(prefixes)):
+            per = []
+            for j in range(n):
+                cont = list(comp[i * n + j])
+                # No finish_reason over HTTP: a continuation that stopped before
+                # the block cap (or ends in EOS) is treated as terminated.
+                done = (len(cont) < block_size) or (bool(cont) and cont[-1] == eos)
+                per.append((cont, done))
+            results.append(per)
+        return results
+
     def _tree_sample_one(self, prompt_token_ids: List[int], block_size: int):
         """Breadth-first tree sample from a single tokenized prompt.
 
@@ -123,9 +186,6 @@ class TreeSamplingMixin:
         per surviving leaf. Mirrors `tree_sample` in tree_sample.ipynb: dedup
         identical continuations, carry EOS-terminated leaves forward unchanged.
         """
-        llm = self.vllm_generation.llm
-        sp = self._tree_sampling_params(block_size)
-
         leaves: List[Tuple[List[int], bool]] = [([], False)]  # (continuation, done)
         for _ in range(self.tree_steps):
             nxt: List[Tuple[List[int], bool]] = []
@@ -144,17 +204,9 @@ class TreeSamplingMixin:
 
             if active:
                 prefixes = [prompt_token_ids + leaf for leaf in active]
-                outs = llm.generate(
-                    self._as_token_prompts(prefixes),
-                    sampling_params=sp,
-                    use_tqdm=False,
-                )
-                for leaf, out in zip(active, outs):
-                    for o in out.outputs:
-                        cont = list(o.token_ids)
-                        # finish_reason == "length" => hit block cap, not done;
-                        # "stop"/"abort"/None-with-eos => terminated.
-                        child_done = o.finish_reason != "length"
+                expanded = self._expand_prefixes(prefixes, block_size)
+                for leaf, conts in zip(active, expanded):
+                    for cont, child_done in conts:
                         child = leaf + cont
                         key = tuple(child)
                         if key not in seen:
@@ -187,12 +239,12 @@ class TreeSamplingMixin:
         # the base trainer's deterministic single-sample generation.
         if getattr(self, "_greedy_pass", False):
             return super()._generate(prompts)
-        # Tree sampling is implemented on the colocate vLLM engine only.
-        if not (getattr(self, "use_vllm", False)
-                and getattr(self, "vllm_mode", None) == "colocate"):
+        # Tree sampling needs a vLLM backend; it is backend-agnostic via
+        # `_expand_prefixes` (colocate engine handle OR HTTP server client).
+        if not getattr(self, "use_vllm", False):
             raise RuntimeError(
-                "tree sampling requires vLLM colocate mode "
-                "(use_vllm=True, vllm_mode='colocate')."
+                "tree sampling requires vLLM (use_vllm=True; "
+                "vllm_mode 'colocate' or 'server')."
             )
 
         import torch
@@ -399,7 +451,7 @@ def main() -> None:
 
     from src.tree_trainer import TreeTrainer
     from src.game24utils import (
-        build_puzzle_pool, bucket_by_difficulty, make_splits, build_datasets,
+        build_puzzle_pool, split_train_eval, make_dataset,
         correctness_reward, format_reward, RolloutLogger,
     )
 
@@ -416,20 +468,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     puzzles = build_puzzle_pool(max_n=args.max_n)
-    easy, medium, hard = bucket_by_difficulty(puzzles, easy_min=8, hard_max=2)
-    train_puzzles, eval_puzzles, hard_probe = make_splits(
-        easy, medium, hard, eval_frac=args.eval_frac, probe_frac=0.40,
+    train_puzzles, eval_puzzles = split_train_eval(
+        puzzles, eval_frac=args.eval_frac, eval_min=args.eval_min,
     )
-    train_ds, eval_ds, probe_ds = build_datasets(train_puzzles, eval_puzzles, hard_probe)
-    print(f"[data] train={len(train_puzzles)} eval={len(eval_puzzles)} "
-          f"probe={len(hard_probe)}", flush=True)
+    train_ds, eval_ds = make_dataset(train_puzzles), make_dataset(eval_puzzles)
+    print(f"[data] total={len(puzzles)} train={len(train_puzzles)} "
+          f"eval={len(eval_puzzles)}", flush=True)
 
-    # Evaluate on ALL validation datasets: the in-distribution eval split and
-    # the held-out hard probe (D3). Passing a dict makes HF Trainer loop over
-    # each; the FastEvalMixin tags every rollout with its split name.
+    # Single in-distribution validation split. Passing a dict lets the
+    # FastEvalMixin tag every rollout with the split name.
     eval_datasets = {"eval": eval_ds}
-    if len(probe_ds) > 0:
-        eval_datasets["probe"] = probe_ds
 
     # Eval group size for the sampled pass@K (defaults to --num-generations).
     num_generations_eval = args.num_generations_eval or args.num_generations
@@ -498,9 +546,9 @@ def main() -> None:
 
     config = GRPOConfig(**config_kwargs)
 
-    if args.tree_sampling and (args.no_vllm or args.vllm_mode != "colocate"):
-        raise ValueError("--tree-sampling requires vLLM colocate mode "
-                         "(drop --no_vllm and use --vllm-mode colocate).")
+    if args.tree_sampling and args.no_vllm:
+        raise ValueError("--tree-sampling requires vLLM (drop --no_vllm; "
+                         "either --vllm-mode colocate or server works).")
 
     # ------- Trainer selection ------------------------------------------
     base_cls = TreeTrainer if args.trainer == "tree" else GRPOTrainer
@@ -592,9 +640,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--logging-steps", type=int, default=10)
     # Data
-    p.add_argument("--max-n", type=int, default=9,
-                   help="Puzzle numbers drawn from {1..max_n}.")
-    p.add_argument("--eval-frac", type=float, default=0.10)
+    p.add_argument("--max-n", type=int, default=13,
+                   help="Puzzle numbers drawn from {1..max_n} (13 = full deck; "
+                        "~1362 solvable, enough for the 400 validation floor).")
+    p.add_argument("--eval-frac", type=float, default=0.40,
+                   help="Validation fraction; actual size = max(eval_frac*N, eval_min).")
+    p.add_argument("--eval-min", type=int, default=400,
+                   help="Validation floor: at least this many puzzles (capped at N).")
     p.add_argument("--eval-steps", type=int, default=50,
                    help="Eval every N steps (0 to disable).")
     # vLLM
