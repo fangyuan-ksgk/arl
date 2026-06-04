@@ -17,6 +17,7 @@ Note: vLLM colocate mode is single-GPU only. For multi-GPU, use --no_vllm
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -98,6 +99,13 @@ class GSM8KRolloutLogger:
         self.eval_path  = eval_path
         self.tokenizer  = tokenizer
         self.in_eval    = False
+        # "sample" (T=1 pass@K) or "greedy" (T=0 pass@1). Flipped by
+        # FastEvalGRPOTrainer around each generation pass.
+        self.decoding   = "sample"
+        # Sampling temperature of the current pass. Stamped by
+        # FastEvalGRPOTrainer._eval_generate before each generation pass
+        # (≈0.0 for greedy, the configured eval temperature for sample).
+        self.temperature = None
         self.train_step = 0
         self.eval_step  = 0
         # Trainer.state.global_step at the moment eval was triggered.
@@ -132,6 +140,9 @@ class GSM8KRolloutLogger:
                     "n_cot_tokens":      int(n_cot_tok),
                     "has_answer_marker": bool(m_ans),
                     "split":             "eval" if self.in_eval else "train",
+                    "decoding":          self.decoding,
+                    "temperature":       (None if self.temperature is None
+                                          else float(self.temperature)),
                     "global_step":       int(self.global_step),
                 }) + "\n")
         if self.in_eval:
@@ -142,64 +153,58 @@ class GSM8KRolloutLogger:
 
 
 class FastEvalGRPOTrainer(GRPOTrainer):
-    """GRPOTrainer with a fast eval path.
-
-    TRL's default `prediction_step` runs `compute_loss`, which triggers two
-    full-model forwards per eval batch (one for `old_per_token_logps` inside
-    `_generate_and_score_completions`, one for the policy logp/entropy inside
-    `_compute_loss`). At vocab≈151k and `max_completion_length` long enough
-    to matter, that local forward dominates wall-clock; evaluating the full
-    GSM8K test set (1319 samples × `num_generations` rollouts) takes ~2h on a
-    single GPU even with vLLM driving generation.
-
-    For our use-case eval only needs (a) completions and (b) reward-function
-    callbacks (so the rollout logger fires). We don't backprop, don't need
-    importance-sampling ratios, and we report no loss metric. So skip both
-    forwards entirely: generate via vLLM, call reward funcs, return 0.
-
-    `num_generations` still works because TRL's eval sampler
-    (`_get_eval_sampler`) already repeats each prompt `num_generations_eval`
-    times, and `_generate` returns one completion per repeated prompt.
+    """GRPOTrainer with a fast eval path. Avoids forward propagation via over-writing "prediction_step" (called within .evaluate method)
     """
+    @contextlib.contextmanager
+    def _greedy_eval(self):
+        """Temporarily force greedy decoding (T=0) and 1 generation/prompt.
+        """
+        old_neval = self.num_generations_eval
+        self.num_generations_eval = 1
+        vg = getattr(self, "vllm_generation", None)
+        gc = getattr(self, "generation_config", None)
+        old_vg_t = getattr(vg, "temperature", None) if vg is not None else None
+        old_gc = (gc.temperature, gc.do_sample) if gc is not None else None
+        if vg is not None:
+            vg.temperature = 0.0
+        if gc is not None:
+            gc.do_sample = False
+        try:
+            yield
+        finally:
+            self.num_generations_eval = old_neval
+            if vg is not None:
+                vg.temperature = old_vg_t
+            if gc is not None:
+                gc.temperature, gc.do_sample = old_gc
 
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        prompts = [x["prompt"] for x in inputs]
-        # Per-batch progress line. HF Trainer's built-in tqdm gets buried under
-        # the GRPO log dicts and tee buffering, so print explicitly: which call,
-        # how many prompts in flight, wall time per call. Lets us watch vLLM
-        # batching behaviour live and project total eval time.
-        if not hasattr(self, "_eval_call_idx"):
-            self._eval_call_idx = 0
-            self._eval_t0 = time.time()
-        self._eval_call_idx += 1
+    def _current_temperature(self):
+        """Live sampling temperature for the in-flight generation pass.
+
+        Reads from the active vLLM generation params first, then the HF
+        generation config. Inside `_greedy_eval` these are forced to 0.0,
+        so the greedy pass naturally records ~0.0 while the sample pass
+        records the configured eval temperature.
+        """
+        vg = getattr(self, "vllm_generation", None)
+        if vg is not None and getattr(vg, "temperature", None) is not None:
+            return float(vg.temperature)
+        gc = getattr(self, "generation_config", None)
+        if gc is not None and getattr(gc, "temperature", None) is not None:
+            return float(gc.temperature)
+        return getattr(getattr(self, "args", None), "temperature", None)
+
+    def _eval_generate(self, prompts, inputs, *, decoding):
+        logger = getattr(self, "_rollout_logger", None)
+        if logger is not None:
+            logger.decoding = decoding
+            logger.temperature = self._current_temperature()
         _t = time.time()
-
-        # TRL versions differ in `_generate`'s return arity (7 in 0.29, more in
-        # later releases). The first four positions and the last position
-        # (extra_fields) have been stable, so index defensively.
         result = self._generate(prompts)
         completion_ids_list = result[1]
         completions = result[3]
         extra_fields = result[-1] if isinstance(result[-1], dict) else {}
-
         dt = time.time() - _t
-        elapsed = time.time() - self._eval_t0
-        n_total = len(self.eval_dataset) if self.eval_dataset is not None else None
-        bs_unique = len(prompts) // max(1, self.args.num_generations)
-        if n_total:
-            done = self._eval_call_idx * bs_unique
-            eta = elapsed * (n_total - done) / max(1, done)
-            print(f"[eval] call {self._eval_call_idx}: {len(prompts)} gens "
-                  f"({bs_unique} prompts) in {dt:.1f}s | "
-                  f"~{done}/{n_total} prompts | elapsed {elapsed/60:.1f}m | "
-                  f"ETA {eta/60:.1f}m", flush=True)
-        else:
-            print(f"[eval] call {self._eval_call_idx}: {len(prompts)} gens in {dt:.1f}s",
-                  flush=True)
-
-        # Merge rollout_func extras into inputs the same way the parent does
-        # before _calculate_rewards, so any reward fn that reads extras still
-        # works on the fast eval path.
         if extra_fields:
             for i, inp in enumerate(inputs):
                 for key, values in extra_fields.items():
@@ -207,9 +212,46 @@ class FastEvalGRPOTrainer(GRPOTrainer):
                         inp[key] = values[i]
                     elif not isinstance(values, list):
                         inp[key] = values
+        if decoding == "greedy":
+            if logger is not None:
+                logger(completions=completions,
+                       gold_answer=[x["gold_answer"] for x in inputs])
+        else:
+            self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+        return dt, len(completions)
 
-        # Fires reward funcs (including the rollout logger shim).
-        self._calculate_rewards(inputs, prompts, completions, completion_ids_list)
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        prompts = [x["prompt"] for x in inputs]
+        if not hasattr(self, "_eval_call_idx"):
+            self._eval_call_idx = 0
+            self._eval_t0 = time.time()
+        self._eval_call_idx += 1
+
+        # Pass 1: sampled pass@K — T=1, `num_generations_eval` rollouts/prompt.
+        dt, n_gen = self._eval_generate(prompts, inputs, decoding="sample")
+
+        # Pass 2: greedy pass@1 — T=0, 1 rollout per *unique* prompt. The eval
+        # sampler repeats each prompt G times; slice back to uniques so we get
+        # one deterministic completion each.
+        G = max(1, self.num_generations_eval)
+        uniq_inputs = inputs[::G]
+        uniq_prompts = prompts[::G]
+        with self._greedy_eval():
+            dt_g, _ = self._eval_generate(uniq_prompts, uniq_inputs, decoding="greedy")
+
+        elapsed = time.time() - self._eval_t0
+        n_total = len(self.eval_dataset) if self.eval_dataset is not None else None
+        bs_unique = len(prompts) // G
+        if n_total:
+            done = self._eval_call_idx * bs_unique
+            eta = elapsed * (n_total - done) / max(1, done)
+            print(f"[eval] call {self._eval_call_idx}: {n_gen} sample + {bs_unique} greedy gens "
+                  f"({bs_unique} prompts) in {dt:.1f}s+{dt_g:.1f}s | "
+                  f"~{done}/{n_total} prompts | elapsed {elapsed/60:.1f}m | "
+                  f"ETA {eta/60:.1f}m", flush=True)
+        else:
+            print(f"[eval] call {self._eval_call_idx}: {n_gen} sample + {bs_unique} greedy gens "
+                  f"in {dt:.1f}s+{dt_g:.1f}s", flush=True)
 
         loss = torch.zeros((), device=self.accelerator.device)
         return loss, None, None
@@ -767,6 +809,8 @@ def main():
         peft_config=peft_config,
         callbacks=[EvalFlagCallback(rollout_logger)],
     )
+    # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
+    trainer._rollout_logger = rollout_logger
 
     # Bind model ref for MBE forward passes (MBEDynamicsLogger only, not RolloutRecorder)
     if mbe_logger is not None and hasattr(mbe_logger, "set_model"):

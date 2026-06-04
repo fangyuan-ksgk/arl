@@ -80,6 +80,49 @@ class PrefixTrie:
             out.append(node.a_max)
         return out
 
+    def token_node_breakdown(self) -> dict:
+        """Classify every non-root node (each = one token in the dedup'd trie).
+        """
+        shared = nonshared = leaf = 0
+
+        leaves: dict = {}
+        stack = [(self, False)]
+        while stack:
+            node, processed = stack.pop()
+            if not node.children:
+                leaves[id(node)] = 1
+                continue
+            if not processed:
+                stack.append((node, True))
+                for child in node.children.values():
+                    stack.append((child, False))
+                continue
+            n_leaves = 0
+            for child in node.children.values():
+                child_leaves = leaves[id(child)]
+                if not child.children:
+                    leaf += 1
+                elif child_leaves >= 2:
+                    shared += 1
+                else:
+                    nonshared += 1
+                n_leaves += child_leaves
+            leaves[id(node)] = n_leaves
+
+        return {
+            "shared": shared,
+            "nonshared": nonshared,
+            "leaf": leaf,
+            "total": shared + nonshared + leaf,
+        }
+
+    @property
+    def shared_prefix_token_fraction(self) -> float:
+        """Fraction of tokens in the trie that live in a shared prefix node
+        (a node traversed by >=2 rollouts). Returns 0.0 for an empty trie."""
+        b = self.token_node_breakdown()
+        return b["shared"] / b["total"] if b["total"] else 0.0
+
 
 def optimistic_prefix_advantages(
     token_seqs: Sequence[Sequence[Hashable]],

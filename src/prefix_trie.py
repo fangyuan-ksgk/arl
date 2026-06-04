@@ -76,6 +76,47 @@ class Trie:
             if r > n["_rmax"]: n["_rmax"] = r
         n["_t"] += 1; n["_tc"] += c
 
+    def token_node_breakdown(self):
+        """Classify every non-root node (each = one token in the dedup'd trie),
+        using the exact pass-through count `_c` (rollouts traversing the node):
+
+        - ``shared``    : has children and _c >= 2 -> a token on a prefix
+                          common to >=2 rollouts.
+        - ``nonshared`` : has children but _c == 1 -> a unary tail unique to a
+                          single rollout.
+        - ``leaf``      : no children -> the last token of a rollout.
+
+        Returns ``{"shared", "nonshared", "leaf", "total"}``.
+        """
+        shared = nonshared = leaf = 0
+        stack = [self.root]
+        while stack:
+            node = stack.pop()
+            for tok, child in node.items():
+                if tok.startswith("_"):
+                    continue
+                has_kids = any(not k.startswith("_") for k in child)
+                if not has_kids:
+                    leaf += 1
+                elif child["_c"] >= 2:
+                    shared += 1
+                else:
+                    nonshared += 1
+                stack.append(child)
+        return {
+            "shared": shared,
+            "nonshared": nonshared,
+            "leaf": leaf,
+            "total": shared + nonshared + leaf,
+        }
+
+    @property
+    def shared_prefix_token_fraction(self):
+        """Fraction of tokens in the trie that live in a shared prefix node
+        (a node traversed by >=2 rollouts). Returns 0.0 for an empty trie."""
+        b = self.token_node_breakdown()
+        return b["shared"] / b["total"] if b["total"] else 0.0
+
 
 def build_trie_with_correctness(rows):
     """rows: iterable of (token_seq, correct_bool) or (token_seq, correct_bool, advantage).
