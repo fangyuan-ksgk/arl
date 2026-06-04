@@ -4,8 +4,11 @@
 #
 # Layout (2 GPUs): vLLM server on VLLM_GPU, training on TRAIN_GPU. Verifies that
 #   - tree sampling runs end-to-end in --vllm-mode server,
-#   - eval fires over ALL val splits (eval + probe), sampled + greedy,
+#   - eval fires over the validation split, sampled (t=1) + greedy (t=0),
 #   - train and eval rollouts land in their JSONL files.
+#
+# Uses a small pool (--max-n 6) + tiny validation floor (--eval-min 4) so the
+# whole run finishes fast; the real training defaults are --max-n 13 / 400.
 #
 # Usage:
 #   bash script/smoke_tree_server.sh
@@ -84,7 +87,7 @@ cmd=( "${PY}" script/tripo_game24.py
     --max-completion-length 128
     --per-device-batch-size 2 --grad-accum 4
     --learning-rate 5e-6 --temperature 1.0 --logging-steps 1
-    --max-n 9
+    --max-n 6 --eval-frac 0.1 --eval-min 4
     --vllm-mode "${MODE}" )
 
 if [[ "${MODE}" == "server" ]]; then
@@ -122,10 +125,14 @@ for f in "${TRAIN_JSONL}" "${EVAL_JSONL}"; do
   fi
 done
 
-# eval JSONL should carry both splits and both decodings.
+# eval JSONL should carry the validation split and BOTH decodings (sample+greedy).
 if [[ -s "${EVAL_JSONL}" ]]; then
   echo "  eval splits seen:    $(grep -o '"eval_dataset":[^,]*' "${EVAL_JSONL}" | sort -u | tr '\n' ' ')"
-  echo "  eval decodings seen: $(grep -o '"decoding":[^,]*' "${EVAL_JSONL}" | sort -u | tr '\n' ' ')"
+  decs="$(grep -o '"decoding":[^,]*' "${EVAL_JSONL}" | sort -u | tr '\n' ' ')"
+  echo "  eval decodings seen: ${decs}"
+  if ! grep -q '"decoding": *"greedy"' "${EVAL_JSONL}" || ! grep -q '"decoding": *"sample"' "${EVAL_JSONL}"; then
+    echo "  FAIL: expected both 'sample' and 'greedy' decodings in eval log"; fail=1
+  fi
 fi
 
 echo "--------------------------------------------------------------"
