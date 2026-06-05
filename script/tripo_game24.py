@@ -311,6 +311,8 @@ class TreeSamplingMixin:
             total_completion_tokens,
             logprobs,
             extra_fields,
+            None,   # images      (TRL 1.5.1 expects 9-tuple)
+            None,   # tool_images
         )
 
 
@@ -472,6 +474,11 @@ def main() -> None:
         puzzles, eval_frac=args.eval_frac, eval_min=args.eval_min,
     )
     train_ds, eval_ds = make_dataset(train_puzzles), make_dataset(eval_puzzles)
+    if getattr(args, "no_think", False):
+        def _nt(ex):
+            pp=[dict(m) for m in ex["prompt"]]; pp[-1]["content"]=pp[-1]["content"]+" /no_think"; return {"prompt": pp}
+        train_ds=train_ds.map(_nt); eval_ds=eval_ds.map(_nt)
+        print("[no_think] appended /no_think to all prompts", flush=True)
     print(f"[data] total={len(puzzles)} train={len(train_puzzles)} "
           f"eval={len(eval_puzzles)}", flush=True)
 
@@ -544,6 +551,9 @@ def main() -> None:
         config_kwargs["eval_steps"] = args.eval_steps
         config_kwargs["eval_on_start"] = True
 
+    config_kwargs["vllm_importance_sampling_correction"] = False
+    config_kwargs["beta"] = args.beta            # KL coef vs reference; >0 anchors policy (anti-collapse)
+    config_kwargs["scale_rewards"] = args.scale_rewards   # group(default,÷std) | none(Dr.GRPO) | batch
     config = GRPOConfig(**config_kwargs)
 
     if args.tree_sampling and args.no_vllm:
@@ -637,7 +647,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per-device-batch-size", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--learning-rate", type=float, default=5e-6)
+    p.add_argument("--beta", type=float, default=0.0,
+                   help="KL coefficient vs reference policy. 0=TRL default (no anchor, unstable on "
+                        "format-reward); >0 (e.g. 0.04) anchors the policy and prevents collapse.")
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--no-think", action="store_true", help="append /no_think to prompts (Qwen3)")
+    p.add_argument("--scale-rewards", choices=["group","none","batch"], default="group",
+                   help="advantage scaling: group=÷group-std (TRL default, 1/std blow-up); "
+                        "none=Dr.GRPO/no std-normalize; batch=÷batch-std")
     p.add_argument("--logging-steps", type=int, default=10)
     # Data
     p.add_argument("--max-n", type=int, default=13,
