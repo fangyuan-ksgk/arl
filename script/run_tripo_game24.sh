@@ -14,18 +14,26 @@
 #   CONFIGS="grpo tripo-flat tripo-tree tripo-flat-min tripo-tree-min"   (also: grpo-tree)
 set -uo pipefail
 
-# --- resolve paths relative to THIS file so it runs from any cwd ---
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../arl/script
-ARL="${ARL:-$(dirname "$SCRIPT_DIR")}"                       # .../arl
-RUN="${RUN:-$SCRIPT_DIR/tripo_game24.py}"
+# --- resolve paths robustly so it runs from any cwd AND survives arl/ re-syncs ---
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# arl repo root: explicit ARL env, else sibling-parent if it looks like the repo, else the known path
+if [ -z "${ARL:-}" ]; then
+  if [ -f "$(dirname "$SCRIPT_DIR")/src/game24utils.py" ]; then ARL="$(dirname "$SCRIPT_DIR")"; else ARL="/home/claudeuser/arl"; fi
+fi
+# training script: explicit RUN, else the first candidate that is actually PATCHED (accepts --beta).
+# Prefer the maintained patched copy in tripo_run/ since arl/script/tripo_game24.py gets reverted by re-syncs.
+if [ -z "${RUN:-}" ]; then
+  for _cand in "/home/claudeuser/tripo_run/tripo_game24_v2.py" "$SCRIPT_DIR/tripo_game24.py" "$ARL/script/tripo_game24.py"; do
+    if [ -f "$_cand" ] && grep -q -- '--beta' "$_cand" 2>/dev/null; then RUN="$_cand"; break; fi
+  done
+  RUN="${RUN:-$ARL/script/tripo_game24.py}"
+fi
 export PYTHONPATH="$ARL${PYTHONPATH:+:$PYTHONPATH}" HF_HUB_ENABLE_HF_TRANSFER=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+# If the caller pinned GPUs via CUDA_VISIBLE_DEVICES, respect it (don't override per-lane).
+CVD_USER="${CUDA_VISIBLE_DEVICES:-}"
 OUT="${OUT:-$HOME/tripo_game24_results}"
 BETA="${BETA:-0.04}"; SCALE="${SCALE:-group}"
-PORT_BASE="${PORT_BASE:-29600}"   # rendezvous port base
-: "${CUDA_VISIBLE_DEVICES:=0,1}"; export CUDA_VISIBLE_DEVICES   # default to GPUs 0,1; honor caller's override
-CVD="$CUDA_VISIBLE_DEVICES"
-PORT_TAG="${#CVD}${CVD: -1}"        # len(CVD) ++ last char  ("0,1"->31, "2,3"->33, "1"->11); never leading-zero
 SEEDS="${SEEDS:-0 1 2}"
 MODELS="${MODELS:-Qwen/Qwen3-0.6B Qwen/Qwen3-1.7B}"
 CONFIGS="${CONFIGS:-grpo tripo-flat tripo-tree tripo-flat-min tripo-tree-min}"
@@ -74,6 +82,13 @@ print()
 PY
 }
 
+# Pick a currently-free TCP port (OS-assigned) so concurrent runs never collide.
+# Override with MASTER_PORT_BASE=<n> to force a deterministic base instead.
+pick_free_port () {
+  python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()' \
+    2>/dev/null || echo $(( 20000 + RANDOM % 20000 ))
+}
+
 cfg_args () { case "$1" in
   grpo)           echo "--trainer grpo" ;;
   grpo-tree)      echo "--trainer grpo --tree-sampling --tree-branch 2 --tree-steps 3" ;;
@@ -84,17 +99,18 @@ cfg_args () { case "$1" in
   *) echo "BAD_CONFIG_$1" ;;
 esac; }
 
-# Note: colocate mode | need to add server mode to support >=4B Qwen models
-
-run_lane () {   # $1=model   (GPUs come from the exported CUDA_VISIBLE_DEVICES)
-  local M=$1 SLUG PDBS GA MEM S C D
+run_lane () {   # $1=model  $2=gpu
+  local M=$1 GPU=$2 SLUG PDBS GA MEM S C D
   SLUG=${M//\//__}
   case "$M" in *1.7B*|*1\.7B*) PDBS=2; GA=8; MEM=0.45 ;; *) PDBS=4; GA=4; MEM=0.55 ;; esac
   for S in $SEEDS; do
     for C in $CONFIGS; do
       D="$OUT/s$S/$SLUG/$C"; mkdir -p "$D"
-      echo ">>> [$M | cuda=$CVD | seed $S | $C] $(date)"
-      MASTER_PORT=$((PORT_BASE + PORT_TAG + 7*S)) \
+      # deterministic base (if given) keeps lanes/seeds separated; else a fresh free port per launch
+      if [ -n "${MASTER_PORT_BASE:-}" ]; then PORT=$(( MASTER_PORT_BASE + 100*GPU + S )); else PORT=$(pick_free_port); fi
+      local CVD="${CVD_USER:-$GPU}"   # honor caller's CUDA_VISIBLE_DEVICES if set, else lane index
+      echo ">>> [$M | CUDA_VISIBLE_DEVICES=$CVD | seed $S | $C | port $PORT] $(date)"
+      CUDA_VISIBLE_DEVICES=$CVD MASTER_PORT=$PORT \
       python "$RUN" --output-dir "$D" --model "$M" \
         --max-steps 120 --num-generations 8 --num-generations-eval 8 \
         --max-completion-length 1024 --no-think --max-n 6 --eval-frac 0.5 --eval-min 40 \
@@ -112,10 +128,13 @@ if [ "${1:-}" = "--tables-only" ]; then
   print_tables "${2:-$OUT}"; exit 0
 fi
 
-echo "RUN=$RUN"; echo "OUT=$OUT  BETA=$BETA  SCALE=$SCALE  SEEDS=[$SEEDS]  CUDA=$CVD  PORT_TAG=$PORT_TAG"
+echo "RUN=$RUN"; echo "OUT=$OUT  BETA=$BETA  SCALE=$SCALE  SEEDS=[$SEEDS]"
+gpu=0
 for M in $MODELS; do
-  run_lane "$M"
+  run_lane "$M" "$gpu" &
+  gpu=$((gpu + 1))
 done
+wait
 
 echo; echo "==================  MAIN TABLES (beta=$BETA, scale=$SCALE)  =================="
 print_tables "$OUT"
