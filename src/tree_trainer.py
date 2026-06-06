@@ -211,7 +211,11 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     """
 
     def __init__(self, *args, use_global_tree: bool = False,
-                 credit_mode: str = "max", **kwargs):
+                 credit_mode: str = "max",
+                 shaped_reward: bool = False,
+                 shaped_kwargs: Optional[dict] = None,
+                 difficulty_map: Optional[dict] = None,
+                 **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
         if credit_mode not in ("max", "min"):
@@ -219,6 +223,15 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         super().__init__(*args, **kwargs)
         self.use_global_tree = use_global_tree
         self.credit_mode = credit_mode
+        # Optional confident-failure / rare-success advantage shaping (arsenal).
+        # When True, the scalar GRPO advantage a_i is replaced by the shaped
+        # per-rollout reward BEFORE the OPA trie backup. `shaped_kwargs` may
+        # carry clip_logp / pos_scale / neg_scale.
+        self.shaped_reward = bool(shaped_reward)
+        self.shaped_kwargs = dict(shaped_kwargs or {})
+        # Optional numbers-tuple -> D_q override. When absent, D_q is taken from
+        # the dataset's per-row #solutions (D_q = 1/#solutions), else 1.0.
+        self.difficulty_map = dict(difficulty_map or {})
         # prompt-key -> PrefixTrie, persisted across batches when enabled.
         self._global_tries: dict = {}
 
@@ -324,3 +337,87 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         inputs = dict(inputs)
         inputs["advantages"] = adv_token
         return super()._compute_loss(model, inputs)
+
+    # ------------------------------------------------------------------
+    # Optional confident-failure / rare-success reward shaping (arsenal).
+    #
+    # Hook at the scoring stage (where `numbers`, correctness and the policy's
+    # sampling logprobs are all available) and overwrite the scalar GRPO
+    # advantage with the shaped per-rollout reward. The per-token OPA backup in
+    # `_compute_loss` then runs on top of the shaped scalar, unchanged. No-op
+    # when `shaped_reward` is False.
+    # ------------------------------------------------------------------
+    def _generate_and_score_completions(self, inputs):
+        out = super()._generate_and_score_completions(inputs)
+        if not self.shaped_reward:
+            return out
+        try:
+            shaped = self._shaped_advantages(out, inputs)
+        except Exception:
+            shaped = None          # shaping must never break training
+        if shaped is not None:
+            out["advantages"] = shaped
+        return out
+
+    def _shaped_advantages(self, out, inputs):
+        """Per-rollout shaped advantage tensor (B,) aligned with `out`, or None.
+
+        Ingredients (all process-local, 1:1 with the generation batch):
+          * correct  — any extracted candidate verifies (== correctness_reward)
+          * logp_o   — sum of the vLLM sampling logprobs over the completion mask
+          * D_q      — difficulty: explicit map, else 1/#solutions, else 1.0
+        """
+        adv   = out.get("advantages")
+        cmask = out.get("completion_mask")
+        cids  = out.get("completion_ids")
+
+        # Sequence logprob source. Prefer the vLLM *sampling* logprobs: the
+        # server/colocate engine returns the sampled-token logprob for free at
+        # generation time (TRL pads it into `sampling_per_token_logps`, right-
+        # padded with 0.0 — harmless since we mask). `old_per_token_logps` is a
+        # recomputed policy forward (expensive, and frequently None), so it is
+        # only a fallback. No GRPOConfig flag is needed: the vLLM path emits
+        # these logprobs unconditionally.
+        logp, src = out.get("sampling_per_token_logps"), "vllm_sampling"
+        if logp is None:
+            logp, src = out.get("old_per_token_logps"), "policy_recompute"
+        if adv is None or cmask is None or cids is None or logp is None:
+            return None
+        if getattr(self, "_logp_src", None) != src:
+            self._logp_src = src
+            print(f"[shaped-reward] logp_o source = {src}", flush=True)
+
+        B = cids.shape[0]
+        try:
+            numbers = [row["numbers"] for row in inputs]
+            sols    = [row.get("solutions") for row in inputs]
+        except Exception:
+            return None
+        if len(numbers) != B:
+            return None            # can't align -> keep TRL advantages
+
+        # log p_theta(o|q): sum sampling logprobs over real completion tokens.
+        logp_o = (logp * cmask).sum(dim=1).detach().float().cpu().numpy()
+
+        from .game24utils import verify_24, extract_expr_candidates
+        texts = self.processing_class.batch_decode(cids, skip_special_tokens=True)
+        correct = [
+            1.0 if any(verify_24(list(n), e) for e in extract_expr_candidates(t)) else 0.0
+            for t, n in zip(texts, numbers)
+        ]
+
+        D_q = []
+        for n, s in zip(numbers, sols):
+            d = self.difficulty_map.get(tuple(n))
+            if d is None:
+                d = (1.0 / len(s)) if s else 1.0
+            D_q.append(float(d))
+
+        import numpy as np
+
+        from .arsenal import confident_failure_rare_success
+        shaped = confident_failure_rare_success(
+            correct, logp_o, np.asarray(D_q, dtype=float),
+            **self.shaped_kwargs,
+        )
+        return torch.as_tensor(shaped, dtype=adv.dtype, device=adv.device)

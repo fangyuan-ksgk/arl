@@ -576,6 +576,12 @@ def main() -> None:
     if args.trainer == "tree":
         trainer_kwargs["use_global_tree"] = args.use_global_tree
         trainer_kwargs["credit_mode"] = args.credit_mode
+        if args.shaped_reward:
+            trainer_kwargs["shaped_reward"] = True
+            trainer_kwargs["shaped_kwargs"] = dict(
+                pos_scale=args.shaped_pos_scale,
+                neg_scale=args.shaped_neg_scale,
+            )
 
     trainer = trainer_cls(**trainer_kwargs)
 
@@ -592,6 +598,7 @@ def main() -> None:
           f"{' + TreeSampling' if args.tree_sampling else ''}"
           f"{' (global trie)' if (args.trainer == 'tree' and args.use_global_tree) else ''}"
           f"{f' credit={args.credit_mode}' if args.trainer == 'tree' else ''}"
+          f"{' shaped' if (args.trainer == 'tree' and args.shaped_reward) else ''}"
           f" | num_generations={args.num_generations}"
           f" eval(sample@{num_generations_eval} t={args.temperature} + greedy@1 t=0)"
           f" splits={list(eval_datasets) if args.eval_steps > 0 else []}", flush=True)
@@ -655,6 +662,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scale-rewards", choices=["group","none","batch"], default="group",
                    help="advantage scaling: group=÷group-std (TRL default, 1/std blow-up); "
                         "none=Dr.GRPO/no std-normalize; batch=÷batch-std")
+    # Confident-failure / rare-success advantage shaping (src/arsenal.py; tree trainer only)
+    p.add_argument("--shaped-reward", action="store_true",
+                   help="Replace the scalar GRPO advantage with the confident-failure/rare-success "
+                        "shaped reward (src/arsenal.py) BEFORE the OPA trie backup; off = TRL default adv.")
+    p.add_argument("--shaped-pos-scale", type=float, default=1.0,
+                   help="success-term scale for --shaped-reward (rewards rare/hard wins more).")
+    p.add_argument("--shaped-neg-scale", type=float, default=1.0,
+                   help="failure-term scale for --shaped-reward (penalizes confident failures more).")
     p.add_argument("--logging-steps", type=int, default=10)
     # Data
     p.add_argument("--max-n", type=int, default=13,
