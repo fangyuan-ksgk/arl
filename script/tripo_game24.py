@@ -576,6 +576,9 @@ def main() -> None:
     if args.trainer == "tree":
         trainer_kwargs["use_global_tree"] = args.use_global_tree
         trainer_kwargs["credit_mode"] = args.credit_mode
+        if args.virtual_rollout != "none":
+            trainer_kwargs["virtual_rollout"] = args.virtual_rollout
+            trainer_kwargs["virtual_max_reward"] = args.virtual_max_reward
         if args.shaped_reward:
             trainer_kwargs["shaped_reward"] = True
             trainer_kwargs["shaped_kwargs"] = dict(
@@ -670,6 +673,15 @@ def parse_args() -> argparse.Namespace:
                    help="success-term scale for --shaped-reward (rewards rare/hard wins more).")
     p.add_argument("--shaped-neg-scale", type=float, default=1.0,
                    help="failure-term scale for --shaped-reward (penalizes confident failures more).")
+    # No-gradient "virtual rollout" reward insertion to revive dead GRPO groups
+    # (src/arsenal.py:virtual_rollout_advantages; tree trainer only). Patches the
+    # reward->advantage step: appends one virtual reward per group before the z-score.
+    p.add_argument("--virtual-rollout", choices=["none", "insert_max", "insert_max_min"], default="none",
+                   help="insert_max=append a MAX-reward virtual rollout to every group; "
+                        "insert_max_min=append MIN reward when group is all-correct else MAX; "
+                        "none=off (default).")
+    p.add_argument("--virtual-max-reward", type=float, default=1.2,
+                   help="reward value of the MAX virtual rollout (default 1.2 = correctness 1.0 + format 0.2).")
     p.add_argument("--logging-steps", type=int, default=10)
     # Data
     p.add_argument("--max-n", type=int, default=13,

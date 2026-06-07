@@ -33,6 +33,8 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Hashable, List, Optional, Sequence
 
+import numpy as np
+
 
 __all__ = ["optimistic_prefix_advantages", "PrefixTrie", "TreeTrainer"]
 
@@ -215,14 +217,29 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  shaped_reward: bool = False,
                  shaped_kwargs: Optional[dict] = None,
                  difficulty_map: Optional[dict] = None,
+                 virtual_rollout: Optional[str] = None,
+                 virtual_max_reward: float = 1.2,
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
         if credit_mode not in ("max", "min"):
             raise ValueError(f"credit_mode must be 'max' or 'min', got {credit_mode!r}")
+        if virtual_rollout not in (None, "insert_max", "insert_max_min"):
+            raise ValueError("virtual_rollout must be None, 'insert_max', or "
+                             f"'insert_max_min', got {virtual_rollout!r}")
         super().__init__(*args, **kwargs)
         self.use_global_tree = use_global_tree
         self.credit_mode = credit_mode
+        # Optional no-gradient "virtual rollout" reward insertion to revive dead
+        # GRPO groups. Patches the reward->advantage step: a virtual reward is
+        # appended to each group's reward vector before the z-score (see
+        # src/arsenal.py:virtual_rollout_advantages). None = off.
+        self.virtual_rollout = virtual_rollout
+        self.virtual_max_reward = float(virtual_max_reward)
+        self._last_rewards_per_func = None      # stashed by _calculate_rewards
+        if self.virtual_rollout:                # shape on correctness -> require it by name, fail loud now
+            assert "correctness_reward" in self.reward_func_names, \
+                f"--virtual-rollout expects a reward function named 'correctness_reward'; got {self.reward_func_names}"
         # Optional confident-failure / rare-success advantage shaping (arsenal).
         # When True, the scalar GRPO advantage a_i is replaced by the shaped
         # per-rollout reward BEFORE the OPA trie backup. `shaped_kwargs` may
@@ -347,20 +364,48 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     # `_compute_loss` then runs on top of the shaped scalar, unchanged. No-op
     # when `shaped_reward` is False.
     # ------------------------------------------------------------------
+    def _calculate_rewards(self, *args, **kwargs):
+        # TRL computes per-function rewards (gathered across processes) here and
+        # then collapses them to scalar advantages inline. Stash the tensor so
+        # the virtual-rollout patch can rebuild advantages from raw rewards.
+        rpf = super()._calculate_rewards(*args, **kwargs)
+        self._last_rewards_per_func = rpf
+        return rpf
+
     def _generate_and_score_completions(self, inputs):
         out = super()._generate_and_score_completions(inputs)
-        if not self.shaped_reward:
-            return out
-        try:
-            shaped = self._shaped_advantages(out, inputs)
-        except Exception:
-            shaped = None          # shaping must never break training
-        if shaped is not None:
-            out["advantages"] = shaped
+        if self.shaped_reward:
+            try:
+                shaped = self._shaped_advantages(out, inputs)
+            except Exception:
+                shaped = None          # shaping must never break training
+            if shaped is not None:
+                out["advantages"] = shaped
+        if self.virtual_rollout and self.model.training:
+            try:
+                revived = self._virtual_rollout_advantages(out)
+            except Exception:
+                revived = None         # virtual-rollout must never break training
+            if revived is not None:
+                out["advantages"] = revived
         return out
 
+    def _virtual_rollout_advantages(self, out):
+        rpf, adv = self._last_rewards_per_func, out.get("advantages")
+        names = self.reward_func_names              
+        ci = names.index("correctness_reward")   # presence validated in __init__
+        correct = rpf[:, ci]                          
+        
+        from .arsenal import virtual_rollout_advantages
+        adv_virtual = virtual_rollout_advantages(
+            correct, correct == 1.0, self.num_generations,
+            max_reward=self.virtual_max_reward, mode=self.virtual_rollout,
+        )
+        lo = self.accelerator.process_index * adv.shape[0]   # same slice TRL applies
+        return adv_virtual[lo:lo + adv.shape[0]].to(adv)
+
     def _shaped_advantages(self, out, inputs):
-        """Per-rollout shaped advantage tensor (B,) aligned with `out`, or None.
+        """Encourage rare success, Penalize confident failure
 
         Ingredients (all process-local, 1:1 with the generation batch):
           * correct  — any extracted candidate verifies (== correctness_reward)
@@ -388,32 +433,15 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             print(f"[shaped-reward] logp_o source = {src}", flush=True)
 
         B = cids.shape[0]
-        try:
-            numbers = [row["numbers"] for row in inputs]
-            sols    = [row.get("solutions") for row in inputs]
-        except Exception:
-            return None
-        if len(numbers) != B:
-            return None            # can't align -> keep TRL advantages
 
         # log p_theta(o|q): sum sampling logprobs over real completion tokens.
         logp_o = (logp * cmask).sum(dim=1).detach().float().cpu().numpy()
 
-        from .game24utils import verify_24, extract_expr_candidates
-        texts = self.processing_class.batch_decode(cids, skip_special_tokens=True)
-        correct = [
-            1.0 if any(verify_24(list(n), e) for e in extract_expr_candidates(t)) else 0.0
-            for t, n in zip(texts, numbers)
-        ]
+        ci = self.reward_func_names.index("correctness_reward")
+        lo = self.accelerator.process_index * B
+        correct = self._last_rewards_per_func[lo:lo + B, ci].detach().cpu().numpy()
 
-        D_q = []
-        for n, s in zip(numbers, sols):
-            d = self.difficulty_map.get(tuple(n))
-            if d is None:
-                d = (1.0 / len(s)) if s else 1.0
-            D_q.append(float(d))
-
-        import numpy as np
+        D_q = [1.0] * B          # TBD. add internal difficulty calculation logic in the future
 
         from .arsenal import confident_failure_rare_success
         shaped = confident_failure_rare_success(
