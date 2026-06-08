@@ -22,14 +22,34 @@ def virtual_rollout_advantages(rewards, corrects, num_generations,
                                max_reward: float = 1.2,
                                mode: str = "insert_max", eps: float = 1e-4):
     # Per GRPO group: append one no-gradient virtual rollout to the reward vector,
-    # z-score, drop it. insert_max_min appends MIN (0.0) when the group is all-correct.
+    #   insert_max               -> append max_reward to every group
+    #   insert_max_min           -> append MIN (0.0) to all-correct, max_reward otherwise
+    #   insert_max_all_incorrect -> append max_reward only to all-incorrect groups
+    #   insert_max_mixed         -> append max_reward only to mixed groups
+
     rew = rewards.view(-1, num_generations)
     cor = corrects.view(-1, num_generations)
     rows = []
     for r, c in zip(rew, cor):
-        v = 0.0 if (mode == "insert_max_min" and bool(c.all())) else max_reward
-        aug = torch.cat([r, r.new_tensor([v])])
-        rows.append(((aug - aug.mean()) / (aug.std() + eps))[:-1])
+        all_correct = bool(c.all())
+        all_incorrect = not bool(c.any())
+        mixed = not all_correct and not all_incorrect
+
+        if mode == "insert_max_min":
+            v, insert = (0.0 if all_correct else max_reward), True
+        elif mode == "insert_max_all_incorrect":
+            v, insert = max_reward, all_incorrect
+        elif mode == "insert_max_mixed":
+            v, insert = max_reward, mixed
+        else:  # insert_max
+            v, insert = max_reward, True
+
+        if insert:
+            aug = torch.cat([r, r.new_tensor([v])])
+            adv = ((aug - aug.mean()) / (aug.std() + eps))[:-1]
+        else:
+            adv = (r - r.mean()) / (r.std() + eps)
+        rows.append(adv)
     return torch.stack(rows).reshape(-1)
 
 # Idea 3. Re-use the prefix trie cached for each query, pick "under-explored" (with low-end quantile childs) and "high potential" (has >0 correct rollouts, not just format rewarded, but correct)
