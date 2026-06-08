@@ -421,24 +421,18 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         return super()._compute_loss(model, inputs)
 
     # ------------------------------------------------------------------
-    # Optional confident-failure / rare-success reward shaping (arsenal).
-    #
-    # Hook at the scoring stage (where `numbers`, correctness and the policy's
-    # sampling logprobs are all available) and overwrite the scalar GRPO
-    # advantage with the shaped per-rollout reward. The per-token OPA backup in
-    # `_compute_loss` then runs on top of the shaped scalar, unchanged. No-op
-    # when `shaped_reward` is False.
+    # Arsenal of Ideas
     # ------------------------------------------------------------------
     def _calculate_rewards(self, *args, **kwargs):
-        # TRL computes per-function rewards (gathered across processes) here and
-        # then collapses them to scalar advantages inline. Stash the tensor so
-        # the virtual-rollout patch can rebuild advantages from raw rewards.
+        # TRL computes per-function rewards (gathered across processes), we collect them
         rpf = super()._calculate_rewards(*args, **kwargs)
         self._last_rewards_per_func = rpf
         return rpf
 
     def _generate_and_score_completions(self, inputs):
         out = super()._generate_and_score_completions(inputs)
+        self._attach_reward(out)
+
         if self.shaped_reward:
             try:
                 shaped = self._shaped_advantages(out, inputs)
@@ -453,11 +447,6 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 revived = None         # virtual-rollout must never break training
             if revived is not None:
                 out["advantages"] = revived
-        if self.model.training: 
-            try:
-                self._attach_reward(out)
-            except Exception:
-                pass                   # reward recording must never break training
         return out
 
     def _local_rewards_per_func(self, out):
