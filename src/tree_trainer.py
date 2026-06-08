@@ -30,8 +30,9 @@ TreeTrainer(GRPOTrainer)
 """
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
-from typing import Hashable, List, Optional, Sequence
+from typing import Dict, Hashable, List, Optional, Sequence
 
 import numpy as np
 
@@ -51,30 +52,63 @@ class PrefixTrie:
     pessimistic backup (worst reachable continuation). Both are running
     extrema, so the same trie can be updated incrementally across batches to act
     as a persistent global trie regardless of which credit mode is read out.
+
+    Each node additionally records, for under-explored / high-potential prefix
+    selection:
+
+    - ``count`` : number of rollouts whose path includes this prefix
+                  (the *exploration* signal — low count = under-explored).
+    - ``r_max`` : ``{reward_key: max reward}`` over rollouts through this prefix
+                  (the *potential* signal, e.g. ``r_max['correctness_reward']``,
+                  ``r_max['format_reward']``). Optimistic (max), mirroring A*.
+
+    All extras default to empty/zero, so callers that pass only an advantage
+    (e.g. :func:`optimistic_prefix_advantages`) keep the original OPA behaviour.
     """
 
-    __slots__ = ("children", "a_max", "a_min")
+    __slots__ = ("children", "a_max", "a_min", "count", "r_max")
 
     def __init__(self):
         self.children: dict = {}
         self.a_max: float = float("-inf")
         self.a_min: float = float("inf")
+        self.count: int = 0
+        self.r_max: Dict[Hashable, float] = {}
 
-    def insert(self, toks: Sequence[Hashable], adv: float) -> None:
+    def _accumulate(self, adv: float, rewards: Optional[dict]) -> None:
+        self.count += 1
+        if adv > self.a_max:
+            self.a_max = adv
+        if adv < self.a_min:
+            self.a_min = adv
+        if rewards:
+            rm = self.r_max
+            for k, v in rewards.items():
+                v = float(v)
+                cur = rm.get(k)
+                if cur is None or v > cur:
+                    rm[k] = v
+
+    def insert(self, toks: Sequence[Hashable], adv: float,
+               rewards: Optional[dict] = None) -> None:
+        """Insert one rollout. ``rewards`` is an optional ``{key: value}`` map of
+        per-rollout reward components (e.g. correctness / format); each node on
+        the path keeps the running max per key."""
         adv = float(adv)
         node = self
-        if adv > node.a_max:
-            node.a_max = adv
-        if adv < node.a_min:
-            node.a_min = adv
+        node._accumulate(adv, rewards)
         for t in toks:
             node = node.children.setdefault(t, PrefixTrie())
-            if adv > node.a_max:
-                node.a_max = adv
-            if adv < node.a_min:
-                node.a_min = adv
+            node._accumulate(adv, rewards)
+
+    def best_reward(self, key: Hashable, default: float = float("-inf")) -> float:
+        """Max reward of ``key`` over rollouts through this prefix (optimistic)."""
+        return self.r_max.get(key, default)
 
     def walk(self, toks: Sequence[Hashable], mode: str = "max") -> List[float]:
+        # This method assumes a given sequence, and it retrieves all its prefix's attributes from the Trie
+        # if same prefix is cached in the Trie before. 
+
         """Per-prefix backup at each prefix: position t is the backup of
         ``tokens[:t+1]``. ``mode='max'`` reads the optimistic A* (``a_max``);
         ``mode='min'`` reads the pessimistic backup (``a_min``).
@@ -91,10 +125,6 @@ class PrefixTrie:
                 break
             out.append(getattr(node, attr))
         return out
-
-    def walk_amax(self, toks: Sequence[Hashable]) -> List[float]:
-        """A* (optimistic backup) at each prefix. Thin wrapper over ``walk``."""
-        return self.walk(toks, mode="max")
 
     def token_node_breakdown(self) -> dict:
         """Classify every non-root node (each = one token in the dedup'd trie).
@@ -134,8 +164,6 @@ class PrefixTrie:
 
     @property
     def shared_prefix_token_fraction(self) -> float:
-        """Fraction of tokens in the trie that live in a shared prefix node
-        (a node traversed by >=2 rollouts). Returns 0.0 for an empty trie."""
         b = self.token_node_breakdown()
         return b["shared"] / b["total"] if b["total"] else 0.0
 
@@ -145,6 +173,7 @@ def optimistic_prefix_advantages(
     scalar_advs: Sequence[float],
     return_trie: bool = False,
     mode: str = "max",
+    rewards: Optional[Sequence[dict]] = None,
 ):
     """Per-token Optimistic Prefix Advantage for one GRPO group.
 
@@ -170,8 +199,12 @@ def optimistic_prefix_advantages(
     if len(token_seqs) != len(scalar_advs):
         raise ValueError("token_seqs and scalar_advs must have equal length")
     root = PrefixTrie()
-    for toks, a in zip(token_seqs, scalar_advs):
-        root.insert(toks, a)
+    if rewards is None:
+        for toks, a in zip(token_seqs, scalar_advs):
+            root.insert(toks, a)
+    else:
+        for toks, a, rw in zip(token_seqs, scalar_advs, rewards):
+            root.insert(toks, a, rewards=rw)
     per_token = [root.walk(toks, mode=mode) for toks in token_seqs]
     if return_trie:
         return per_token, root
@@ -219,14 +252,17 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  difficulty_map: Optional[dict] = None,
                  virtual_rollout: Optional[str] = None,
                  virtual_max_reward: float = 1.2,
+                 record_reward_keys: Sequence[str] = ("correctness_reward", "format_reward"),
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
         if credit_mode not in ("max", "min"):
             raise ValueError(f"credit_mode must be 'max' or 'min', got {credit_mode!r}")
-        if virtual_rollout not in (None, "insert_max", "insert_max_min"):
-            raise ValueError("virtual_rollout must be None, 'insert_max', or "
-                             f"'insert_max_min', got {virtual_rollout!r}")
+        if virtual_rollout not in (None, "insert_max", "insert_min", "insert_max_min",
+                                   "insert_max_all_incorrect", "insert_max_mixed"):
+            raise ValueError("virtual_rollout must be None, 'insert_max', 'insert_min', "
+                             "'insert_max_min', 'insert_max_all_incorrect', or "
+                             f"'insert_max_mixed', got {virtual_rollout!r}")
         super().__init__(*args, **kwargs)
         self.use_global_tree = use_global_tree
         self.credit_mode = credit_mode
@@ -251,6 +287,12 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         self.difficulty_map = dict(difficulty_map or {})
         # prompt-key -> PrefixTrie, persisted across batches when enabled.
         self._global_tries: dict = {}
+        # Reward-func names recorded per trie node (r_max[key]) for under-explored
+        # / high-potential prefix selection. Only names present in the actual
+        # reward_funcs are stashed at generation time.
+        self._opa_reward_keys = tuple(
+            k for k in record_reward_keys if k in self.reward_func_names
+        )
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -264,6 +306,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         use_global_tree: bool = False,
         global_tries: Optional[dict] = None,
         credit_mode: str = "max",
+        reward_components: Optional[dict] = None,
     ):
         """The credit-assignment core of :meth:`_compute_loss`.
 
@@ -290,7 +333,16 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             for i in range(Bp)
         ]
 
-        # (2) Group rollouts by prompt.
+        # (1b) Per-rollout reward dicts ({reward_key: value}) for trie recording.
+        # reward_components is {key: tensor (Bp,)} aligned with completion_ids.
+        rew_rows: Optional[List[dict]] = None
+        if reward_components:
+            rew_rows = [
+                {k: float(v[i]) for k, v in reward_components.items()}
+                for i in range(Bp)
+            ]
+
+        # (2) Group rollouts by prompt. (assign )
         def _pkey(row):
             return tuple(int(x) for x in row.tolist() if x != pad_id)
 
@@ -302,17 +354,20 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         for pkey, idxs in groups.items():
             g_seqs = [seqs[i] for i in idxs]
             g_advs = [a_list[i] for i in idxs]
+            g_rew = [rew_rows[i] for i in idxs] if rew_rows is not None else None
 
-            # (3) A* per prefix.
-            if use_global_tree:
+            # (3) A* per prefix. 
+            if use_global_tree: # @FY, we will add (1). global mean/std buffered advantage || (2). buffer sampling with global trie (add / replace rollouts)
                 if global_tries is None:
                     global_tries = {}
                 trie = global_tries.setdefault(pkey, PrefixTrie())
-                for toks, a in zip(g_seqs, g_advs):
-                    trie.insert(toks, a)
+                for j, (toks, a) in enumerate(zip(g_seqs, g_advs)):
+                    trie.insert(toks, a, rewards=(g_rew[j] if g_rew is not None else None))
                 per_tok = [trie.walk(toks, mode=credit_mode) for toks in g_seqs]
             else:
-                per_tok = optimistic_prefix_advantages(g_seqs, g_advs, mode=credit_mode)
+                per_tok = optimistic_prefix_advantages(
+                    g_seqs, g_advs, mode=credit_mode, rewards=g_rew
+                )
 
             # (4) Scatter back into the (Bp, T) tensor.
             for i, vals in zip(idxs, per_tok):
@@ -333,13 +388,23 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         prompt_ids = inputs.get("prompt_ids")
         completion_ids = inputs.get("completion_ids")
         mask = inputs.get("completion_mask")
-        if adv_scalar is None or completion_ids is None or mask is None:
+        # Only the scalar (Bp,) GRPO advantage path is rewritable into per-token.
+        if (adv_scalar is None or completion_ids is None or mask is None
+                or adv_scalar.dim() != 1):
             return super()._compute_loss(model, inputs)
 
-        # TRL advantages may be (Bp,) scalar or already (Bp, T); we only
-        # rewrite the scalar case. A 2D advantage means another override ran.
-        if adv_scalar.dim() != 1:
-            return super()._compute_loss(model, inputs)
+        # @FY. It's possible to "intercept" and change inputs.get("completion_ids") as well as inputs.get("advantages")
+        #      here, before they get sent to the model for forward computation & loss scaling
+        
+        # Per-rollout reward components stashed on the generation batch (see
+        # _generate_and_score_completions). They were shuffled+split by TRL
+        # alongside completion_ids, so they stay row-aligned here.
+        inputs = copy.copy(inputs)  # shallow copy: isolate our pop/set without coercing type
+        reward_components = {}
+        for key in self._opa_reward_keys:
+            t = inputs.pop(key, None)   # pop: keep our reward columns out of TRL's loss
+            if t is not None:
+                reward_components[key] = t
 
         tok = self.processing_class
         pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
@@ -349,9 +414,9 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 use_global_tree=self.use_global_tree,
                 global_tries=self._global_tries,
                 credit_mode=self.credit_mode,
+                reward_components=(reward_components or None),
             )
 
-        inputs = dict(inputs)
         inputs["advantages"] = adv_token
         return super()._compute_loss(model, inputs)
 
@@ -388,21 +453,43 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 revived = None         # virtual-rollout must never break training
             if revived is not None:
                 out["advantages"] = revived
+        if self.model.training: 
+            try:
+                self._attach_reward(out)
+            except Exception:
+                pass                   # reward recording must never break training
         return out
 
-    def _virtual_rollout_advantages(self, out):
+    def _local_rewards_per_func(self, out):
+        """Local-process slice of the gathered per-func reward tensor (rpf)"""
         rpf, adv = self._last_rewards_per_func, out.get("advantages")
-        names = self.reward_func_names              
-        ci = names.index("correctness_reward")   # presence validated in __init__
-        correct = rpf[:, ci]                          
-        
+        if rpf is None or adv is None:
+            return None
+        Bp = adv.shape[0]
+        lo = self.accelerator.process_index * Bp     # same slice TRL applies
+        return rpf[lo:lo + Bp]
+
+    def _attach_reward(self, out):
+        """Attach per-rollout reward"""
+        local = self._local_rewards_per_func(out)
+        if local is None:
+            return
+        names = self.reward_func_names
+        for key in self._opa_reward_keys:
+            out[key] = local[:, names.index(key)].detach().clone()
+
+    def _virtual_rollout_advantages(self, out):
+        adv = out.get("advantages")
+        local = self._local_rewards_per_func(out)
+        ci = self.reward_func_names.index("correctness_reward")  # validated in __init__
+        rewards = local.sum(axis=1)        # total reward = sum over all reward funcs
+        corrects = (local[:, ci] == 1.0)   # correctness flag from its own column
+
         from .arsenal import virtual_rollout_advantages
-        adv_virtual = virtual_rollout_advantages(
-            correct, correct == 1.0, self.num_generations,
+        return virtual_rollout_advantages(
+            rewards, corrects, self.num_generations,
             max_reward=self.virtual_max_reward, mode=self.virtual_rollout,
-        )
-        lo = self.accelerator.process_index * adv.shape[0]   # same slice TRL applies
-        return adv_virtual[lo:lo + adv.shape[0]].to(adv)
+        ).to(adv)
 
     def _shaped_advantages(self, out, inputs):
         """Encourage rare success, Penalize confident failure

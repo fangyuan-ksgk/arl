@@ -676,9 +676,14 @@ def parse_args() -> argparse.Namespace:
     # No-gradient "virtual rollout" reward insertion to revive dead GRPO groups
     # (src/arsenal.py:virtual_rollout_advantages; tree trainer only). Patches the
     # reward->advantage step: appends one virtual reward per group before the z-score.
-    p.add_argument("--virtual-rollout", choices=["none", "insert_max", "insert_max_min"], default="none",
+    p.add_argument("--virtual-rollout",
+                   choices=["none", "insert_max", "insert_max_min",
+                            "insert_max_all_incorrect", "insert_max_mixed"],
+                   default="none",
                    help="insert_max=append a MAX-reward virtual rollout to every group; "
                         "insert_max_min=append MIN reward when group is all-correct else MAX; "
+                        "insert_max_all_incorrect=append MAX only to all-incorrect groups; "
+                        "insert_max_mixed=append MAX only to mixed groups; "
                         "none=off (default).")
     p.add_argument("--virtual-max-reward", type=float, default=1.2,
                    help="reward value of the MAX virtual rollout (default 1.2 = correctness 1.0 + format 0.2).")
