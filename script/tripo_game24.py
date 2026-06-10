@@ -536,6 +536,7 @@ def main() -> None:
         bf16=torch.cuda.is_available(),
         save_strategy="no",
         report_to="none",
+        seed=args.seed,   # reshuffles data order per seed (lottery runs)
     )
     if not args.no_vllm:
         config_kwargs["use_vllm"] = True
@@ -574,10 +575,12 @@ def main() -> None:
             scale=args.predictive_velocity_scale,
             clip=args.predictive_velocity_clip,
             norm_mode=args.predictive_norm_mode,
+            answer_source=args.predictive_answer_source,
         )
         reward_funcs.append(predictive_velo_obj)
         print(f"[reward] predictive velocity enabled: scale={args.predictive_velocity_scale}, "
-              f"clip=±{args.predictive_velocity_clip}, norm_mode='{args.predictive_norm_mode}'",
+              f"clip=±{args.predictive_velocity_clip}, norm_mode='{args.predictive_norm_mode}', "
+              f"answer_source='{args.predictive_answer_source}'",
               flush=True)
     if args.no_correctness_reward:
         print("[reward] correctness reward DISABLED for training "
@@ -650,7 +653,11 @@ def main() -> None:
               f"reconciled to {args.num_generations})", flush=True)
 
     t0 = time.time()
+    if args.trainer == "tree" and args.absorb_steps > 0:
+        trainer.absorb_buffer(args.absorb_steps, args.absorb_groups_per_query)
     trainer.train()
+    if args.trainer == "tree":
+        trainer.save_tries()   # persist trie even with save_strategy='no'
     print(f"[done] training in {time.time() - t0:.0f}s | "
           f"rollouts -> {train_rollout_log}\n"
           f"          eval -> {eval_rollout_log}", flush=True)
@@ -712,6 +719,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--predictive-velocity-clip", type=float, default=1.0)
     p.add_argument("--predictive-norm-mode", type=str, default="log_total",
                    choices=["log_total", "cot_len"])
+    p.add_argument("--predictive-answer-source", type=str, default="rollout",
+                   choices=["rollout", "gold"],
+                   help="v1 'rollout' = score the model's own answer a; "
+                        "v2 'gold' = score the GT answer a* (first `solutions` entry) — "
+                        "works before the model ever finds a correct answer.")
     p.add_argument("--no-correctness-reward", action="store_true",
                    help="Drop the correctness reward from training (e.g. to replace it with "
                         "--predictive-velocity-reward). Eval accuracy is unaffected: "
@@ -746,6 +758,13 @@ def parse_args() -> argparse.Namespace:
                         "through the sampled prefix.")
     p.add_argument("--tree-persist-path", type=str, default=None,
                    help="(tree) JSON path to persist the global tries across runs.")
+    p.add_argument("--absorb-steps", type=int, default=0,
+                   help="(tree) >0: before train(), absorb ALL buffered healthy groups "
+                        "(>=1 correct + >=1 incorrect rollout per prompt trie) in exactly "
+                        "this many gradient updates (accumulation derived). Requires a "
+                        "pre-grown --tree-persist-path buffer from the seed-lottery runs.")
+    p.add_argument("--absorb-groups-per-query", type=int, default=1,
+                   help="(tree) healthy groups stitched per healthy query for the absorb phase.")
     # Confident-failure / rare-success advantage shaping (src/arsenal.py; tree trainer only)
     p.add_argument("--shaped-reward", action="store_true",
                    help="Replace the scalar GRPO advantage with the confident-failure/rare-success "

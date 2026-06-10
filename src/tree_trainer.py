@@ -575,6 +575,102 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         return tuple(int(x) for x in prompt_row.tolist() if x != pad_id)
 
     # ------------------------------------------------------------------
+    # Absorb phase: replay stitched healthy groups BEFORE trainer.train()
+    # ------------------------------------------------------------------
+    def stitch_healthy_groups(self, groups_per_query: int = 1, rng=None):
+        """Stitch healthy GRPO groups from the buffered trie dict.
+
+        A prompt is *healthy* when its trie holds >=1 correct AND >=1 incorrect
+        rollout (leaf). For each healthy prompt, sample ``groups_per_query``
+        groups of ``num_generations`` leaves (one correct + one incorrect
+        guaranteed, rest uniform over all leaves); the group advantage is the
+        LOCAL z-score of the leaf-recorded total rewards (_TOTAL_KEY).
+
+        Returns ``[(pkey, [token_lists], [advantages]), ...]``.
+        """
+        rng = rng or random
+        g = self.num_generations
+        groups = []
+        for pkey, trie in self._global_tries.items():
+            leaves = list(trie.leaves())
+            pos = [lf for lf in leaves if lf.best_reward("correctness_reward") > 0]
+            neg = [lf for lf in leaves if not (lf.best_reward("correctness_reward") > 0)]
+            if not pos or not neg:
+                continue
+            for _ in range(groups_per_query):
+                picks = [rng.choice(pos), rng.choice(neg)]
+                picks += [rng.choice(leaves) for _ in range(g - 2)]
+                rng.shuffle(picks)
+                r = torch.tensor([lf.best_reward(_TOTAL_KEY) for lf in picks],
+                                 dtype=torch.float32)
+                assert torch.isfinite(r).all(), \
+                    f"buffered leaf missing _TOTAL_KEY reward for a healthy prompt"
+                adv = (r - r.mean()) / (r.std() + self.buffered_eps)
+                groups.append((pkey, [lf.prefix() for lf in picks], adv.tolist()))
+        return groups
+
+    def absorb_buffer(self, steps: int = 10, groups_per_query: int = 1) -> None:
+        """Train on ALL stitched healthy groups in exactly ``steps`` gradient
+        updates, before ``trainer.train()`` starts.
+
+        The groups are packed into ``steps`` chunks (effective gradient
+        accumulation = ceil(n_groups / steps) groups per update, derived — not
+        configured). One forward per group (prompt is uniform within a group,
+        so no prompt padding); loss is the ratio-1 GRPO objective, i.e. plain
+        advantage-weighted log-likelihood over completion tokens.
+
+        Buffered rollouts are off-policy tokens with no stored logps, so this
+        must run BEFORE any on-policy update (ratio == 1 only on the first
+        pass). Uses the trainer's own optimizer (created here, reused by
+        ``train()``). Multi-rank: the stitching rng is seeded with
+        ``args.seed``, so every rank performs identical replicated updates and
+        stays in sync without gradient reduction. vLLM picks up the absorbed
+        weights at the first generation (global_step != _last_loaded_step).
+        """
+        groups = self.stitch_healthy_groups(
+            groups_per_query, rng=random.Random(self.args.seed))
+        if not groups:
+            print("[absorb] no healthy groups in buffer — skipped", flush=True)
+            return
+        random.Random(self.args.seed).shuffle(groups)
+        steps = min(int(steps), len(groups))
+        chunks = [groups[i::steps] for i in range(steps)]
+        print(f"[absorb] {len(groups)} healthy groups "
+              f"({groups_per_query}/query, group size {self.num_generations}) "
+              f"-> {steps} updates ({len(chunks[0])} groups/update)", flush=True)
+        self.create_optimizer()
+        opt = self.optimizer
+        device = self.accelerator.device
+        pad_id = self._pad_id()
+        width_cap = int(self.args.max_completion_length)
+        model = self.model
+        model.train()
+        for chunk in chunks:
+            opt.zero_grad(set_to_none=True)
+            for pkey, seqs, advs in chunk:
+                seqs = [list(s)[:width_cap] for s in seqs]
+                T = max(len(s) for s in seqs)
+                B = len(seqs)
+                prompt = torch.tensor(pkey, dtype=torch.long,
+                                      device=device).unsqueeze(0).expand(B, -1)
+                cids = torch.full((B, T), pad_id, dtype=torch.long, device=device)
+                cmask = torch.zeros((B, T), dtype=torch.long, device=device)
+                for j, s in enumerate(seqs):
+                    cids[j, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+                    cmask[j, :len(s)] = 1
+                ids = torch.cat([prompt, cids], dim=1)
+                attn = torch.cat([torch.ones_like(prompt), cmask], dim=1)
+                with self.accelerator.autocast():
+                    logps, _ = self._get_per_token_logps_and_entropies(
+                        model, ids, attn, T)
+                    adv_t = torch.tensor(advs, device=device,
+                                         dtype=logps.dtype).unsqueeze(1)
+                    loss = -(adv_t * logps * cmask).sum() / cmask.sum().clamp(min=1)
+                (loss / len(chunk)).backward()
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+
+    # ------------------------------------------------------------------
     @staticmethod
     def _tree_token_advantages(
         prompt_ids,

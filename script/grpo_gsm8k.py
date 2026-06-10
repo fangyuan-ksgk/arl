@@ -468,7 +468,13 @@ def main():
                         choices=["log_total", "cot_len"],
                         help="Length denominator: 'log_total' = /log(min(T,D)) (original); "
                              "'cot_len' = /l_o => log[p/p]/(l_a*l_o) info-density reward "
+                             "with linear shortening pressure "
                              "(~100x smaller, recalibrate --predictive_velocity_scale).")
+    parser.add_argument("--predictive_answer_source", type=str, default="rollout",
+                        choices=["rollout", "gold"],
+                        help="v1 'rollout' = score the model's own answer a; "
+                             "v2 'gold' = score the GT answer a* (gold_answer column) — "
+                             "works before the model ever finds a correct answer.")
     # Entropy density — phase contrast "reason hard, then commit".
     # raw_v = mean(H over rationale)  −  mean(H over answer)
     # High reward at positive scale = rationale is uncertain, answer is
@@ -776,11 +782,13 @@ def main():
             clip=args.predictive_velocity_clip,
             marker=args.predictive_marker,
             norm_mode=args.predictive_norm_mode,
+            answer_source=args.predictive_answer_source,
         )
         reward_funcs.append(predictive_velo_obj)
         print(f"Predictive velocity reward enabled: scale={args.predictive_velocity_scale}, "
               f"clip=±{args.predictive_velocity_clip}, marker='{args.predictive_marker}', "
-              f"norm_mode='{args.predictive_norm_mode}'")
+              f"norm_mode='{args.predictive_norm_mode}', "
+              f"answer_source='{args.predictive_answer_source}'")
 
     eval_dataset = None
     if args.eval_steps > 0:

@@ -887,7 +887,8 @@ def _compute_predictive_velocity_for_completion(model, tokenizer, prompt,
                                                  completion_text,
                                                  stride: int = 8,
                                                  marker: str = "####",
-                                                 norm_mode: str = "log_total"):
+                                                 norm_mode: str = "log_total",
+                                                 gold_answer_text=None):
     """Length-normalised predictive velocity for a single rollout.
 
     Splits completion on `marker` (default "####", GSM8K convention) into
@@ -926,7 +927,13 @@ def _compute_predictive_velocity_for_completion(model, tokenizer, prompt,
     # Keep marker on the answer side so both sequences see "####" before `a`.
     # This isolates the rationale's contribution rather than confounding it
     # with the model's prior on the marker token itself.
-    answer_text = marker + post
+    # v2 (gold mode): score the GROUND-TRUTH answer a* instead of the model's
+    # own answer — the signal works before the model ever finds a correct
+    # answer. The rationale split (and the marker gate above) is unchanged.
+    if gold_answer_text is not None:
+        answer_text = marker + " " + str(gold_answer_text).strip()
+    else:
+        answer_text = marker + post
     if not rationale_text.strip() or not answer_text.strip():
         return 0.0
 
@@ -1014,12 +1021,25 @@ class PredictiveVeloReward:
     Cost: 2× the forward passes of EntropyVelo / PerplexityVelo. Skips
     rollouts without a `####` marker (returns 0.0), so format-violating
     rollouts contribute neither signal nor noise.
+
+    `answer_source`:
+      - "rollout" (v1, default): a = the model's own emitted answer. Only
+        starts working once the model searches out correct answers.
+      - "gold" (v2): a = the ground-truth answer a*, read per-sample from the
+        dataset columns passed through TRL kwargs — `gold_answer` (GSM8K) or
+        `solutions` (Game24). With multiple valid solutions the reward is the
+        MAX velocity over all of them, so a rationale gets credit for
+        whichever solution it actually supports (cost: 2 forwards per
+        solution). Fails loud if neither column exists.
     """
 
     def __init__(self, tokenizer, stride: int = 8, scale: float = 4.0,
                  clip: float = 1.0, marker: str = "####",
-                 norm_mode: str = "log_total"):
-        self.__name__ = "predictive_velocity"
+                 norm_mode: str = "log_total", answer_source: str = "rollout"):
+        assert answer_source in ("rollout", "gold"), \
+            f"unknown answer_source: {answer_source}"
+        self.__name__ = ("predictive_velocity" if answer_source == "rollout"
+                         else "predictive_velocity_gold")
         self.model = None
         self.tokenizer = tokenizer
         self.stride = stride
@@ -1027,21 +1047,38 @@ class PredictiveVeloReward:
         self.clip = clip
         self.marker = marker
         self.norm_mode = norm_mode
+        self.answer_source = answer_source
 
     def set_model(self, model):
         self.model = model
 
+    def _gold_texts(self, n, gold_answer=None, solutions=None):
+        """Per-sample list of GT answer candidates ([None] row = v1 path)."""
+        if self.answer_source != "gold":
+            return [[None]] * n
+        if gold_answer is not None:
+            return [[str(g)] for g in gold_answer]
+        if solutions is not None:
+            return [[str(x) for x in s] for s in solutions]
+        raise KeyError("answer_source='gold' requires a `gold_answer` or "
+                       "`solutions` dataset column")
+
     @torch.no_grad()
-    def __call__(self, prompts, completions, **kwargs) -> list[float]:
+    def __call__(self, prompts, completions, gold_answer=None, solutions=None,
+                 **kwargs) -> list[float]:
         if self.model is None:
             return [0.0] * len(completions)
+        golds = self._gold_texts(len(completions), gold_answer, solutions)
         rewards = []
-        for prompt, completion in zip(prompts, completions):
+        for prompt, completion, cands in zip(prompts, completions, golds):
             completion_text = completion[0]["content"]
-            v = _compute_predictive_velocity_for_completion(
-                self.model, self.tokenizer, prompt, completion_text,
-                stride=self.stride, marker=self.marker,
-                norm_mode=self.norm_mode,
+            v = max(
+                _compute_predictive_velocity_for_completion(
+                    self.model, self.tokenizer, prompt, completion_text,
+                    stride=self.stride, marker=self.marker,
+                    norm_mode=self.norm_mode, gold_answer_text=gold,
+                )
+                for gold in cands
             )
             v = max(-self.clip, min(v, self.clip))
             rewards.append(v / self.scale)
