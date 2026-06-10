@@ -1058,10 +1058,19 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         # _tool_call_loop), so tool calls in the forced continuation are
         # EXECUTED and their output tokens come back masked in f_tmask.
         # Without tools, _generate_single_turn is the same path minus the loop.
+        # TRL 1.5.x: _generate_single_turn(prompt_ids, images, multimodal_fields)
+        #   -> (completion_ids, logprobs);  _generate(prompts) -> 9-tuple.
+        # Build per-row prompt TOKEN-IDS (prompt + forced prefix), mirroring `texts`.
+        _pad_prompt = list(pkeys[0])
+        prompt_ids_list = []
+        for _k in range(M):
+            _pid = (list(pkeys[forced[_k][0]]) + forced[_k][2]) if _k < len(forced) else _pad_prompt
+            prompt_ids_list.extend([_pid] * g)
         if getattr(self, "tools", None):
-            _, f_cids, f_tmask, _, _, _, _ = super()._generate(texts)
+            # tool path untested here (no tools in Game-24); 9-tuple unpack per TRL 1.5.x
+            (_, f_cids, f_tmask, _, _, _, _, _, _) = super()._generate(texts)
         else:
-            _, f_cids, _, _ = super()._generate_single_turn(texts)
+            f_cids, _ = super()._generate_single_turn(prompt_ids_list, None, None)
             f_tmask = None
 
         # Gradient-free prefix: loss_mask = completion_mask * tool_mask in TRL,
