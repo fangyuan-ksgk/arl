@@ -454,6 +454,9 @@ def main():
                              "'trajectory' uses the endpoint diff NLL(o_last) − NLL(o_first).")
     # Predictive velocity — two forward passes per rollout: log p(a|q,o) − log p(a|q).
     # Splits completion on `--predictive_marker` (default "####", GSM8K convention).
+    parser.add_argument("--no_correctness_reward", action="store_true",
+                        help="Drop the correctness reward from training. Eval accuracy is "
+                             "unaffected (rollout logger computes correctness independently).")
     parser.add_argument("--predictive_velocity_reward", action="store_true",
                         help="Add length-normalised predictive velocity reward: "
                              "clip((log p(a|q,o) − log p(a|q)) / log(min(T,D)), ±clip) / scale")
@@ -625,7 +628,10 @@ def main():
         )
 
     # Build reward function list
-    reward_funcs = [correctness_reward, format_reward]
+    reward_funcs = ([format_reward] if args.no_correctness_reward
+                    else [correctness_reward, format_reward])
+    if args.no_correctness_reward:
+        print("Correctness reward DISABLED for training (eval accuracy still logged).")
     mbe_reward_obj = None
 
     if args.mbe_log and mbe_logger is not None:

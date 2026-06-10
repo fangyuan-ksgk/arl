@@ -564,9 +564,29 @@ def main() -> None:
     base_cls = TreeTrainer if args.trainer == "tree" else GRPOTrainer
     trainer_cls = build_trainer_class(base_cls, args.tree_sampling)
 
+    reward_funcs = ([format_reward] if args.no_correctness_reward
+                    else [correctness_reward, format_reward])
+    predictive_velo_obj = None
+    if args.predictive_velocity_reward:
+        from src.mbe_reward import PredictiveVeloReward
+        predictive_velo_obj = PredictiveVeloReward(
+            tokenizer,
+            scale=args.predictive_velocity_scale,
+            clip=args.predictive_velocity_clip,
+            norm_mode=args.predictive_norm_mode,
+        )
+        reward_funcs.append(predictive_velo_obj)
+        print(f"[reward] predictive velocity enabled: scale={args.predictive_velocity_scale}, "
+              f"clip=±{args.predictive_velocity_clip}, norm_mode='{args.predictive_norm_mode}'",
+              flush=True)
+    if args.no_correctness_reward:
+        print("[reward] correctness reward DISABLED for training "
+              "(eval accuracy still logged by RolloutLogger)", flush=True)
+    reward_funcs.append(rollout_logger)
+
     trainer_kwargs = dict(
         model=args.model,
-        reward_funcs=[correctness_reward, format_reward, rollout_logger],
+        reward_funcs=reward_funcs,
         args=config,
         train_dataset=train_ds,
         eval_dataset=(eval_datasets if args.eval_steps > 0 else None),
@@ -585,11 +605,25 @@ def main() -> None:
                 pos_scale=args.shaped_pos_scale,
                 neg_scale=args.shaped_neg_scale,
             )
+        # Buffer tricks (src/tree_trainer.py; all default OFF -> vanilla GRPO
+        # advantages). Compose by ordering: inject/resample first (tokens +
+        # rewards + LOCAL group z-score), buffered baseline last.
+        trainer_kwargs["buffered_baseline"] = args.buffered_baseline
+        trainer_kwargs["inject_rollout"] = args.inject_rollout
+        trainer_kwargs["inject_incorrect"] = args.inject_incorrect
+        trainer_kwargs["resample_prefix"] = args.resample_prefix
+        trainer_kwargs["resample_train_prefix"] = args.resample_train_prefix
+        trainer_kwargs["resample_inject"] = args.resample_inject
+        if args.tree_persist_path:
+            trainer_kwargs["tree_persist_path"] = args.tree_persist_path
 
     trainer = trainer_cls(**trainer_kwargs)
 
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger
+
+    if predictive_velo_obj is not None:
+        predictive_velo_obj.set_model(trainer.model)
 
     # Wire tree-sampling knobs onto the live trainer (read at generation time).
     if args.tree_sampling:
@@ -602,6 +636,10 @@ def main() -> None:
           f"{' (global trie)' if (args.trainer == 'tree' and args.use_global_tree) else ''}"
           f"{f' credit={args.credit_mode}' if args.trainer == 'tree' else ''}"
           f"{' shaped' if (args.trainer == 'tree' and args.shaped_reward) else ''}"
+          + (''.join(f' +{f}' for f in ('buffered_baseline', 'inject_rollout',
+                                        'inject_incorrect', 'resample_prefix',
+                                        'resample_train_prefix', 'resample_inject')
+                     if args.trainer == 'tree' and getattr(args, f))) +
           f" | num_generations={args.num_generations}"
           f" eval(sample@{num_generations_eval} t={args.temperature} + greedy@1 t=0)"
           f" splits={list(eval_datasets) if args.eval_steps > 0 else []}", flush=True)
@@ -665,6 +703,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--scale-rewards", choices=["group","none","batch"], default="group",
                    help="advantage scaling: group=÷group-std (TRL default, 1/std blow-up); "
                         "none=Dr.GRPO/no std-normalize; batch=÷batch-std")
+    # Predictive velocity reward (src/mbe_reward.py:PredictiveVeloReward).
+    # Game24 uses the same '####' marker convention as GSM8K, so defaults apply.
+    p.add_argument("--predictive-velocity-reward", action="store_true",
+                   help="Add length-normalised predictive velocity reward: "
+                        "clip((log p(a|q,o) − log p(a|q)) / denom, ±clip) / scale")
+    p.add_argument("--predictive-velocity-scale", type=float, default=4.0)
+    p.add_argument("--predictive-velocity-clip", type=float, default=1.0)
+    p.add_argument("--predictive-norm-mode", type=str, default="log_total",
+                   choices=["log_total", "cot_len"])
+    p.add_argument("--no-correctness-reward", action="store_true",
+                   help="Drop the correctness reward from training (e.g. to replace it with "
+                        "--predictive-velocity-reward). Eval accuracy is unaffected: "
+                        "RolloutLogger computes correctness independently.")
+    # Buffer tricks (src/tree_trainer.py; tree trainer only, all default off).
+    # 1.  --buffered-baseline : advantages rescaled by the BUFFERED reward std
+    #     (stable across batches), re-centered to zero-sum per group.
+    # 2.  --inject-rollout    : degenerate group (all_wrong / format_only /
+    #     reward_hacking) -> swap ONE slot for a buffered CORRECT rollout
+    #     (leaf-recorded reward), local group z-score recomputed.
+    # 2.1 --inject-incorrect  : additionally break ALL-CORRECT groups with a
+    #     buffered WRONG rollout (requires --inject-rollout).
+    # 3.  --resample-prefix   : REPLACE each all-correct group with fresh
+    #     continuations of an under-explored buffered prefix (same step).
+    # 3.1 --resample-train-prefix : train the forced prefix tokens too
+    #     (default: prefix is attended context only, no gradient via tool_mask).
+    # 3b  --resample-inject   : reserve one slot of the resampled group for the
+    #     buffered correct rollout THROUGH that prefix (guaranteed contrast).
+    p.add_argument("--buffered-baseline", action="store_true",
+                   help="(tree) zero-sum group advantages with the buffered-std denominator.")
+    p.add_argument("--inject-rollout", action="store_true",
+                   help="(tree) repair degenerate groups with a buffered correct rollout.")
+    p.add_argument("--inject-incorrect", action="store_true",
+                   help="(tree) also break all-correct groups with a buffered wrong rollout.")
+    p.add_argument("--resample-prefix", action="store_true",
+                   help="(tree) same-step resample of all-correct groups from an "
+                        "under-explored buffered prefix.")
+    p.add_argument("--resample-train-prefix", action="store_true",
+                   help="(tree) give the forced prefix tokens gradient (default: context only).")
+    p.add_argument("--resample-inject", action="store_true",
+                   help="(tree) reserve one resampled slot for the buffered correct rollout "
+                        "through the sampled prefix.")
+    p.add_argument("--tree-persist-path", type=str, default=None,
+                   help="(tree) JSON path to persist the global tries across runs.")
     # Confident-failure / rare-success advantage shaping (src/arsenal.py; tree trainer only)
     p.add_argument("--shaped-reward", action="store_true",
                    help="Replace the scalar GRPO advantage with the confident-failure/rare-success "

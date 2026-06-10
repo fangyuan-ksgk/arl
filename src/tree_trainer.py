@@ -31,6 +31,9 @@ TreeTrainer(GRPOTrainer)
 from __future__ import annotations
 
 import copy
+import json
+import os
+import random
 from collections import defaultdict
 from typing import Dict, Hashable, List, Optional, Sequence
 
@@ -38,6 +41,11 @@ import numpy as np
 
 
 __all__ = ["optimistic_prefix_advantages", "PrefixTrie", "TreeTrainer"]
+
+# Synthetic reward key recorded on every global-trie node: the total scalar
+# reward (sum over reward funcs) of each rollout, so a buffered group baseline
+# (mean/std) can be read straight off a prefix node (see _buffered_advantages).
+_TOTAL_KEY = "_total_reward"
 
 
 # ---------------------------------------------------------------------------
@@ -58,52 +66,224 @@ class PrefixTrie:
 
     - ``count`` : number of rollouts whose path includes this prefix
                   (the *exploration* signal — low count = under-explored).
-    - ``r_max`` : ``{reward_key: max reward}`` over rollouts through this prefix
-                  (the *potential* signal, e.g. ``r_max['correctness_reward']``,
-                  ``r_max['format_reward']``). Optimistic (max), mirroring A*.
+    - ``stats`` : ``{reward_key: [n, mean, var, max]}`` over rollouts through this
+                  prefix. ``mean`` / ``var`` are **EMA** estimates (exponentially
+                  recency-weighted, decay ``reward_ema``) so the baseline tracks the
+                  *current* policy as it improves rather than all of history. Read
+                  via ``best_reward`` (optimistic max, mirroring A*), ``reward_mean``
+                  / ``reward_std``. E.g. ``best_reward('correctness_reward')``.
 
     All extras default to empty/zero, so callers that pass only an advantage
     (e.g. :func:`optimistic_prefix_advantages`) keep the original OPA behaviour.
     """
 
-    __slots__ = ("children", "a_max", "a_min", "count", "r_max")
+    __slots__ = ("children", "a_max", "a_min", "count", "stats", "parent", "token")
 
-    def __init__(self):
+    def __init__(self, parent: Optional["PrefixTrie"] = None,
+                 token: Optional[Hashable] = None):
         self.children: dict = {}
+        # Back-reference to the path: ``token`` is the edge from ``parent`` to this
+        # node. Root has both None. Lets ``prefix()`` reconstruct a node's tokens.
+        self.parent = parent
+        self.token = token
         self.a_max: float = float("-inf")
         self.a_min: float = float("inf")
         self.count: int = 0
-        self.r_max: Dict[Hashable, float] = {}
+        # Per reward key: ``[n, mean, var, max]`` — EMA running mean/variance
+        # (recency-weighted; see _accumulate) plus the optimistic max. A key may
+        # appear on only a subset of the rollouts through this node.
+        self.stats: Dict[Hashable, list] = {}
 
-    def _accumulate(self, adv: float, rewards: Optional[dict]) -> None:
+    def _accumulate(self, adv: float, rewards: Optional[dict],
+                    reward_ema: float = 0.9) -> None:
         self.count += 1
         if adv > self.a_max:
             self.a_max = adv
         if adv < self.a_min:
             self.a_min = adv
         if rewards:
-            rm = self.r_max
-            for k, v in rewards.items():
-                v = float(v)
-                cur = rm.get(k)
-                if cur is None or v > cur:
-                    rm[k] = v
+            st = self.stats
+            for k, r in rewards.items():
+                r = float(r)
+                acc = st.get(k)
+                if acc is None:
+                    st[k] = [1, r, 0.0, r]      # [n, mean, var, max]; var=0 on first
+                    continue
+                n, m, v, mx = acc
+                d = r - m
+                m = m + (1 - reward_ema) * d                    # EMA mean
+                v = reward_ema * (v + (1 - reward_ema) * d * d)  # EMA var (West)
+                acc[0], acc[1], acc[2] = n + 1, m, v
+                if r > mx:
+                    acc[3] = r
 
     def insert(self, toks: Sequence[Hashable], adv: float,
-               rewards: Optional[dict] = None) -> None:
+               rewards: Optional[dict] = None, reward_ema: float = 0.9) -> None:
         """Insert one rollout. ``rewards`` is an optional ``{key: value}`` map of
-        per-rollout reward components (e.g. correctness / format); each node on
-        the path keeps the running max per key."""
+        per-rollout reward components (e.g. correctness / format); each node on the
+        path keeps the running max plus an EMA mean/var per key. ``reward_ema`` is
+        the EMA retention factor (higher = slower adaptation; 0.9 default)."""
         adv = float(adv)
         node = self
-        node._accumulate(adv, rewards)
+        node._accumulate(adv, rewards, reward_ema)
         for t in toks:
-            node = node.children.setdefault(t, PrefixTrie())
-            node._accumulate(adv, rewards)
+            child = node.children.get(t)
+            if child is None:
+                child = PrefixTrie(parent=node, token=t)
+                node.children[t] = child
+            node = child
+            node._accumulate(adv, rewards, reward_ema)
 
     def best_reward(self, key: Hashable, default: float = float("-inf")) -> float:
         """Max reward of ``key`` over rollouts through this prefix (optimistic)."""
-        return self.r_max.get(key, default)
+        acc = self.stats.get(key)
+        return acc[3] if acc is not None else default
+
+    def reward_mean(self, key: Hashable, default: float = float("nan")) -> float:
+        """Running mean reward of ``key`` over rollouts through this prefix."""
+        acc = self.stats.get(key)
+        return acc[1] if acc is not None else default
+
+    def reward_std(self, key: Hashable, default: float = float("nan")) -> float:
+        """EMA running std of ``key`` reward over rollouts through this prefix
+        (square root of the EMA variance). Returns ``default`` if unseen."""
+        acc = self.stats.get(key)
+        if acc is None:
+            return default
+        return acc[2] ** 0.5
+
+    # --- (de)serialization: JSON-safe, drops parent/token (rebuilt on load) ---
+    @staticmethod
+    def _enc_f(x: float):
+        if x == float("inf"):
+            return "inf"
+        if x == float("-inf"):
+            return "-inf"
+        return x
+
+    @staticmethod
+    def _dec_f(x):
+        if x == "inf":
+            return float("inf")
+        if x == "-inf":
+            return float("-inf")
+        return float(x)
+
+    def to_dict(self) -> dict:
+        """Recursively serialize into a JSON-safe dict. ``parent``/``token`` are
+        dropped (reconstructed by :meth:`from_dict`); ``±inf`` extrema are encoded
+        as strings. ``children`` is a list of ``[token, child_dict]`` pairs so
+        non-string token types (e.g. int token-ids) survive a JSON round-trip."""
+        return {
+            "a_max": self._enc_f(self.a_max),
+            "a_min": self._enc_f(self.a_min),
+            "count": self.count,
+            "stats": {k: list(v) for k, v in self.stats.items()},
+            "children": [[k, c.to_dict()] for k, c in self.children.items()],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict, parent: Optional["PrefixTrie"] = None,
+                  token: Optional[Hashable] = None) -> "PrefixTrie":
+        """Inverse of :meth:`to_dict`; rebuilds ``parent``/``token`` back-links."""
+        node = cls(parent=parent, token=token)
+        node.a_max = cls._dec_f(d["a_max"])
+        node.a_min = cls._dec_f(d["a_min"])
+        node.count = int(d["count"])
+        node.stats = {k: list(v) for k, v in d.get("stats", {}).items()}
+        for tok, cd in d.get("children", []):
+            node.children[tok] = cls.from_dict(cd, parent=node, token=tok)
+        return node
+
+    def prefix(self) -> List[Hashable]:
+        """Tokens from the root to this node (the prefix it represents). Root -> ``[]``.
+        Reconstructed by climbing ``parent`` links, so it is O(depth)."""
+        toks: List[Hashable] = []
+        node = self
+        while node.parent is not None:
+            toks.append(node.token)
+            node = node.parent
+        toks.reverse()
+        return toks
+
+    def get_node(self, prefix: Sequence[Hashable]) -> Optional["PrefixTrie"]:
+        """Return the node reached by following ``prefix`` from this node, or
+        ``None`` if the prefix is absent. ``get_node([])`` returns ``self``."""
+        node = self
+        for t in prefix:
+            node = node.children.get(t)
+            if node is None:
+                return None
+        return node
+
+    def leaves(self):
+        """Yield every leaf node (no children). A leaf is the final prefix of a
+        completed rollout, so the SET of leaves is the set of distinct rollouts
+        stored in the trie (regardless of how many times each was inserted)."""
+        stack = [self]
+        while stack:
+            node = stack.pop()
+            if not node.children:
+                yield node
+            else:
+                stack.extend(node.children.values())
+
+    def sample_rollout(self, correct: bool = True,
+                       key: Hashable = "correctness_reward",
+                       rng=None) -> Optional[List[Hashable]]:
+        """Uniformly sample one complete rollout (root -> leaf token sequence)
+        whose terminal reward matches ``correct``: ``best_reward(key) > 0`` for a
+        correct rollout, ``== 0`` (or unseen) for a wrong one. Sampling is over
+        the SET of distinct rollouts (leaves), ignoring visit counts ``n`` so a
+        frequently-resampled rollout is no likelier than a rare one. ``rng`` may
+        be a ``random.Random``; defaults to the module RNG. Returns the token
+        list, or ``None`` if no leaf matches."""
+        import random
+        rng = rng or random
+        want = bool(correct)
+        pool = [lf for lf in self.leaves()
+                if (lf.best_reward(key) > 0) == want]
+        if not pool:
+            return None
+        return rng.choice(pool).prefix()
+
+    def iter_nodes(self):
+        stack: List[tuple] = [([], self)]
+        while stack:
+            prefix, node = stack.pop()
+            for tok, child in node.children.items():
+                p = prefix + [tok]
+                yield p, child
+                stack.append((p, child))
+
+    def prefix_score(self, key: Hashable = "correctness_reward") -> Optional[float]:
+        """Most difficult, Achievable Prefix recieves highest score"""
+        if not self.children:
+            return None
+        return self.best_reward(key) * (1.0 - self.reward_mean(key)) / self.count
+
+    def sample_prefix(self, key: Hashable = "correctness_reward",
+                      rng=None) -> Optional[List[Hashable]]:
+        """Sample one under-explored prefix (token list, root -> node), weighted
+        by :meth:`prefix_score` over prefixes with a reachable success
+        (``best_reward(key) > 0``). Returns ``None`` if no prefix qualifies
+        (e.g. every success is already reliable -> all scores 0)."""
+        rng = rng or random
+        cands: List[tuple] = []
+        for p, n in self.iter_nodes():
+            if n.best_reward(key) <= 0:
+                continue
+            sc = n.prefix_score(key)
+            if sc is not None and sc > 0:
+                cands.append((p, sc))
+        if not cands:
+            return None
+        x = rng.random() * sum(sc for _, sc in cands)
+        for p, sc in cands:
+            x -= sc
+            if x <= 0:
+                return p
+        return cands[-1][0]
 
     def walk(self, toks: Sequence[Hashable], mode: str = "max") -> List[float]:
         # This method assumes a given sequence, and it retrieves all its prefix's attributes from the Trie
@@ -215,8 +395,16 @@ def optimistic_prefix_advantages(
 # Trainer
 # ---------------------------------------------------------------------------
 try:  # keep the OPA core importable even without trl installed
-    import torch
-    from trl import GRPOTrainer
+    import contextlib
+    import io
+
+    # `import trl` pulls in transformers/protobuf, which prints benign
+    # "MessageFactory object has no attribute 'GetPrototype'" tracebacks to stderr
+    # on some protobuf versions. Mute that import-time noise (real failures still
+    # raise and are handled below); the permanent fix is pinning protobuf.
+    with contextlib.redirect_stderr(io.StringIO()):
+        import torch
+        from trl import GRPOTrainer
     _HAS_TRL = True
 except Exception:  # pragma: no cover - notebook may import the core only
     GRPOTrainer = object  # type: ignore
@@ -253,6 +441,14 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  virtual_rollout: Optional[str] = None,
                  virtual_max_reward: float = 1.2,
                  record_reward_keys: Sequence[str] = ("correctness_reward", "format_reward"),
+                 tree_persist_path: Optional[str] = None,
+                 buffered_baseline: bool = False,
+                 buffered_eps: float = 1e-4,
+                 inject_rollout: bool = False,
+                 inject_incorrect: bool = False,
+                 resample_prefix: bool = False,
+                 resample_train_prefix: bool = False,
+                 resample_inject: bool = False,
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
@@ -294,6 +490,90 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             k for k in record_reward_keys if k in self.reward_func_names
         )
 
+        # --- Idea 1: cross-run persistence of the global prefix trie ----------
+        self.tree_persist_path = tree_persist_path
+        if tree_persist_path and os.path.exists(tree_persist_path):
+            self.load_tries(tree_persist_path)
+        # --- Idea 3: buffered (cross-batch) group baseline for advantages -----
+        self.buffered_baseline = bool(buffered_baseline)
+        self.buffered_eps = float(buffered_eps)
+        # --- repair degenerate groups with a REAL buffered rollout -------------
+        # inject_rollout: degenerate group -> inject buffered CORRECT rollout
+        # (buffer's best total reward). inject_incorrect additionally repairs
+        # all-correct groups with a buffered INCORRECT rollout (zero reward).
+        self.inject_rollout = bool(inject_rollout)
+        self.inject_incorrect = bool(inject_incorrect)
+        # --- Idea 4: resample all-correct groups from a buffered prefix --------
+        self.resample_prefix = bool(resample_prefix)
+        # True  -> forced prefix tokens get gradient (advantage-weighted BC of
+        #          the prefix; immediate lift of p(prefix), off-policy).
+        # False -> prefix is context only: attended (completion_mask=1) but
+        #          excluded from the loss via TRL's tool_mask (loss_mask =
+        #          completion_mask * tool_mask); only the on-policy
+        #          continuation is trained.
+        self.resample_train_prefix = bool(resample_train_prefix)
+        # resample_inject: reserve ONE random slot of each resampled group for
+        # a buffered CORRECT rollout (full rollout from the prompt, no forced
+        # prefix) — guarantees contrast even if all g forced continuations
+        # come back wrong. Scored by the same reward funcs as the rest.
+        self.resample_inject = bool(resample_inject)
+        # ``use_global_tree`` ONLY controls the credit source in _compute_loss
+        # (per-token A* read from the persistent trie instead of a per-batch
+        # trie). Buffer maintenance is a separate, internal concern: the trie is
+        # ingested whenever ANY consumer needs it, without changing the credit
+        # assignment mode.
+        self._use_buffer = (self.use_global_tree or self.buffered_baseline
+                            or self.inject_rollout or self.resample_prefix)
+
+    # ------------------------------------------------------------------
+    # Idea 1: persistence helpers
+    # ------------------------------------------------------------------
+    def save_tries(self, path: Optional[str] = None) -> None:
+        """Serialize every per-prompt global trie to JSON. Only the main process
+        writes. Prompt keys (int token-id tuples) are stored as lists."""
+        path = path or self.tree_persist_path
+        if not path:
+            return
+        if getattr(self, "accelerator", None) is not None and not self.accelerator.is_main_process:
+            return
+        payload = {
+            "version": 1,
+            "tries": [[list(pkey), trie.to_dict()] for pkey, trie in self._global_tries.items()],
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f)
+        os.replace(tmp, path)   # atomic
+
+    def load_tries(self, path: Optional[str] = None) -> None:
+        """Load per-prompt global tries written by :meth:`save_tries`."""
+        path = path or self.tree_persist_path
+        if not path or not os.path.exists(path):
+            return
+        with open(path) as f:
+            payload = json.load(f)
+        self._global_tries = {
+            tuple(pkey): PrefixTrie.from_dict(d) for pkey, d in payload.get("tries", [])
+        }
+
+    def _save_checkpoint(self, *args, **kwargs):
+        # Persist the trie alongside every model checkpoint.
+        out = super()._save_checkpoint(*args, **kwargs)
+        try:
+            self.save_tries()
+        except Exception:
+            pass   # persistence must never break checkpointing
+        return out
+
+    def _pad_id(self) -> int:
+        tok = self.processing_class
+        return tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+
+    @staticmethod
+    def _row_pkey(prompt_row, pad_id: int) -> tuple:
+        return tuple(int(x) for x in prompt_row.tolist() if x != pad_id)
+
     # ------------------------------------------------------------------
     @staticmethod
     def _tree_token_advantages(
@@ -307,6 +587,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         global_tries: Optional[dict] = None,
         credit_mode: str = "max",
         reward_components: Optional[dict] = None,
+        update_tree: bool = True,
     ):
         """The credit-assignment core of :meth:`_compute_loss`.
 
@@ -342,13 +623,10 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 for i in range(Bp)
             ]
 
-        # (2) Group rollouts by prompt. (assign )
-        def _pkey(row):
-            return tuple(int(x) for x in row.tolist() if x != pad_id)
-
+        # (2) Group rollouts by prompt.
         groups: dict = defaultdict(list)
         for i in range(Bp):
-            groups[_pkey(prompt_ids[i])].append(i)
+            groups[TreeTrainer._row_pkey(prompt_ids[i], pad_id)].append(i)
 
         adv_token = torch.zeros_like(completion_mask, dtype=adv_scalar.dtype)
         for pkey, idxs in groups.items():
@@ -356,14 +634,26 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             g_advs = [a_list[i] for i in idxs]
             g_rew = [rew_rows[i] for i in idxs] if rew_rows is not None else None
 
-            # (3) A* per prefix. 
-            if use_global_tree: # @FY, we will add (1). global mean/std buffered advantage || (2). buffer sampling with global trie (add / replace rollouts)
+            # (3) A* per prefix.
+            if use_global_tree:
                 if global_tries is None:
                     global_tries = {}
                 trie = global_tries.setdefault(pkey, PrefixTrie())
-                for j, (toks, a) in enumerate(zip(g_seqs, g_advs)):
-                    trie.insert(toks, a, rewards=(g_rew[j] if g_rew is not None else None))
-                per_tok = [trie.walk(toks, mode=credit_mode) for toks in g_seqs]
+                # ``update_tree`` is False when the trie was already populated at
+                # generation time (see _update_global_tree): walking again here
+                # without re-inserting avoids double-counting across the
+                # num_iterations inner GRPO updates that reuse one batch.
+                if update_tree:
+                    for j, (toks, a) in enumerate(zip(g_seqs, g_advs)):
+                        trie.insert(toks, a, rewards=(g_rew[j] if g_rew is not None else None))
+                if trie.count == 0:
+                    # Buffer empty (e.g. ingestion skipped): fall back to a fresh
+                    # per-group OPA so credit is never silently zeroed.
+                    per_tok = optimistic_prefix_advantages(
+                        g_seqs, g_advs, mode=credit_mode, rewards=g_rew
+                    )
+                else:
+                    per_tok = [trie.walk(toks, mode=credit_mode) for toks in g_seqs]
             else:
                 per_tok = optimistic_prefix_advantages(
                     g_seqs, g_advs, mode=credit_mode, rewards=g_rew
@@ -393,9 +683,6 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 or adv_scalar.dim() != 1):
             return super()._compute_loss(model, inputs)
 
-        # @FY. It's possible to "intercept" and change inputs.get("completion_ids") as well as inputs.get("advantages")
-        #      here, before they get sent to the model for forward computation & loss scaling
-        
         # Per-rollout reward components stashed on the generation batch (see
         # _generate_and_score_completions). They were shuffled+split by TRL
         # alongside completion_ids, so they stay row-aligned here.
@@ -406,8 +693,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             if t is not None:
                 reward_components[key] = t
 
-        tok = self.processing_class
-        pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
+        pad_id = self._pad_id()
         with torch.no_grad():
             adv_token = self._tree_token_advantages(
                 prompt_ids, completion_ids, mask, adv_scalar, pad_id,
@@ -415,6 +701,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 global_tries=self._global_tries,
                 credit_mode=self.credit_mode,
                 reward_components=(reward_components or None),
+                update_tree=not self.use_global_tree,
             )
 
         inputs["advantages"] = adv_token
@@ -429,25 +716,366 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         self._last_rewards_per_func = rpf
         return rpf
 
+    def _hook(self, out, fn, *args):
+        """Run one advantage hook; a non-None return replaces out['advantages'].
+        Exceptions are swallowed: hooks must never break training."""
+        try:
+            new = fn(out, *args)
+        except Exception:
+            return
+        if new is not None:
+            out["advantages"] = new
+
     def _generate_and_score_completions(self, inputs):
         out = super()._generate_and_score_completions(inputs)
-        self._attach_reward(out)
+        local = self._local_rewards_per_func(out)
+        self._attach_reward(out, local)
 
         if self.shaped_reward:
-            try:
-                shaped = self._shaped_advantages(out, inputs)
-            except Exception:
-                shaped = None          # shaping must never break training
-            if shaped is not None:
-                out["advantages"] = shaped
+            self._hook(out, self._shaped_advantages, inputs, local)
         if self.virtual_rollout and self.model.training:
-            try:
-                revived = self._virtual_rollout_advantages(out)
-            except Exception:
-                revived = None         # virtual-rollout must never break training
-            if revived is not None:
-                out["advantages"] = revived
+            self._hook(out, self._virtual_rollout_advantages, local)
+
+        if not self.model.training:
+            return out
+
+        pkeys = None
+        if self._use_buffer:
+            pids, pad_id = out["prompt_ids"], self._pad_id()
+            pkeys = [self._row_pkey(pids[i], pad_id) for i in range(pids.shape[0])]
+            self._update_global_tree(out, local, pkeys) # update global tree
+
+        # Group repair first: both rewrite tokens + rewards (``local`` and the
+        # out columns) and leave a plain LOCAL group z-score advantage.
+        # treatment for degenerate group using a REAL rollout from the buffer
+        # (as opposed to virtual_rollout's reward-only insertion)
+        if self.inject_rollout:
+            self._inject_buffer_rollouts(out, local, pkeys)
+        # Idea 4: same-step resample — every all-correct group (zero learning
+        # signal) is REPLACED by g continuations of an under-explored buffered
+        # prefix, re-scored; the original group is discarded.
+        if self.resample_prefix:
+            self._resample_all_correct_groups(out, inputs, local, pkeys)
+
+        # Buffered baseline LAST: the single advantage interceptor. Recomputes
+        # every row (repaired ones included, via the updated rewards) against
+        # the buffer mean/std — composition by ordering, not by embedding.
+        if self.buffered_baseline:
+            self._hook(out, self._buffered_advantages, local, pkeys)
         return out
+
+    # ------------------------------------------------------------------
+    # Idea 1: ingest a generation batch into the global trie (once per batch)
+    # ------------------------------------------------------------------
+    def _update_global_tree(self, out, local=None, pkeys=None) -> None:
+        adv = out.get("advantages")
+        cids = out.get("completion_ids")
+        mask = out.get("completion_mask")
+        if adv is None or cids is None or mask is None or pkeys is None or adv.dim() != 1:
+            return
+        mb = mask.bool()
+        # Per-rollout reward components for node stats, plus the synthetic total
+        # reward used by the buffered baseline (Idea 3).
+        rew_cols = {k: out[k] for k in self._opa_reward_keys if k in out}
+        total = local.sum(dim=1) if local is not None else None
+        for i, pkey in enumerate(pkeys):
+            toks = [int(t) for t in cids[i][mb[i]].tolist()]
+            rdict = {k: float(v[i]) for k, v in rew_cols.items()}
+            if total is not None:
+                rdict[_TOTAL_KEY] = float(total[i])
+            trie = self._global_tries.setdefault(pkey, PrefixTrie())
+            trie.insert(toks, float(adv[i]), rewards=(rdict or None))
+
+    # ------------------------------------------------------------------
+    # Idea 3: re-baseline advantages with the buffered group mean/std
+    # ------------------------------------------------------------------
+    def _buffered_advantages(self, out, local=None, pkeys=None):
+        """Rescale rewards by the BUFFERED std (stable across batches, never
+        the degenerate within-group 0/eps), then re-center per group so each
+        group's advantages sum to ZERO — the update stays a within-group
+        contrast, never a uniform imitate-everything push."""
+        adv = out.get("advantages")
+        if adv is None or pkeys is None or local is None or adv.dim() != 1:
+            return None
+        r = local.sum(dim=1).float()
+        new = adv.clone().float()
+        for i, pkey in enumerate(pkeys):
+            trie = self._global_tries[pkey]
+            s = trie.reward_std(_TOTAL_KEY)
+            assert s == s, f"_TOTAL_KEY stats missing for pkey (trie count={trie.count})"
+            new[i] = r[i] / (s + self.buffered_eps)
+        g = self.num_generations
+        for s0 in range(0, new.shape[0], g):
+            new[s0:s0 + g] -= new[s0:s0 + g].mean()
+        return new.to(adv)
+
+    # ------------------------------------------------------------------
+    # repair degenerate groups with a REAL buffered rollout (token swap)
+    # ------------------------------------------------------------------
+    def _inject_buffer_rollouts(self, out, local=None, pkeys=None) -> None:
+        """Swap ONE slot per broken group for a real rollout from the buffer:
+          * degenerate (all_wrong / format_only / reward_hacking)
+              -> buffered CORRECT rollout
+          * all-correct (only when ``inject_incorrect``)
+              -> buffered INCORRECT rollout
+        The injected slot carries the per-func rewards RECORDED at the
+        rollout's leaf node when it was ingested (written into ``local`` and
+        the out columns so every downstream consumer sees them), and the WHOLE
+        group's advantages are recomputed as the LOCAL group z-score over the
+        substituted rewards. Re-baselining against the buffer is NOT done here
+        — _buffered_advantages runs after this hook when Idea 1 is enabled."""
+        adv = out.get("advantages")
+        cids = out.get("completion_ids")
+        cmask = out.get("completion_mask")
+        if adv is None or cids is None or cmask is None or local is None or pkeys is None:
+            return
+        # The injected tokens are off-policy and carry no stored logps: they
+        # only train correctly when GRPO's importance ratio is exactly 1.
+        if (getattr(self, "num_iterations", 1) != 1
+                or "old_per_token_logps" in out
+                or "importance_sampling_ratio" in out):
+            return
+
+        correct, fmt, total = self._split_rewards(local)
+        pad_id, g = self._pad_id(), self.num_generations
+        r = total.clone().float()
+        for s in range(0, adv.shape[0], g):
+            label = self._classify_group(correct[s:s + g], fmt[s:s + g], total[s:s + g])
+            if label in ("all_wrong", "format_only", "reward_hacking"):
+                want_correct = True
+            elif label == "all_correct" and self.inject_incorrect:
+                want_correct = False
+            else:
+                continue                                   # mixed: nothing to repair
+            trie = self._global_tries[pkeys[s]]            # one prompt per group
+            toks = trie.sample_rollout(correct=want_correct, key="correctness_reward",
+                                       rng=random)
+            if not toks:
+                continue                                   # buffer lacks that kind
+            slot = s + random.randrange(g)
+            self._overwrite_completion(cids, cmask, slot, toks, pad_id)
+            # Per-func rewards RECORDED at the rollout's leaf node, written
+            # into ``local`` + out columns so downstream consumers (incl.
+            # _buffered_advantages, which runs after) see the substitution.
+            node = trie.get_node(toks)
+            names = self.reward_func_names
+            for key in self._opa_reward_keys:
+                v = float(node.best_reward(key))
+                local[slot, names.index(key)] = v
+                if key in out:
+                    out[key][slot] = v
+            r[slot] = float(node.best_reward(_TOTAL_KEY))
+            # Tool-use training: the row's tool_mask described the DISCARDED
+            # completion; the injected rollout is plain text, so reset to 1s.
+            if "tool_mask" in out:
+                out["tool_mask"][slot] = 1
+            # LOCAL group z-score over the substituted rewards — nothing else.
+            grp = r[s:s + g]
+            adv[s:s + g] = ((grp - grp.mean()) / (grp.std() + self.buffered_eps)).to(adv)
+
+    @staticmethod
+    def _overwrite_completion(cids, cmask, i: int, toks, pad_id: int) -> None:
+        """Overwrite row ``i`` of the completion tensors with token-ids ``toks``
+        (truncated to the batch's completion width); mask = 1 on the new tokens,
+        0 on the trailing pad."""
+        width = cids.shape[1]
+        toks = list(toks)[:width]
+        n = len(toks)
+        cids[i] = cids.new_full((width,), pad_id)
+        cids[i, :n] = torch.tensor(toks, dtype=cids.dtype, device=cids.device)
+        cmask[i] = cmask.new_zeros(width)
+        cmask[i, :n] = 1
+
+    def _split_rewards(self, local):
+        names = self.reward_func_names
+        correct = local[:, names.index("correctness_reward")]
+        fmt = (local[:, names.index("format_reward")]
+               if "format_reward" in names else torch.zeros_like(correct))
+        return correct, fmt, local.sum(dim=1)
+
+    def _classify_group(self, correct, fmt, total):
+        """mixed, all_correct, reward_hacking, format_only, all_wrong"""
+        n = len(correct)
+        n_correct = int((correct > 0).sum())
+        n_hack = int((fmt>0).sum())
+        if 0 < n_correct < n:
+            return "mixed"
+        if n_correct == n:
+            return "all_correct"
+        if n_hack == n: 
+            return "reward_hacking"
+        if n_correct == 0 and n_hack > 0:
+            return "format_only"
+        return "all_wrong"
+
+    # ------------------------------------------------------------------
+    # Idea 4: same-step resample of all-correct groups from a buffered prefix
+    # ------------------------------------------------------------------
+    def _resample_all_correct_groups(self, out, inputs, local=None, pkeys=None) -> None:
+        """Replace each ALL-CORRECT group (zero variance, nothing to learn) with
+        fresh continuations of an under-explored buffered prefix.
+        ONLY WORK for training runs without Tool Use (Need to fix, if this works)
+        """
+        
+        adv = out.get("advantages")
+        cids = out.get("completion_ids")
+        cmask = out.get("completion_mask")
+        if adv is None or cids is None or cmask is None or local is None or pkeys is None:
+            return
+        if (getattr(self, "num_iterations", 1) != 1
+                or "old_per_token_logps" in out
+                or "importance_sampling_ratio" in out):
+            return
+
+        correct, fmt, total = self._split_rewards(local)
+        pad_id, g, tok = self._pad_id(), self.num_generations, self.processing_class
+        names = self.reward_func_names
+
+        # Collect this rank's forced groups: (row offset, trie, prefix, text).
+        forced = []
+        for s in range(0, adv.shape[0], g):
+            label = self._classify_group(correct[s:s + g], fmt[s:s + g], total[s:s + g])
+            if label != "all_correct":
+                continue
+            trie = self._global_tries[pkeys[s]]            # one prompt per group
+            prefix = trie.sample_prefix(rng=random)
+            if not prefix:
+                continue                                   # no under-explored prefix
+            prefix = [int(t) for t in prefix]
+            text = tok.decode(list(pkeys[s]) + prefix, skip_special_tokens=False)
+            forced.append((s, trie, prefix, text))
+
+        # (1) Regenerate in ONE rank-uniform call. vLLM-server generation is a
+        # collective (gather_object + broadcast, sliced by process_index *
+        # len(prompts)), so EVERY rank must send an identically-shaped prompt
+        # list: pad to the max forced-group count across ranks with a dummy
+        # group (this rank's first prompt) and discard its output.
+        n = torch.tensor([len(forced)], device=self.accelerator.device)
+        M = int(self.accelerator.gather(n).max().item())
+        if M == 0:
+            return
+        dummy_text = tok.decode(list(pkeys[0]), skip_special_tokens=False)
+        texts = []
+        for k in range(M):
+            texts.extend([forced[k][3] if k < len(forced) else dummy_text] * g)
+        # Tool-use training: go through _generate (single-turn generation +
+        # _tool_call_loop), so tool calls in the forced continuation are
+        # EXECUTED and their output tokens come back masked in f_tmask.
+        # Without tools, _generate_single_turn is the same path minus the loop.
+        if getattr(self, "tools", None):
+            _, f_cids, f_tmask, _, _, _, _ = super()._generate(texts)
+        else:
+            _, f_cids, _, _ = super()._generate_single_turn(texts)
+            f_tmask = None
+
+        # Gradient-free prefix: loss_mask = completion_mask * tool_mask in TRL,
+        # so zeroing tool_mask on the prefix removes its gradient WITHOUT
+        # touching attention (unlike zeroing completion_mask).
+        tmask = out.get("tool_mask")
+        if tmask is None and (f_tmask is not None or not self.resample_train_prefix):
+            tmask = out["tool_mask"] = torch.ones_like(cmask)
+
+        width = cids.shape[1]
+        for k, (s, trie, prefix, _) in enumerate(forced):
+            new_completions = [(prefix + [int(t) for t in c])[:width]
+                               for c in f_cids[k * g:(k + 1) * g]]
+            # [resample_inject] reserve one slot for a buffered CORRECT
+            # rollout THROUGH THIS PREFIX: the prefix was sampled because its
+            # subtree contains a success (best_reward > 0), so sample the
+            # rollout from the prefix NODE — the group then contrasts "the
+            # success through this prefix" against g-1 fresh attempts from the
+            # same prefix. Full rollout row: fully trained (tool_mask stays 1).
+            j_inj = -1
+            if self.resample_inject:
+                pnode = trie.get_node(prefix)
+                inj = (pnode.sample_rollout(correct=True, key="correctness_reward",
+                                            rng=random) if pnode is not None else None)
+                if not inj:                            # robustness fallback
+                    inj = trie.sample_rollout(correct=True, key="correctness_reward",
+                                              rng=random)
+                if inj:
+                    j_inj = random.randrange(g)
+                    new_completions[j_inj] = [int(t) for t in inj][:width]
+            # (2) Re-score locally; write the new rewards into ``local`` + out
+            # columns so downstream consumers (incl. _buffered_advantages,
+            # which runs after) see the substituted group.
+            rpf = self._score_completions(inputs[s:s + g], new_completions)  # (g, n_funcs)
+            r_new = rpf.sum(dim=1)
+            local[s:s + g] = rpf.to(local)
+            for key in self._opa_reward_keys:
+                if key in out:
+                    out[key][s:s + g] = rpf[:, names.index(key)].to(out[key])
+            # (3) LOCAL group z-score over the new rewards — nothing else;
+            # buffered re-baselining is the hook's job, not this method's.
+            adv[s:s + g] = ((r_new - r_new.mean())
+                            / (r_new.std() + self.buffered_eps)).to(adv)
+            # (4) Swap tokens in place. Any pre-existing tool_mask row
+            # described the DISCARDED completion — rebuild it for the new one:
+            # 1s, continuation tool-output zeros from f_tmask (tool path),
+            # then prefix zeros unless the prefix should be trained.
+            for j in range(g):
+                self._overwrite_completion(cids, cmask, s + j, new_completions[j], pad_id)
+                if tmask is not None:
+                    tmask[s + j] = 1
+                    if j == j_inj:
+                        continue                    # full rollout: train it all
+                    if f_tmask is not None:
+                        fm = torch.as_tensor(f_tmask[k * g + j])
+                        cont = min(len(fm), width - len(prefix))
+                        tmask[s + j, len(prefix):len(prefix) + cont] = \
+                            fm[:cont].to(tmask)
+                    if not self.resample_train_prefix:
+                        tmask[s + j, :len(prefix)] = 0
+            # Forced rows have no valid sampling logps; zero them so any
+            # downstream consumer (e.g. shaped_reward) sees mask-consistent 0s.
+            slp = out.get("sampling_per_token_logps")
+            if slp is not None:
+                slp[s:s + g] = 0.0
+
+        # KL regularization (beta != 0): ref_per_token_logps was computed by
+        # TRL BEFORE this swap, so on forced rows it describes the discarded
+        # completions. Recompute it for those rows against the new tokens.
+        rlp = out.get("ref_per_token_logps")
+        if rlp is not None and forced:
+            rows = [s + j for s, *_ in forced for j in range(g)]
+            pc_ids = torch.cat([out["prompt_ids"][rows], cids[rows]], dim=1)
+            attn = torch.cat([out["prompt_mask"][rows], cmask[rows]], dim=1)
+            with torch.no_grad():
+                if self.ref_model is not None:
+                    new_rlp, _ = self._get_per_token_logps_and_entropies(
+                        self.ref_model, pc_ids, attn, width)
+                else:
+                    from trl.trainer.utils import use_adapter
+                    model = self.accelerator.unwrap_model(self.model)
+                    with use_adapter(model, adapter_name="ref" if "ref" in model.peft_config else None):
+                        new_rlp, _ = self._get_per_token_logps_and_entropies(
+                            self.model, pc_ids, attn, width)
+            rlp[rows] = new_rlp.to(rlp)
+
+    def _score_completions(self, rows, completion_ids_list):
+        """Run the raw reward funcs on decoded completions, process-locally
+        (no gather — unlike TRL's _calculate_rewards). ``rows`` are the raw
+        dataset rows for the group (carrying e.g. gold_answer / test_list);
+        the completion text is wrapped to match the dataset's format so the
+        same reward funcs work unchanged. Returns a (len(rows), n_funcs)
+        tensor."""
+        from trl.data_utils import is_conversational
+        tok = self.processing_class
+        texts = [tok.decode(c, skip_special_tokens=True) for c in completion_ids_list]
+        conversational = bool(rows) and isinstance(rows[0], dict) and is_conversational(rows[0])
+        completions = ([[{"role": "assistant", "content": t}] for t in texts]
+                       if conversational else texts)
+        prompts = [r.get("prompt") if isinstance(r, dict) else None for r in rows]
+        keys = ([k for k in rows[0] if k not in ("prompt", "completion", "completion_ids")]
+                if rows and isinstance(rows[0], dict) else [])
+        kwargs = {k: [r[k] for r in rows] for k in keys}
+        kwargs["trainer_state"] = self.state
+        rpf = torch.zeros(len(rows), len(self.reward_funcs))
+        for i, func in enumerate(self.reward_funcs):
+            vals = func(prompts=prompts, completions=completions,
+                        completion_ids=completion_ids_list, **kwargs)
+            rpf[:, i] = torch.tensor([float("nan") if v is None else float(v) for v in vals])
+        return rpf.nan_to_num(0.0)
 
     def _local_rewards_per_func(self, out):
         """Local-process slice of the gathered per-func reward tensor (rpf)"""
@@ -458,18 +1086,16 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         lo = self.accelerator.process_index * Bp     # same slice TRL applies
         return rpf[lo:lo + Bp]
 
-    def _attach_reward(self, out):
-        """Attach per-rollout reward"""
-        local = self._local_rewards_per_func(out)
+    def _attach_reward(self, out, local):
+        """Attach per-rollout reward columns ({key: (Bp,)}) onto the batch."""
         if local is None:
             return
         names = self.reward_func_names
         for key in self._opa_reward_keys:
             out[key] = local[:, names.index(key)].detach().clone()
 
-    def _virtual_rollout_advantages(self, out):
+    def _virtual_rollout_advantages(self, out, local):
         adv = out.get("advantages")
-        local = self._local_rewards_per_func(out)
         ci = self.reward_func_names.index("correctness_reward")  # validated in __init__
         rewards = local.sum(axis=1)        # total reward = sum over all reward funcs
         corrects = (local[:, ci] == 1.0)   # correctness flag from its own column
@@ -480,7 +1106,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             max_reward=self.virtual_max_reward, mode=self.virtual_rollout,
         ).to(adv)
 
-    def _shaped_advantages(self, out, inputs):
+    def _shaped_advantages(self, out, inputs, local=None):
         """Encourage rare success, Penalize confident failure
 
         Ingredients (all process-local, 1:1 with the generation batch):
@@ -502,7 +1128,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         logp, src = out.get("sampling_per_token_logps"), "vllm_sampling"
         if logp is None:
             logp, src = out.get("old_per_token_logps"), "policy_recompute"
-        if adv is None or cmask is None or cids is None or logp is None:
+        if adv is None or cmask is None or cids is None or logp is None or local is None:
             return None
         if getattr(self, "_logp_src", None) != src:
             self._logp_src = src
@@ -514,8 +1140,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         logp_o = (logp * cmask).sum(dim=1).detach().float().cpu().numpy()
 
         ci = self.reward_func_names.index("correctness_reward")
-        lo = self.accelerator.process_index * B
-        correct = self._last_rewards_per_func[lo:lo + B, ci].detach().cpu().numpy()
+        correct = local[:, ci].detach().cpu().numpy()
 
         D_q = [1.0] * B          # TBD. add internal difficulty calculation logic in the future
 
