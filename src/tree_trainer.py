@@ -51,6 +51,40 @@ _TOTAL_KEY = "_total_reward"
 # ---------------------------------------------------------------------------
 # Core: token-id prefix trie with optimistic (max) advantage backup
 # ---------------------------------------------------------------------------
+def _trie_deep_call(fn, _stack_bytes=512 * 1024 * 1024):
+    """Run ``fn`` in a thread with a large C stack, a raised recursion limit, and the
+    pure-Python json (en|de)coder forced on — so trie (de)serialization is NOT bounded
+    by completion length. Trie depth == #tokens on the longest buffered completion,
+    which can exceed (a) Python's default ~1000 recursion limit, (b) the 8 MiB thread
+    stack, and (c) the C json coder's fixed C-recursion limit (which ignores
+    setrecursionlimit on CPython >=3.12). Verified to round-trip a 20k-deep trie."""
+    import sys as _sys, threading as _th
+    from json import scanner as _js
+    _sys.setrecursionlimit(max(_sys.getrecursionlimit(), 1 << 22))   # ~4.19M frames
+    box = {}
+    def _runner():
+        _old_ms = _js.make_scanner
+        _js.make_scanner = _js.py_make_scanner          # force pure-Python decoder
+        try:
+            box["r"] = fn()
+        except BaseException as e:                       # propagate to caller
+            box["e"] = e
+        finally:
+            _js.make_scanner = _old_ms
+    prev = None
+    try:
+        prev = _th.stack_size(_stack_bytes)              # large per-thread C stack
+    except (ValueError, RuntimeError):
+        pass                                             # platform refused -> default stack
+    t = _th.Thread(target=_runner); t.start(); t.join()
+    if prev is not None:
+        try: _th.stack_size(prev)
+        except (ValueError, RuntimeError): pass
+    if "e" in box:
+        raise box["e"]
+    return box.get("r")
+
+
 class PrefixTrie:
     """Lightweight prefix trie keyed on hashable tokens (e.g. token ids).
 
@@ -536,26 +570,28 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             return
         if getattr(self, "accelerator", None) is not None and not self.accelerator.is_main_process:
             return
-        payload = {
-            "version": 1,
-            "tries": [[list(pkey), trie.to_dict()] for pkey, trie in self._global_tries.items()],
-        }
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f)
-        os.replace(tmp, path)   # atomic
+        def _do_save():
+            payload = {
+                "version": 1,
+                "tries": [[list(pkey), trie.to_dict()] for pkey, trie in self._global_tries.items()],
+            }
+            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(payload, f)            # json.dump -> pure-Python iterencode (respects limit)
+            os.replace(tmp, path)   # atomic
+        _trie_deep_call(_do_save)   # unbounded by completion length (trie depth ~ #tokens)
 
     def load_tries(self, path: Optional[str] = None) -> None:
         """Load per-prompt global tries written by :meth:`save_tries`."""
         path = path or self.tree_persist_path
         if not path or not os.path.exists(path):
             return
-        with open(path) as f:
-            payload = json.load(f)
-        self._global_tries = {
-            tuple(pkey): PrefixTrie.from_dict(d) for pkey, d in payload.get("tries", [])
-        }
+        def _do_load():
+            with open(path) as f:
+                payload = json.JSONDecoder().decode(f.read())   # fresh decoder -> pure-Python scanner
+            return {tuple(pkey): PrefixTrie.from_dict(d) for pkey, d in payload.get("tries", [])}
+        self._global_tries = _trie_deep_call(_do_load)
 
     def _save_checkpoint(self, *args, **kwargs):
         # Persist the trie alongside every model checkpoint.

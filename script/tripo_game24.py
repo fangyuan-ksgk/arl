@@ -346,15 +346,25 @@ class FastEvalMixin:
         gc = getattr(self, "generation_config", None)
         old_vg_t = getattr(vg, "temperature", None) if vg is not None else None
         old_gc = (gc.temperature, gc.do_sample) if gc is not None else None
+        old_self_t = getattr(self, "temperature", None)
+        # TRL builds the vLLM SamplingParams from self.temperature (the server
+        # VLLMClient path reads THIS); vg.temperature only reaches the colocate
+        # engine and vLLM ignores do_sample. Set all three so greedy (T=0) really
+        # applies in BOTH colocate and server mode (else server "greedy" samples
+        # at T=1 -> long rambling completions, wrong greedy@1, slower eval).
+        self.temperature = 0.0
         if vg is not None:
             vg.temperature = 0.0
         if gc is not None:
             gc.do_sample = False
+            gc.temperature = 0.0
         try:
             yield
         finally:
             self.num_generations_eval = old_neval
             self._greedy_pass = False
+            if old_self_t is not None:
+                self.temperature = old_self_t
             if vg is not None:
                 vg.temperature = old_vg_t
             if gc is not None:
