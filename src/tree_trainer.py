@@ -386,7 +386,7 @@ def optimistic_prefix_advantages(
     token_seqs: Sequence[Sequence[Hashable]],
     scalar_advs: Sequence[float],
     return_trie: bool = False,
-    mode: str = "max",
+    mode: str = "base",
     rewards: Optional[Sequence[dict]] = None,
 ):
     """Per-token Optimistic Prefix Advantage for one GRPO group.
@@ -419,7 +419,10 @@ def optimistic_prefix_advantages(
     else:
         for toks, a, rw in zip(token_seqs, scalar_advs, rewards):
             root.insert(toks, a, rewards=rw)
-    per_token = [root.walk(toks, mode=mode) for toks in token_seqs]
+    if mode == "base":   # vanilla GRPO: same scalar advantage on every token
+        per_token = [[a] * len(toks) for toks, a in zip(token_seqs, scalar_advs)]
+    else:
+        per_token = [root.walk(toks, mode=mode) for toks in token_seqs]
     if return_trie:
         return per_token, root
     return per_token
@@ -468,7 +471,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     """
 
     def __init__(self, *args, use_global_tree: bool = False,
-                 credit_mode: str = "max",
+                 credit_mode: str = "base",
                  shaped_reward: bool = False,
                  shaped_kwargs: Optional[dict] = None,
                  difficulty_map: Optional[dict] = None,
@@ -486,8 +489,8 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
-        if credit_mode not in ("max", "min"):
-            raise ValueError(f"credit_mode must be 'max' or 'min', got {credit_mode!r}")
+        if credit_mode not in ("base", "max", "min"):
+            raise ValueError(f"credit_mode must be 'base', 'max', or 'min', got {credit_mode!r}")
         if virtual_rollout not in (None, "insert_max", "insert_min", "insert_max_min",
                                    "insert_max_all_incorrect", "insert_max_mixed"):
             raise ValueError("virtual_rollout must be None, 'insert_max', 'insert_min', "
@@ -776,8 +779,8 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             g_advs = [a_list[i] for i in idxs]
             g_rew = [rew_rows[i] for i in idxs] if rew_rows is not None else None
 
-            # (3) A* per prefix.
-            if use_global_tree:
+            # (3) A* per prefix. 'base' never reads the trie (no redistribution).
+            if use_global_tree and credit_mode != "base":
                 if global_tries is None:
                     global_tries = {}
                 trie = global_tries.setdefault(pkey, PrefixTrie())

@@ -703,10 +703,12 @@ def parse_args() -> argparse.Namespace:
     # Tree-credit (OPA) options
     p.add_argument("--use-global-tree", action="store_true",
                    help="(tree trainer) persist the prefix trie across batches.")
-    p.add_argument("--credit-mode", choices=["max", "min"], default="max",
-                   help="(tree trainer) per-prefix advantage backup: 'max' = "
-                        "Optimistic Prefix Advantage (best reachable "
-                        "continuation); 'min' = pessimistic (worst reachable).")
+    p.add_argument("--credit-mode", choices=["base", "max", "min"], default="base",
+                   help="(tree trainer) per-prefix advantage backup: 'base' = "
+                        "vanilla GRPO trajectory-level advantage (default, no "
+                        "redistribution); 'max' = Optimistic Prefix Advantage "
+                        "(best reachable continuation); 'min' = pessimistic "
+                        "(worst reachable).")
     # Tree sampling options
     p.add_argument("--tree-sampling", action="store_true",
                    help="Breadth-first block sampling on the colocate vLLM engine.")
