@@ -618,14 +618,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     # ------------------------------------------------------------------
     def stitch_healthy_groups(self, groups_per_query: int = 1, rng=None):
         """Stitch healthy GRPO groups from the buffered trie dict.
-
-        A prompt is *healthy* when its trie holds >=1 correct AND >=1 incorrect
-        rollout (leaf). For each healthy prompt, sample ``groups_per_query``
-        groups of ``num_generations`` leaves (one correct + one incorrect
-        guaranteed, rest uniform over all leaves); the group advantage is the
-        LOCAL z-score of the leaf-recorded total rewards (_TOTAL_KEY).
-
-        Returns ``[(pkey, [token_lists], [advantages]), ...]``.
+           取出全部 healthy groups 每个 query 有固定数目的 group, 计算 advantage
         """
         rng = rng or random
         g = self.num_generations
@@ -637,6 +630,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             if not pos or not neg:
                 continue
             for _ in range(groups_per_query):
+                # 配比：1 胜 1 败 + 其他随机 ｜ 配比应为可调整参数 （这里不是）
                 picks = [rng.choice(pos), rng.choice(neg)]
                 picks += [rng.choice(leaves) for _ in range(g - 2)]
                 rng.shuffle(picks)
@@ -671,7 +665,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         if not groups:
             print("[absorb] no healthy groups in buffer — skipped", flush=True)
             return
-        random.Random(self.args.seed).shuffle(groups)
+        random.Random(self.args.seed).shuffle(groups) # -> redundant but fine
         steps = min(int(steps), len(groups))
         chunks = [groups[i::steps] for i in range(steps)]
         print(f"[absorb] {len(groups)} healthy groups "
@@ -715,6 +709,14 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                         adv_t = torch.tensor(sub_adv, device=device,
                                              dtype=logps.dtype).unsqueeze(1)
                         loss = -(adv_t * logps * cmask).sum() / group_tokens / len(chunk)
+                        if self.beta != 0.0:
+                            assert self.ref_model is not None, \
+                                "beta != 0 needs self.ref_model (PEFT ref path not wired here)"
+                            with torch.no_grad():
+                                ref_logps, _ = self._get_per_token_logps_and_entropies(
+                                    self.ref_model, ids, attn, T)
+                            kl = torch.exp(ref_logps - logps) - (ref_logps - logps) - 1
+                            loss = loss + self.beta * (kl * cmask).sum() / group_tokens / len(chunk)
                     loss.backward()
             opt.step()
         opt.zero_grad(set_to_none=True)
