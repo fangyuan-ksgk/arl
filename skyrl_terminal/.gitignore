@@ -1,0 +1,19 @@
+# junk / unrelated leftovers in this dir
+*.bin
+*.o
+qemu-5.2.0/
+readme.html
+meter.o
+sequences.csv
+training_output.txt
+
+# generated / caches
+__pycache__/
+*.pyc
+*.emb.npy
+*.log
+
+# data + outputs live under ~/data and ~/exports, not in the repo
+data/
+exports/
+.ipynb_checkpoints/
