@@ -482,6 +482,10 @@ def main() -> None:
     puzzles = build_puzzle_pool(max_n=args.max_n)
     train_puzzles, eval_puzzles = split_train_eval(
         puzzles, eval_frac=args.eval_frac, eval_min=args.eval_min,
+        rng=random.Random(0xE7A15),   # FIXED split seed -> IDENTICAL eval set across all run
+                                       # seeds (was: global rng seeded by args.seed -> eval set
+                                       # differed per seed). Training data ORDER still varies by
+                                       # args.seed (set above), so seed variation is preserved.
     )
     train_ds, eval_ds = make_dataset(train_puzzles), make_dataset(eval_puzzles)
     if getattr(args, "no_think", False):
@@ -565,6 +569,17 @@ def main() -> None:
     config_kwargs["vllm_importance_sampling_correction"] = False
     config_kwargs["beta"] = args.beta            # KL coef vs reference; >0 anchors policy (anti-collapse)
     config_kwargs["scale_rewards"] = args.scale_rewards   # group(default,÷std) | none(Dr.GRPO) | batch
+    # ---- 4B memory knobs (all opt-in; defaults = unchanged behavior) --------------------------
+    # bf16(=AMP) above only casts COMPUTE; weights/grads/optimizer stay fp32 unless we load bf16.
+    # For 4B full-FT in 80GB (server mode): --model-dtype bfloat16 (weights 16->8GB, Adam states too)
+    # + --optim paged_adamw_8bit (Adam states 32->8GB). gradient-checkpointing OFF by default (it
+    # recomputes activations in backward -> ~20-30%% slower; rarely needed once bf16 + 8-bit Adam).
+    if getattr(args, "model_dtype", None):
+        config_kwargs["model_init_kwargs"] = {"dtype": args.model_dtype}
+    config_kwargs["optim"] = args.optim
+    if getattr(args, "gradient_checkpointing", False):
+        config_kwargs["gradient_checkpointing"] = True
+        config_kwargs["gradient_checkpointing_kwargs"] = {"use_reentrant": False}
     config = GRPOConfig(**config_kwargs)
 
     if args.tree_sampling and args.no_vllm:
@@ -799,6 +814,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--virtual-max-reward", type=float, default=1.2,
                    help="reward value of the MAX virtual rollout (default 1.2 = correctness 1.0 + format 0.2).")
     p.add_argument("--logging-steps", type=int, default=10)
+    p.add_argument("--optim", default="adamw_torch",
+                   help="HF optimizer name. 'paged_adamw_8bit' cuts Adam states ~4x "
+                        "(4B: 32GB->8GB) so full-FT 4B fits in 80GB server mode.")
+    p.add_argument("--gradient-checkpointing", action="store_true",
+                   help="recompute activations in backward (saves memory, ~20-30%% slower). "
+                        "OFF by default; usually unneeded once weights are bf16 + 8-bit Adam.")
+    p.add_argument("--model-dtype", default=None,
+                   help="model load dtype, e.g. 'bfloat16' (weights bf16 -> halves model/grad/Adam "
+                        "memory; needed for 4B). Default None = HF default (fp32 weights + bf16 AMP).")
     # Data
     p.add_argument("--max-n", type=int, default=13,
                    help="Puzzle numbers drawn from {1..max_n} (13 = full deck; "

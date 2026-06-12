@@ -681,28 +681,38 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         width_cap = int(self.args.max_completion_length)
         model = self.model
         model.train()
+        # micro-batch the per-group forward+backward to per_device_train_batch_size, so the
+        # BACKWARD batch is mb (not the whole 8-seq group). The old code backprop'd the entire
+        # group in ONE backward -> it retained the full (group x T x vocab) logits graph and
+        # OOM'd at long T (normal training keeps its backward batch at per_device_train_batch_size
+        # with grad accumulation). Mathematically identical: the group loss is a token-mean, so
+        # normalize each slice by the group's total completion tokens.
+        mb = max(1, int(self.args.per_device_train_batch_size))
         for chunk in chunks:
             opt.zero_grad(set_to_none=True)
             for pkey, seqs, advs in chunk:
                 seqs = [list(s)[:width_cap] for s in seqs]
-                T = max(len(s) for s in seqs)
-                B = len(seqs)
-                prompt = torch.tensor(pkey, dtype=torch.long,
-                                      device=device).unsqueeze(0).expand(B, -1)
-                cids = torch.full((B, T), pad_id, dtype=torch.long, device=device)
-                cmask = torch.zeros((B, T), dtype=torch.long, device=device)
-                for j, s in enumerate(seqs):
-                    cids[j, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
-                    cmask[j, :len(s)] = 1
-                ids = torch.cat([prompt, cids], dim=1)
-                attn = torch.cat([torch.ones_like(prompt), cmask], dim=1)
-                with self.accelerator.autocast():
-                    logps, _ = self._get_per_token_logps_and_entropies(
-                        model, ids, attn, T)
-                    adv_t = torch.tensor(advs, device=device,
-                                         dtype=logps.dtype).unsqueeze(1)
-                    loss = -(adv_t * logps * cmask).sum() / cmask.sum().clamp(min=1)
-                (loss / len(chunk)).backward()
+                group_tokens = max(sum(len(s) for s in seqs), 1)
+                for i in range(0, len(seqs), mb):
+                    sub, sub_adv = seqs[i:i + mb], advs[i:i + mb]
+                    T = max(len(s) for s in sub)
+                    B = len(sub)
+                    prompt = torch.tensor(pkey, dtype=torch.long,
+                                          device=device).unsqueeze(0).expand(B, -1)
+                    cids = torch.full((B, T), pad_id, dtype=torch.long, device=device)
+                    cmask = torch.zeros((B, T), dtype=torch.long, device=device)
+                    for j, s in enumerate(sub):
+                        cids[j, :len(s)] = torch.tensor(s, dtype=torch.long, device=device)
+                        cmask[j, :len(s)] = 1
+                    ids = torch.cat([prompt, cids], dim=1)
+                    attn = torch.cat([torch.ones_like(prompt), cmask], dim=1)
+                    with self.accelerator.autocast():
+                        logps, _ = self._get_per_token_logps_and_entropies(
+                            model, ids, attn, T)
+                        adv_t = torch.tensor(sub_adv, device=device,
+                                             dtype=logps.dtype).unsqueeze(1)
+                        loss = -(adv_t * logps * cmask).sum() / group_tokens / len(chunk)
+                    loss.backward()
             opt.step()
         opt.zero_grad(set_to_none=True)
 
