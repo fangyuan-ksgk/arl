@@ -19,7 +19,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-EXPORTS = "/home/claudeuser/exports"
+EXPORTS = os.environ.get("SKYRL_EXPORTS", os.path.expanduser("~/exports"))
 
 # train metrics parsed in-order from the console log (one value per step)
 TRAIN_KEYS = {

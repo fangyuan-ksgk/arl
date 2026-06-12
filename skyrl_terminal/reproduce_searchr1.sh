@@ -8,10 +8,12 @@ set -uo pipefail
 
 # always run as claudeuser (root hits the /workspace uv-cache quota on this box)
 if [ "$(id -u)" = "0" ]; then exec su claudeuser -c "bash $(printf '%q' "$0") $(printf '%q ' "$@")"; fi
-export HOME=/home/claudeuser
-PY=/home/claudeuser/SkyRL/.venv/bin/python
-HERE=/home/claudeuser/arl/skyrl_terminal
-DATA=/home/claudeuser/data/searchR1_mini
+export HOME="${HOME:-/home/claudeuser}"
+# SKYRL_DIR = the (forked) SkyRL repo to run against; pass it in to use any checkout.
+export SKYRL_DIR="${SKYRL_DIR:-$HOME/SkyRL}"
+PY="$SKYRL_DIR/.venv/bin/python"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this script's own dir (works from any checkout)
+DATA="${DATA_DIR:-$HOME/data/searchR1_mini}"
 
 # (1) dataset + corpus (skip if already built)
 if [ ! -f "$DATA/train.parquet" ]; then

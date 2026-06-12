@@ -19,12 +19,15 @@ if [ "$(id -u)" = "0" ]; then
 fi
 
 # --- pin the environment to the project user -------------------------------
-export HOME=/home/claudeuser
-export UV_CACHE_DIR=/home/claudeuser/.cache/uv   # never the quota-limited /workspace
-PROJECT=/home/claudeuser
+export HOME="${HOME:-/home/claudeuser}"
+PROJECT="${PROJECT:-$HOME}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$PROJECT/.cache/uv}"   # never the quota-limited /workspace
+# SKYRL_DIR = the (forked) SkyRL repo to train against — pass it to use any checkout.
+SKYRL_DIR="${SKYRL_DIR:-$PROJECT/SkyRL}"
+ARL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this script's own dir
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_ENABLE_HF_TRANSFER=1
-export TBENCH_VERIFIER_PYTHON="$PROJECT/tbench-venv/bin/python"
+export TBENCH_VERIFIER_PYTHON="${TBENCH_VERIFIER_PYTHON:-$PROJECT/tbench-venv/bin/python}"
 # Raise Ray's host-RAM kill line (container cgroup is only ~116 GB).
 export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.97}"
 
@@ -66,7 +69,7 @@ fi
 echo ">> Terminal-Bench GRPO | model=$MODEL_PATH | bs=$TRAIN_BS x n=$N_SAMPLES | lr=$LR | epochs=$EPOCHS | lora_rank=$LORA_RANK"
 echo ">> data=$DATA_DIR | log=$LOG | RAY_memory_usage_threshold=$RAY_memory_usage_threshold"
 
-cd "$PROJECT/SkyRL"
+cd "$SKYRL_DIR"
 
 # Logging must never break the run: only tee if the log is writable, else stdout-only.
 if : >> "$LOG" 2>/dev/null; then
@@ -125,5 +128,6 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   "$@" 2>&1 | "${TEE[@]}"
 
 # auto-plot results into clean figures + CSV (no more log-soup grepping)
-/home/claudeuser/tbench-venv/bin/python /home/claudeuser/arl/skyrl_terminal/plot_run.py --run "$RUN_NAME" 2>/dev/null \
-  && echo ">> figures: /home/claudeuser/exports/$RUN_NAME/${RUN_NAME}_curves.png" || true
+PLOT_PY="$PROJECT/tbench-venv/bin/python"; [ -x "$PLOT_PY" ] || PLOT_PY="$SKYRL_DIR/.venv/bin/python"
+"$PLOT_PY" "$ARL/plot_run.py" --run "$RUN_NAME" 2>/dev/null \
+  && echo ">> figures: $PROJECT/exports/$RUN_NAME/${RUN_NAME}_curves.png" || true

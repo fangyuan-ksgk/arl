@@ -11,12 +11,15 @@ set -uo pipefail
 if [ "$(id -u)" = "0" ]; then
   exec su claudeuser -c "bash $(printf '%q' "$0") $(printf '%q ' "$@")"
 fi
-export HOME=/home/claudeuser
-export UV_CACHE_DIR=/home/claudeuser/.cache/uv
+export HOME="${HOME:-/home/claudeuser}"
+PROJECT="${PROJECT:-$HOME}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$PROJECT/.cache/uv}"
 export TOKENIZERS_PARALLELISM=false
 export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.97}"
 
-PROJECT=/home/claudeuser
+# SKYRL_DIR = the (forked) SkyRL repo to train against — pass it to use any checkout.
+SKYRL_DIR="${SKYRL_DIR:-$PROJECT/SkyRL}"
+ARL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this script's own dir
 DATA_DIR="${DATA_DIR:-$PROJECT/data/searchR1_mini}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}"
 RUN_NAME="${RUN_NAME:-searchr1_mini_1gpu}"
@@ -34,8 +37,8 @@ curl -s -m 5 -X POST http://127.0.0.1:8000/retrieve -H 'Content-Type: applicatio
   -d '{"query":"test","topk":1,"return_scores":true}' >/dev/null 2>&1 \
   || { echo "ERROR: retrieval server not responding on :8000 — start mini_retrieval_server.py first"; exit 1; }
 
-echo ">> SearchR1-mini | model=$MODEL_PATH | bs=$TRAIN_BS x n=$N_SAMPLES | turns=4 | lora=$LORA_RANK | log=$LOG"
-cd "$PROJECT/SkyRL"
+echo ">> SearchR1-mini | model=$MODEL_PATH | bs=$TRAIN_BS x n=$N_SAMPLES | turns=4 | lora=$LORA_RANK | skyrl=$SKYRL_DIR | log=$LOG"
+cd "$SKYRL_DIR"
 if : >> "$LOG" 2>/dev/null; then TEE=(tee -a "$LOG"); else TEE=(cat); fi
 
 uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
@@ -102,5 +105,5 @@ uv run --isolated --extra fsdp -m skyrl.train.entrypoints.main_base \
   "$@" 2>&1 | "${TEE[@]}"
 
 # auto-plot results into clean figures + CSV
-/home/claudeuser/tbench-venv/bin/python /home/claudeuser/arl/skyrl_terminal/plot_run.py --run "$RUN_NAME" 2>/dev/null \
-  && echo ">> figures: /home/claudeuser/exports/$RUN_NAME/${RUN_NAME}_curves.png" || true
+"$SKYRL_DIR/.venv/bin/python" "$ARL/plot_run.py" --run "$RUN_NAME" 2>/dev/null \
+  && echo ">> figures: $PROJECT/exports/$RUN_NAME/${RUN_NAME}_curves.png" || true
