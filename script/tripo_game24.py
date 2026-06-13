@@ -679,7 +679,8 @@ def main() -> None:
 
     t0 = time.time()
     if args.trainer == "tree" and args.absorb_steps > 0:
-        trainer.absorb_buffer(args.absorb_steps, args.absorb_groups_per_query)
+        trainer.absorb_buffer(args.absorb_steps, args.absorb_groups_per_query,
+                              n_pos=args.absorb_n_pos, n_neg=args.absorb_n_neg)
     trainer.train()
     if args.trainer == "tree":
         trainer.save_tries()   # persist trie even with save_strategy='no'
@@ -792,6 +793,12 @@ def parse_args() -> argparse.Namespace:
                         "pre-grown --tree-persist-path buffer from the seed-lottery runs.")
     p.add_argument("--absorb-groups-per-query", type=int, default=1,
                    help="(tree) healthy groups stitched per healthy query for the absorb phase.")
+    p.add_argument("--absorb-n-pos", type=int, default=1,
+                   help="(tree) guaranteed correct rollouts per stitched group "
+                        "(rest of the group is uniform over all buffered leaves).")
+    p.add_argument("--absorb-n-neg", type=int, default=1,
+                   help="(tree) guaranteed incorrect rollouts per stitched group. "
+                        "Requires n_pos + n_neg <= num-generations.")
     # Confident-failure / rare-success advantage shaping (src/arsenal.py; tree trainer only)
     p.add_argument("--shaped-reward", action="store_true",
                    help="Replace the scalar GRPO advantage with the confident-failure/rare-success "

@@ -616,12 +616,17 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     # ------------------------------------------------------------------
     # Absorb phase: replay stitched healthy groups BEFORE trainer.train()
     # ------------------------------------------------------------------
-    def stitch_healthy_groups(self, groups_per_query: int = 1, rng=None):
+    def stitch_healthy_groups(self, groups_per_query: int = 1, rng=None,
+                              n_pos: int = 1, n_neg: int = 1):
         """Stitch healthy GRPO groups from the buffered trie dict.
            取出全部 healthy groups 每个 query 有固定数目的 group, 计算 advantage
+           配比：n_pos 胜 + n_neg 败 + 其余随机
         """
         rng = rng or random
         g = self.num_generations
+        assert 1 <= n_pos and 1 <= n_neg and n_pos + n_neg <= g, \
+            f"need n_pos>=1, n_neg>=1, n_pos+n_neg<=num_generations ({g}); " \
+            f"got n_pos={n_pos}, n_neg={n_neg}"
         groups = []
         for pkey, trie in self._global_tries.items():
             leaves = list(trie.leaves())
@@ -630,9 +635,9 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             if not pos or not neg:
                 continue
             for _ in range(groups_per_query):
-                # 配比：1 胜 1 败 + 其他随机 ｜ 配比应为可调整参数 （这里不是）
-                picks = [rng.choice(pos), rng.choice(neg)]
-                picks += [rng.choice(leaves) for _ in range(g - 2)]
+                picks = [rng.choice(pos) for _ in range(n_pos)]
+                picks += [rng.choice(neg) for _ in range(n_neg)]
+                picks += [rng.choice(leaves) for _ in range(g - n_pos - n_neg)]
                 rng.shuffle(picks)
                 r = torch.tensor([lf.best_reward(_TOTAL_KEY) for lf in picks],
                                  dtype=torch.float32)
@@ -642,7 +647,8 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 groups.append((pkey, [lf.prefix() for lf in picks], adv.tolist()))
         return groups
 
-    def absorb_buffer(self, steps: int = 10, groups_per_query: int = 1) -> None:
+    def absorb_buffer(self, steps: int = 10, groups_per_query: int = 1,
+                      n_pos: int = 1, n_neg: int = 1) -> None:
         """Train on ALL stitched healthy groups in exactly ``steps`` gradient
         updates, before ``trainer.train()`` starts.
 
@@ -661,7 +667,8 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         weights at the first generation (global_step != _last_loaded_step).
         """
         groups = self.stitch_healthy_groups(
-            groups_per_query, rng=random.Random(self.args.seed))
+            groups_per_query, rng=random.Random(self.args.seed),
+            n_pos=n_pos, n_neg=n_neg)
         if not groups:
             print("[absorb] no healthy groups in buffer — skipped", flush=True)
             return
