@@ -35,6 +35,11 @@ export RAY_memory_usage_threshold="${RAY_memory_usage_threshold:-0.97}"
 DATA_DIR="${DATA_DIR:-$PROJECT/data/terminal_bench}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-Coder-3B-Instruct}"
 RUN_NAME="${RUN_NAME:-terminal_grpo_coder3b}"
+# Per-run scratch dir: isolates THIS run's Ray session + proot sandbox temp dirs
+# (Ray + tempfile both honor TMPDIR), so a concurrent run — or a stray
+# `rm -rf /tmp/ray/...` — can't delete another run's working files out from under it.
+export TMPDIR="/tmp/skyrl-$RUN_NAME"
+mkdir -p "$TMPDIR"
 EPOCHS="${EPOCHS:-20}"
 TRAIN_BS="${TRAIN_BS:-16}"      # memory-safe (full 32 OOM'd the cgroup)
 N_SAMPLES="${N_SAMPLES:-6}"     # 16x6 = 96 traj/step

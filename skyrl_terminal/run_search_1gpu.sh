@@ -23,6 +23,10 @@ ARL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # this script's own dir
 DATA_DIR="${DATA_DIR:-$PROJECT/data/searchR1_mini}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen2.5-3B-Instruct}"
 RUN_NAME="${RUN_NAME:-searchr1_mini_1gpu}"
+# Per-run scratch dir: isolates THIS run's Ray session + sandbox temp dirs (Ray +
+# tempfile both honor TMPDIR), so concurrent runs / stray cleanups can't collide.
+export TMPDIR="/tmp/skyrl-$RUN_NAME"
+mkdir -p "$TMPDIR"
 EPOCHS="${EPOCHS:-1}"
 TRAIN_BS="${TRAIN_BS:-64}"      # 2000 rows / 64 ≈ 31 steps in 1 epoch
 N_SAMPLES="${N_SAMPLES:-5}"
