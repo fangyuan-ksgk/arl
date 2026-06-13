@@ -1,0 +1,42 @@
+{
+  "ToyBox (miniGRPO eval, n=4)": [
+    {
+      "model": "Qwen2.5-0.5B-Instruct",
+      "pass@1": 0.1574074074074074,
+      "passk": 0.3333333333333333,
+      "mean_reward": 0.23310185185185184
+    },
+    {
+      "model": "Qwen2.5-1.5B-Instruct",
+      "pass@1": 0.4166666666666667,
+      "passk": 0.5,
+      "mean_reward": 0.3287037037037037
+    },
+    {
+      "model": "Qwen2.5-3B-Instruct",
+      "pass@1": 0.4166666666666667,
+      "passk": 0.5833333333333334,
+      "mean_reward": 0.4375
+    },
+    {
+      "model": "Qwen2.5-Coder-3B-Instruct",
+      "pass@1": 0.4166666666666667,
+      "passk": 0.5,
+      "mean_reward": 0.4375
+    }
+  ],
+  "Terminal-Bench (miniGRPO eval, n=4)": [
+    {
+      "model": "Qwen2.5-Coder-1.5B-Instruct",
+      "pass@1": 0.19895833333333332,
+      "passk": 0.125,
+      "mean_reward": 0.229296875
+    },
+    {
+      "model": "Qwen2.5-Coder-3B-Instruct",
+      "pass@1": 0.29322916666666665,
+      "passk": 0.15625,
+      "mean_reward": 0.2598958333333333
+    }
+  ]
+}
