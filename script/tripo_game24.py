@@ -548,7 +548,9 @@ def main() -> None:
         logging_steps=args.logging_steps,
         temperature=args.temperature,
         bf16=torch.cuda.is_available(),
-        save_strategy="no",
+        save_strategy=("steps" if args.save_steps > 0 else "no"),
+        save_steps=(args.save_steps if args.save_steps > 0 else 500),
+        save_total_limit=args.save_total_limit,
         report_to="none",
         seed=args.seed,   # reshuffles data order per seed (lottery runs)
     )
@@ -682,6 +684,9 @@ def main() -> None:
         trainer.absorb_buffer(args.absorb_steps, args.absorb_groups_per_query,
                               n_pos=args.absorb_n_pos, n_neg=args.absorb_n_neg)
     trainer.train()
+    if args.save_final:
+        trainer.save_model(str(out_dir / "final"))
+        print(f"[save] final model -> {out_dir / 'final'}", flush=True)
     if args.trainer == "tree":
         trainer.save_tries()   # persist trie even with save_strategy='no'
     print(f"[done] training in {time.time() - t0:.0f}s | "
@@ -701,6 +706,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trainer", choices=["tree", "grpo"], default="tree",
                    help="'tree' = TreeTrainer (OPA per-token credit); "
                         "'grpo' = vanilla GRPO baseline.")
+    # Checkpointing (off by default; artifacts land under output-dir/trl and /final)
+    p.add_argument("--save-steps", type=int, default=0,
+                   help="0 = no intermediate checkpoints (default). >0 = TRL "
+                        "save_strategy='steps' every N steps into output-dir/trl/checkpoint-*.")
+    p.add_argument("--save-total-limit", type=int, default=None,
+                   help="Max intermediate checkpoints to keep (oldest pruned). None = keep all.")
+    p.add_argument("--save-final", action="store_true",
+                   help="Save a final full-precision snapshot to output-dir/final after train().")
     # Tree-credit (OPA) options
     p.add_argument("--use-global-tree", action="store_true",
                    help="(tree trainer) persist the prefix trie across batches.")

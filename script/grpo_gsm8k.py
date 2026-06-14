@@ -280,6 +280,22 @@ class EvalFlagCallback(TrainerCallback):
         self.logger.in_eval = False
 
 
+class SaveAtStepsCallback(TrainerCallback):
+    """Force a checkpoint save at an explicit set of global steps.
+
+    HF's `save_steps` only supports a fixed interval. This callback forces
+    `control.should_save=True` at arbitrary steps (e.g. 1,2,4,8 plus a
+    mid-training and final step) so we can capture early-training dynamics.
+    """
+    def __init__(self, steps):
+        self.steps = set(int(s) for s in steps)
+
+    def on_step_end(self, args, state, control, **kw):
+        if state.global_step in self.steps:
+            control.should_save = True
+        return control
+
+
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
@@ -344,7 +360,20 @@ def main():
     parser.add_argument("--vllm_server_port", type=int, default=8000,
                         help="(server only) Port of the vLLM server.")
     parser.add_argument("--gradient_checkpointing", action="store_true")
-    parser.add_argument("--save_strategy", type=str, default="no")
+    parser.add_argument("--save_strategy", type=str, default="no",
+                        choices=["no", "steps", "epoch"],
+                        help="'steps' saves intermediate ckpts every --save_steps.")
+    parser.add_argument("--save_steps", type=int, default=500,
+                        help="(save_strategy=steps) save a checkpoint every N steps.")
+    parser.add_argument("--save_total_limit", type=int, default=None,
+                        help="Max checkpoints to keep (older ones deleted). None = keep all.")
+    parser.add_argument("--save_steps_list", type=str, default=None,
+                        help="Comma-separated global steps to force-save checkpoints at "
+                             "(e.g. '1,2,4,8,150,300'). Works regardless of --save_strategy. "
+                             "Use for capturing early-training dynamics on a non-uniform grid.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Training seed. Controls train data ordering (shuffle); the "
+                             "eval set is sampled sequentially so validation data is unaffected.")
     parser.add_argument("--report_to", type=str, default="none")
     parser.add_argument("--train_device", type=int, default=0,
                         help="CUDA device index for training (server mode only). "
@@ -528,7 +557,12 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         save_strategy=args.save_strategy,
         report_to=args.report_to,
+        seed=args.seed,
     )
+    if args.save_strategy == "steps":
+        config_kwargs["save_steps"] = args.save_steps
+    if args.save_total_limit is not None:
+        config_kwargs["save_total_limit"] = args.save_total_limit
     if args.max_steps > 0:
         config_kwargs["max_steps"] = args.max_steps
     if not args.no_vllm:
@@ -814,6 +848,12 @@ def main():
     print(f"Rollout logger enabled → train: {train_rollout_path}\n"
           f"                         eval:  {eval_rollout_path}")
 
+    callbacks = [EvalFlagCallback(rollout_logger)]
+    if args.save_steps_list:
+        save_steps = [int(s) for s in args.save_steps_list.split(",") if s.strip()]
+        callbacks.append(SaveAtStepsCallback(save_steps))
+        print(f"Forced checkpoint saves at steps: {sorted(set(save_steps))} → {args.output_dir}/checkpoint-<step>")
+
     trainer = FastEvalGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
@@ -821,7 +861,7 @@ def main():
         train_dataset=prefix_dataset if prefix_dataset is not None else train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
-        callbacks=[EvalFlagCallback(rollout_logger)],
+        callbacks=callbacks,
     )
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger

@@ -56,6 +56,17 @@ MAX_STEPS=300
 EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
 EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 
+# Seeds for the multi-seed run. Each seed reshuffles the TRAINING data ordering
+# (passed as --seed); the eval set is sampled sequentially so validation data is
+# identical across seeds. SEED is set per-iteration by the driver loop.
+SEEDS=(0 1 2 3)
+SEED=0
+
+# Checkpoint grid: early-training dynamics on a log-ish schedule (1,2,4,8) plus
+# mid-training and end. Forced via grpo_gsm8k.py's SaveAtStepsCallback regardless
+# of --save_strategy. Saved to <run_dir>/checkpoint-<step>.
+SAVE_STEPS_LIST="1,2,4,8,$((MAX_STEPS/2)),${MAX_STEPS}"
+
 # MBE velocity defaults
 VELO_STRIDE=8
 VELO_LAYERS="-1"
@@ -253,6 +264,8 @@ run_experiment() {
         --learning_rate ${LR} \
         --logging_steps 10 \
         --save_strategy no \
+        --save_steps_list "${SAVE_STEPS_LIST}" \
+        --seed ${SEED} \
         --report_to none \
         --eval_steps ${EVAL_EVERY} \
         --eval_samples ${EVAL_SAMPLES} \
@@ -320,125 +333,28 @@ run_cell() {
 }
 
 # =============================================
-# Experiments
-# =============================================
-# NOTE: existing MBE velocity cells (baseline / traj_w* / roll_w* / *_neg_*)
-# are commented out for this run — only the new InvLogLength baseline ladder
-# is active. Re-enable them when running the full 12-cell sweep.
-
-# # 1) Baseline GRPO (no MBE velocity reward).
-# run_cell "baseline_grpo"             trajectory     off
+# Experiments — multi-seed (2026-06-14)
 #
-# # 2-7) Positive MBE velocity — 2 modes × 3 weight magnitudes (10, 100, 10000)
-# #      scale = 1/w, so weight 10=0.1, 100=0.01, 10000=0.0001.
-# run_cell "traj_w10"                  trajectory     0.1
-# run_cell "traj_w100"                 trajectory     0.01
-# run_cell "traj_w10000"               trajectory     0.0001
-# run_cell "roll_w10"                  rollercoaster  0.1
-# run_cell "roll_w100"                 rollercoaster  0.01
-# run_cell "roll_w10000"               rollercoaster  0.0001
+# Two cells only: baseline GRPO and InvLogLength-short (w=10), each across
+# SEEDS=(0 1 2 3). The seed is threaded to grpo_gsm8k.py via --seed: it
+# reshuffles training data ordering only — the eval set is sampled sequentially
+# so validation data is identical across all runs. Intermediate checkpoints are
+# saved at SAVE_STEPS_LIST=(1,2,4,8,mid,end) into <run_dir>/checkpoint-<step>.
 #
-# # 8-9) "Negative" MBE velocity — penalise high MBE velocity, weight = 10000.
-# #      scale = -1/w → reward sign flipped.
-# run_cell "traj_neg_w10000"           trajectory     -0.0001
-# run_cell "roll_neg_w10000"           rollercoaster  -0.0001
-
-# 10-12) InvLogLength baseline — 1/log(min(T_comp, D)) with MBE velocity disabled.
-#        Same weight ladder as the positive MBE velocity arm so length-vs-acc curves
-#        can be overlaid directly. If these reproduce traj_w*'s length reduction,
-#        the diversity numerator is doing no work — see analysis note 2026-05-27.
-# Positive scale: reward 1/log(T) is positive → optimizer drives T DOWN → short CoT.
-# run_cell "invlog_short_w10"        invlog          0.1
-# run_cell "invlog_short_w100"       invlog          0.01
-# run_cell "invlog_short_w10000"     invlog          0.0001
-
-# Negative scale: reward 1/log(T) is negative (penalty for being short) →
-# optimizer drives T UP → long CoT. Same magnitude ladder for fair comparison.
-# run_cell "invlog_long_w10"         invlog         -0.1
-# run_cell "invlog_long_w100"        invlog         -0.01
-# run_cell "invlog_long_w10000"      invlog         -0.0001
-
-
+# Output dirs are per-seed: <name>_seed<S> so runs never collide.
 # =============================================
-# Newly added reward shaping designs (2026-05-27)
-#
-# All four families use the same weight ladder {10, 100, 10000} ⇔ scale ∈
-# {0.1, 0.01, 0.0001} as the MBE velocity arm so length / accuracy curves can
-# be overlaid directly across families. Negative-scale variants (penalise
-# rather than reward) are commented out — uncomment if you want a sign-flip
-# ablation. Trajectory variants of the velocity rewards are also commented
-# out (rollercoaster is the recommended default — see class docstrings).
-#
-# Cost note:
-#   entvelo / pplxvelo / entdensity   → 1 forward pass per rollout (cheap).
-#   predvelo                          → 2 forward passes per rollout (~2× slow).
-# =============================================
+for SEED in "${SEEDS[@]}"; do
+    echo ""
+    echo "############################################################"
+    echo "# SEED ${SEED}"
+    echo "############################################################"
 
-# 13-15) Entropy velocity (rollercoaster). Σ_t max(0, H(o_{t+1}) − H(o_t)).
-# run_cell "entvelo_roll_w10"          entvelo_roll      0.1
-# run_cell "entvelo_roll_w100"         entvelo_roll      0.01
-# run_cell "entvelo_roll_w10000"       entvelo_roll      0.0001
+    # 1) Baseline GRPO (no MBE velocity reward).
+    run_cell "baseline_grpo_seed${SEED}"     trajectory     off
 
-# 16-18) Perplexity velocity (rollercoaster). Σ_t max(0, NLL(o_{t+1}) − NLL(o_t)).
-# run_cell "pplxvelo_roll_w10"         pplxvelo_roll     0.1
-# run_cell "pplxvelo_roll_w100"        pplxvelo_roll     0.01
-# run_cell "pplxvelo_roll_w10000"      pplxvelo_roll     0.0001
-
-# 19-21) Entropy density (mean H rationale − mean H answer).
-# run_cell "entdensity_w10"            entdensity        0.1
-# run_cell "entdensity_w100"           entdensity        0.01
-# run_cell "entdensity_w10000"         entdensity        0.0001
-
-# 22-24) Predictive velocity (log p(a|q,o) − log p(a|q)). Two forwards/rollout.
-# run_cell "predvelo_w10"              predvelo          0.1
-# run_cell "predvelo_w100"             predvelo          0.01
-# run_cell "predvelo_w10000"           predvelo          0.0001
-
-# 25) Predictive velocity with a LARGER clip (1.0 -> 5.0) to escape saturation.
-#     predvelo_w10 railed raw v at ±1.0 (logged reward pinned ~9-10/10) => near-
-#     zero within-group variance => GRPO cancels it. Raising the clip lets v keep
-#     earning reward up to ±5, restoring the gradient.
-#     CAUTION: bound = clip/scale = 5/0.1 = ±50, i.e. ~5x the correctness(±1) /
-#     format(±0.5) terms => predvelo will dominate the summed reward. That is the
-#     intended "stronger control"; watch that eval accuracy doesn't collapse. If
-#     it does, hold the bound fixed instead (clip=5, scale=0.5 => bound ±10) to
-#     de-saturate without inflating the weight.
-#     args: run_cell <name> <mode> <scale> <clip> <norm_mode>
-run_cell "predvelo_clip5_w10"        predvelo          0.1   5.0
-
-# 25b) Bigger-w ladder at the de-saturated clip=5.0. With clip=1.0 the raw value
-#      railed, so increasing w only rescaled a near-constant (GRPO-cancelled)
-#      reward and showed no effect. At clip=5.0 raw v can keep earning up to ±5,
-#      so this ladder finally isolates what the predictive-velocity TERM does as
-#      its weight grows. bound = clip/scale = 5·w:
-#        w=10 -> scale 0.1  -> bound ±50   (== predvelo_clip5_w10 above)
-#        w=20 -> scale 0.05 -> bound ±100
-#        w=50 -> scale 0.02 -> bound ±250
-#      CAUTION: these increasingly dominate correctness(±1)/format(±0.5); the
-#      point is to see the term's pull on length/accuracy, so watch eval acc.
-run_cell "predvelo_clip5_w20"        predvelo          0.05  5.0
-# run_cell "predvelo_clip5_w50"        predvelo          0.02  5.0
-
-# 26) Stronger length regularization for CoT shortening: norm_mode=cot_len makes
-#     the reward = log[p(a|q,o)/p(a|q)] / (l_a*l_o), adding *linear* CoT-length
-#     pressure on top of the predictive signal. The default log-normalised form
-#     (predvelo_w10) did NOT shorten CoT (~470 tok ~ baseline).
-#     SCALE IS PROVISIONAL (w=50). The cot_len raw value is ~100x smaller, so
-#     clip=1.0 essentially never binds; pick scale principally via
-#     script/calibrate_predictive_cotlen.py (match within-group std to correctness).
-# run_cell "predvelo_cotlen_w50"       predvelo          0.02  1.0   cot_len
-
-
-# =============================================
-# Active cells (2026-05-28) — longshort gated InvLogLength only.
-# Asymmetric shaping: longer CoT for failed cases, shorter for successful ones.
-# scale 0.1 ⇒ w_correct=+10, w_incorrect=−10 (handled in run_experiment's
-# `longshort` branch).
-# =============================================
-# run_cell "longshort_w10"             longshort         0.1
-# run_cell "longshort_w100"            longshort         0.01
-# run_cell "longshort_w10000"          longshort         0.0001
-
+    # 2) InvLogLength-short, w=10 (scale 0.1): reward 1/log(T) positive → short CoT.
+    run_cell "invlog_short_w10_seed${SEED}"  invlog         0.1
+done
 
 # =============================================
 # Final summary
