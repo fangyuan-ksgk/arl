@@ -534,6 +534,22 @@ def main() -> None:
         def on_evaluate(self, a, state, control, **kw):
             self.logger.in_eval = False
 
+    class SaveAtStepsCallback(TrainerCallback):
+        """Force a checkpoint save at an explicit set of global steps.
+
+        HF's ``save_steps`` only supports a fixed interval. This forces
+        ``control.should_save=True`` at arbitrary steps (e.g. 1,4,8,12 plus the
+        final step) regardless of ``save_strategy`` so early-training dynamics
+        are captured. Checkpoints land in ``output_dir/trl/checkpoint-<step>``.
+        """
+        def __init__(self, steps):
+            self.steps = set(int(s) for s in steps)
+
+        def on_step_end(self, a, state, control, **kw):
+            if state.global_step in self.steps:
+                control.should_save = True
+            return control
+
     # ------- Config ------------------------------------------------------
     config_kwargs = dict(
         output_dir=str(out_dir / "trl"),
@@ -614,6 +630,13 @@ def main() -> None:
               "(eval accuracy still logged by RolloutLogger)", flush=True)
     reward_funcs.append(rollout_logger)
 
+    callbacks = [EvalFlagCallback(rollout_logger)]
+    if args.save_steps_list:
+        forced = [int(s) for s in args.save_steps_list.split(",") if s.strip()]
+        callbacks.append(SaveAtStepsCallback(forced))
+        print(f"[save] forced checkpoints at steps {sorted(set(forced))} "
+              f"-> {out_dir / 'trl'}/checkpoint-<step>", flush=True)
+
     trainer_kwargs = dict(
         model=args.model,
         reward_funcs=reward_funcs,
@@ -621,7 +644,7 @@ def main() -> None:
         train_dataset=train_ds,
         eval_dataset=(eval_datasets if args.eval_steps > 0 else None),
         processing_class=tokenizer,
-        callbacks=[EvalFlagCallback(rollout_logger)],
+        callbacks=callbacks,
     )
     if args.trainer == "tree":
         trainer_kwargs["use_global_tree"] = args.use_global_tree
@@ -712,6 +735,10 @@ def parse_args() -> argparse.Namespace:
                         "save_strategy='steps' every N steps into output-dir/trl/checkpoint-*.")
     p.add_argument("--save-total-limit", type=int, default=None,
                    help="Max intermediate checkpoints to keep (oldest pruned). None = keep all.")
+    p.add_argument("--save-steps-list", type=str, default=None,
+                   help="Comma-separated global steps to force-save at (e.g. '1,4,8,12,30'). "
+                        "Works regardless of --save-steps; use for a non-uniform grid "
+                        "(early-training dynamics). Checkpoints -> output-dir/trl/checkpoint-<step>.")
     p.add_argument("--save-final", action="store_true",
                    help="Save a final full-precision snapshot to output-dir/final after train().")
     # Tree-credit (OPA) options

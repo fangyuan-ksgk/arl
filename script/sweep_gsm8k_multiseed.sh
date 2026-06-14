@@ -36,8 +36,8 @@ export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
 BASE_OUTPUT="${PROJECT_DIR}/output/sweep_mbe_velocity"
 TIMESTAMP=$(date +%Y%m%d_%H%M)
 
-MODEL="Qwen/Qwen3-1.7B"
-MODEL_TAG="1.7b"
+MODEL="Qwen/Qwen3-0.6B"
+MODEL_TAG="0.6b"
 
 # GPU layout & vLLM server
 VLLM_GPU=0
@@ -59,13 +59,13 @@ EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 # Seeds for the multi-seed run. Each seed reshuffles the TRAINING data ordering
 # (passed as --seed); the eval set is sampled sequentially so validation data is
 # identical across seeds. SEED is set per-iteration by the driver loop.
-SEEDS=(0 1 2 3)
+SEEDS=(0 1 2 3 4 5 6 7)
 SEED=0
 
 # Checkpoint grid: early-training dynamics on a log-ish schedule (1,2,4,8) plus
 # mid-training and end. Forced via grpo_gsm8k.py's SaveAtStepsCallback regardless
 # of --save_strategy. Saved to <run_dir>/checkpoint-<step>.
-SAVE_STEPS_LIST="1,2,4,8,$((MAX_STEPS/2)),${MAX_STEPS}"
+SAVE_STEPS_LIST="1,4,8,12,${MAX_STEPS}"
 
 # MBE velocity defaults
 VELO_STRIDE=8
