@@ -111,7 +111,7 @@ class PrefixTrie:
     (e.g. :func:`optimistic_prefix_advantages`) keep the original OPA behaviour.
     """
 
-    __slots__ = ("children", "a_max", "a_min", "count", "stats", "parent", "token")
+    __slots__ = ("children", "a_max", "a_min", "count", "stats", "parent", "token", "logp")
 
     def __init__(self, parent: Optional["PrefixTrie"] = None,
                  token: Optional[Hashable] = None):
@@ -123,6 +123,12 @@ class PrefixTrie:
         self.a_max: float = float("-inf")
         self.a_min: float = float("inf")
         self.count: int = 0
+        # Behavior-policy log-prob logπ_behav(token | prefix) of this edge token at
+        # generation time, stashed for M2PO importance ratios on REPLAYED buffer
+        # rollouts (the live-batch path reads TRL's old_per_token_logps instead).
+        # NaN until recorded; latest insertion wins (the trie is deduplicated, so
+        # a shared node tracks the most recent snapshot that produced this token).
+        self.logp: float = float("nan")
         # Per reward key: ``[n, mean, var, max]`` — EMA running mean/variance
         # (recency-weighted; see _accumulate) plus the optimistic max. A key may
         # appear on only a subset of the rollouts through this node.
@@ -152,21 +158,26 @@ class PrefixTrie:
                     acc[3] = r
 
     def insert(self, toks: Sequence[Hashable], adv: float,
-               rewards: Optional[dict] = None, reward_ema: float = 0.9) -> None:
+               rewards: Optional[dict] = None, reward_ema: float = 0.9,
+               logps: Optional[Sequence[float]] = None) -> None:
         """Insert one rollout. ``rewards`` is an optional ``{key: value}`` map of
         per-rollout reward components (e.g. correctness / format); each node on the
         path keeps the running max plus an EMA mean/var per key. ``reward_ema`` is
-        the EMA retention factor (higher = slower adaptation; 0.9 default)."""
+        the EMA retention factor (higher = slower adaptation; 0.9 default).
+        ``logps`` (optional) is the per-token behavior log-prob aligned 1:1 with
+        ``toks``; when given, each edge node records logπ_behav for M2PO replay."""
         adv = float(adv)
         node = self
         node._accumulate(adv, rewards, reward_ema)
-        for t in toks:
+        for k, t in enumerate(toks):
             child = node.children.get(t)
             if child is None:
                 child = PrefixTrie(parent=node, token=t)
                 node.children[t] = child
             node = child
             node._accumulate(adv, rewards, reward_ema)
+            if logps is not None:
+                node.logp = float(logps[k])
 
     def best_reward(self, key: Hashable, default: float = float("-inf")) -> float:
         """Max reward of ``key`` over rollouts through this prefix (optimistic)."""
@@ -193,6 +204,8 @@ class PrefixTrie:
             return "inf"
         if x == float("-inf"):
             return "-inf"
+        if x != x:  # NaN (unrecorded behavior logp)
+            return "nan"
         return x
 
     @staticmethod
@@ -201,6 +214,8 @@ class PrefixTrie:
             return float("inf")
         if x == "-inf":
             return float("-inf")
+        if x == "nan":
+            return float("nan")
         return float(x)
 
     def to_dict(self) -> dict:
@@ -212,6 +227,7 @@ class PrefixTrie:
             "a_max": self._enc_f(self.a_max),
             "a_min": self._enc_f(self.a_min),
             "count": self.count,
+            "logp": self._enc_f(self.logp),
             "stats": {k: list(v) for k, v in self.stats.items()},
             "children": [[k, c.to_dict()] for k, c in self.children.items()],
         }
@@ -224,6 +240,7 @@ class PrefixTrie:
         node.a_max = cls._dec_f(d["a_max"])
         node.a_min = cls._dec_f(d["a_min"])
         node.count = int(d["count"])
+        node.logp = cls._dec_f(d.get("logp", "nan"))
         node.stats = {k: list(v) for k, v in d.get("stats", {}).items()}
         for tok, cd in d.get("children", []):
             node.children[tok] = cls.from_dict(cd, parent=node, token=tok)
@@ -338,6 +355,20 @@ class PrefixTrie:
             if node is None:
                 break
             out.append(getattr(node, attr))
+        return out
+
+    def walk_logp(self, toks: Sequence[Hashable]) -> List[float]:
+        """Per-token behavior log-prob logπ_behav(a_t | s_<t) recorded at insert
+        for ``toks`` (position t = the edge into ``toks[:t+1]``). Truncates if a
+        prefix is absent; entries are NaN where no logp was recorded. Used to form
+        M2PO importance ratios on REPLAYED buffer rollouts."""
+        out: List[float] = []
+        node = self
+        for t in toks:
+            node = node.children.get(t)
+            if node is None:
+                break
+            out.append(node.logp)
         return out
 
     def token_node_breakdown(self) -> dict:
@@ -486,6 +517,9 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  resample_prefix: bool = False,
                  resample_train_prefix: bool = False,
                  resample_inject: bool = False,
+                 m2po: bool = False,
+                 m2po_tau: float = 0.04,
+                 absorb_clip: str = "none",
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
@@ -554,6 +588,22 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         # prefix) — guarantees contrast even if all g forced continuations
         # come back wrong. Scored by the same reward funcs as the rest.
         self.resample_inject = bool(resample_inject)
+        # --- M2PO: token-level second-moment trust region (arXiv:2510.01161) ---
+        # When on, _compute_loss masks (zeros the advantage of) the few highest
+        # (log r)^2 trust-region tokens until the batch-mean (log r)^2 over the
+        # remaining valid tokens falls below m2po_tau. r = pi_theta / pi_behav
+        # (current / generation-time), so it only bites when data is stale
+        # (num_iterations>1, async, or replayed). No-op on pure on-policy passes.
+        self.m2po = bool(m2po)
+        self.m2po_tau = float(m2po_tau)
+        # absorb_buffer off-policy objective (uses the per-token behavior logp
+        # stored in the trie): "none" -> ratio-1 GRPO (plain advantage-weighted
+        # log-likelihood); "ppo" -> token-level PPO clipped surrogate; "m2po" ->
+        # second-moment masked (unclipped) importance-weighted surrogate.
+        self.absorb_clip = str(absorb_clip).lower()
+        if self.absorb_clip not in ("none", "ppo", "m2po"):
+            raise ValueError("absorb_clip must be 'none', 'ppo', or 'm2po', "
+                             f"got {absorb_clip!r}")
         # ``use_global_tree`` ONLY controls the credit source in _compute_loss
         # (per-token A* read from the persistent trie instead of a per-batch
         # trie). Buffer maintenance is a separate, internal concern: the trie is
@@ -613,6 +663,23 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     def _row_pkey(prompt_row, pad_id: int) -> tuple:
         return tuple(int(x) for x in prompt_row.tolist() if x != pad_id)
 
+    @staticmethod
+    def _pick_distinct(pool, k, rng, chosen):
+        """Pick ``k`` items from ``pool`` WITHOUT replacement, skipping items
+        whose ``id`` is already in the ``chosen`` set (mutated in place so picks
+        stay distinct across pos/neg/filler within one group). Falls back to a
+        with-replacement top-up ONLY when the remaining distinct pool can't cover
+        ``k`` (i.e. the prompt has too few distinct buffered rollouts)."""
+        if k <= 0:
+            return []
+        avail = [x for x in pool if id(x) not in chosen]
+        out = rng.sample(avail, min(k, len(avail))) if avail else []
+        for x in out:
+            chosen.add(id(x))
+        while len(out) < k:                 # unavoidable repeats: pool exhausted
+            out.append(rng.choice(pool))
+        return out
+
     # ------------------------------------------------------------------
     # Absorb phase: replay stitched healthy groups BEFORE trainer.train()
     # ------------------------------------------------------------------
@@ -620,7 +687,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                               n_pos: int = 1, n_neg: int = 1):
         """Stitch healthy GRPO groups from the buffered trie dict.
            取出全部 healthy groups 每个 query 有固定数目的 group, 计算 advantage
-           配比：n_pos 胜 + n_neg 败 + 其余随机
+           配比：n_pos 胜 + n_neg 败 + 其余随机（组内不放回采样）
         """
         rng = rng or random
         g = self.num_generations
@@ -635,9 +702,12 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             if not pos or not neg:
                 continue
             for _ in range(groups_per_query):
-                picks = [rng.choice(pos) for _ in range(n_pos)]
-                picks += [rng.choice(neg) for _ in range(n_neg)]
-                picks += [rng.choice(leaves) for _ in range(g - n_pos - n_neg)]
+                # Sample distinct within the group: n_pos wins + n_neg losses +
+                # filler, none repeated unless a pool runs out of distinct leaves.
+                chosen: set = set()
+                picks = self._pick_distinct(pos, n_pos, rng, chosen)
+                picks += self._pick_distinct(neg, n_neg, rng, chosen)
+                picks += self._pick_distinct(leaves, g - n_pos - n_neg, rng, chosen)
                 rng.shuffle(picks)
                 r = torch.tensor([lf.best_reward(_TOTAL_KEY) for lf in picks],
                                  dtype=torch.float32)
@@ -655,13 +725,24 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         The groups are packed into ``steps`` chunks (effective gradient
         accumulation = ceil(n_groups / steps) groups per update, derived — not
         configured). One forward per group (prompt is uniform within a group,
-        so no prompt padding); loss is the ratio-1 GRPO objective, i.e. plain
-        advantage-weighted log-likelihood over completion tokens.
+        so no prompt padding). The off-policy objective is selected by
+        ``absorb_clip`` (all using the per-token behavior logp stored in the
+        trie at generation time):
 
-        Buffered rollouts are off-policy tokens with no stored logps, so this
-        must run BEFORE any on-policy update (ratio == 1 only on the first
-        pass). Uses the trainer's own optimizer (created here, reused by
-        ``train()``). Multi-rank: the stitching rng is seeded with
+          * ``"none"`` — ratio-1 GRPO: plain advantage-weighted log-likelihood
+            (the original behavior; assumes ratio ≈ 1, so run BEFORE any
+            on-policy update).
+          * ``"ppo"``  — token-level PPO/GRPO clipped surrogate
+            ``min(r·A, clip(r, 1±ε)·A)`` with ``r = π_θ/π_behav``.
+          * ``"m2po"`` — second-moment masked, unclipped importance-weighted
+            surrogate (mask the highest ``(log r)²`` trust-region tokens until
+            batch-mean ``(log r)² ≤ m2po_tau``).
+
+        ``"ppo"``/``"m2po"`` form the ratio explicitly, so they are robust to
+        the staleness of replayed buffer rollouts; ``"none"`` is not. Tokens
+        with no stored behavior logp fall back to ``r == 1`` (ratio-1 policy
+        gradient on that token). Uses the trainer's own optimizer (created
+        here, reused by ``train()``). Multi-rank: the stitching rng is seeded with
         ``args.seed``, so every rank performs identical replicated updates and
         stays in sync without gradient reduction. vLLM picks up the absorbed
         weights at the first generation (global_step != _last_loaded_step).
@@ -692,11 +773,20 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         # with grad accumulation). Mathematically identical: the group loss is a token-mean, so
         # normalize each slice by the group's total completion tokens.
         mb = max(1, int(self.args.per_device_train_batch_size))
+        clip = self.absorb_clip                       # "none" | "ppo" | "m2po"
+        # PPO clip range: reuse TRL's GRPO epsilons (asymmetric if configured).
+        eps_low = getattr(self, "epsilon_low", None) or getattr(self.args, "epsilon", 0.2) or 0.2
+        eps_high = getattr(self, "epsilon_high", None) or eps_low
+        clip_acted = clip_valid = 0   # diagnostics: tokens clipped (ppo)/masked (m2po)
+        print(f"[absorb] off-policy objective = {clip}"
+              + (f" (eps_low={eps_low}, eps_high={eps_high})" if clip == "ppo" else
+                 f" (tau={self.m2po_tau})" if clip == "m2po" else ""), flush=True)
         for chunk in chunks:
             opt.zero_grad(set_to_none=True)
             for pkey, seqs, advs in chunk:
                 seqs = [list(s)[:width_cap] for s in seqs]
                 group_tokens = max(sum(len(s) for s in seqs), 1)
+                m2_trie = self._global_tries.get(pkey) if clip != "none" else None
                 for i in range(0, len(seqs), mb):
                     sub, sub_adv = seqs[i:i + mb], advs[i:i + mb]
                     T = max(len(s) for s in sub)
@@ -715,7 +805,42 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                             model, ids, attn, T)
                         adv_t = torch.tensor(sub_adv, device=device,
                                              dtype=logps.dtype).unsqueeze(1)
-                        loss = -(adv_t * logps * cmask).sum() / group_tokens / len(chunk)
+                        if clip == "none":
+                            # ratio-1 GRPO: plain advantage-weighted log-likelihood.
+                            loss = -(adv_t * logps * cmask).sum() / group_tokens / len(chunk)
+                        else:
+                            # PPO / M2PO both form r = π_θ / π_behav from the stored
+                            # behavior logp. Tokens with no stored logp (NaN) fall
+                            # back to behav = logπ_θ.detach() so r == 1 there and the
+                            # surrogate reduces to the ratio-1 policy gradient (still
+                            # trained, just no off-policy correction on that token).
+                            behav = torch.full((B, T), float("nan"),
+                                               device=device, dtype=torch.float32)
+                            if m2_trie is not None:
+                                for j, s in enumerate(sub):
+                                    bl = m2_trie.walk_logp(s)
+                                    if bl:
+                                        behav[j, :len(bl)] = torch.tensor(
+                                            bl, device=device, dtype=torch.float32)
+                            recorded = torch.isfinite(behav)
+                            behav = torch.where(recorded, behav, logps.detach().float())
+                            log_r = logps.float() - behav        # grad flows via logps
+                            r = log_r.exp().to(logps.dtype)
+                            if clip == "ppo":
+                                # Token-level PPO/GRPO clipped surrogate.
+                                r_clip = r.clamp(1.0 - eps_low, 1.0 + eps_high)
+                                surr = torch.min(r * adv_t, r_clip * adv_t)
+                                clip_valid += int((cmask.bool() & recorded).sum().item())
+                                clip_acted += int(((r != r_clip) & cmask.bool() & recorded)
+                                                  .sum().item())
+                            else:  # "m2po": second-moment mask, unclipped ratio
+                                valid = cmask.bool() & recorded
+                                keep = self._m2po_keep_from_logr(
+                                    log_r.detach(), adv_t.squeeze(1), valid, self.m2po_tau)
+                                surr = keep.to(logps.dtype) * r * adv_t
+                                clip_valid += int(valid.sum().item())
+                                clip_acted += int((valid & (keep == 0)).sum().item())
+                            loss = -(surr * cmask).sum() / group_tokens / len(chunk)
                         if self.beta != 0.0:
                             assert self.ref_model is not None, \
                                 "beta != 0 needs self.ref_model (PEFT ref path not wired here)"
@@ -727,6 +852,11 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                     loss.backward()
             opt.step()
         opt.zero_grad(set_to_none=True)
+        if clip != "none":
+            frac = (clip_acted / clip_valid) if clip_valid else 0.0
+            verb = "clipped" if clip == "ppo" else "masked"
+            print(f"[absorb] {clip} {verb} {clip_acted}/{clip_valid} "
+                  f"recorded tokens ({frac:.2%})", flush=True)
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -858,8 +988,90 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                 update_tree=not self.use_global_tree,
             )
 
+        # M2PO: zero the advantage of masked tokens -> zero policy gradient on
+        # the few highest-variance (log r)^2 trust-region tokens, leaving the
+        # rest (incl. informative high-entropy tokens) untouched.
+        if self.m2po:
+            keep = self._m2po_token_keep_mask(model, inputs, adv_scalar, mask)
+            if keep is not None:
+                adv_token = adv_token * keep.to(adv_token.dtype)
+
         inputs["advantages"] = adv_token
         return super()._compute_loss(model, inputs)
+
+    # ------------------------------------------------------------------
+    # M2PO: token-level second-moment trust region (arXiv:2510.01161)
+    # ------------------------------------------------------------------
+    def _m2po_token_keep_mask(self, model, inputs, adv_scalar, completion_mask):
+        """Paper-faithful (token-level) M2PO keep-mask over the batch's completion
+        tokens. Returns a ``(B, T)`` float tensor in ``{0, 1}`` (1 = keep), or
+        ``None`` when behavior log-probs are unavailable (pure on-policy: r == 1,
+        so M2 == 0 and nothing is masked).
+
+        Mechanism (Algorithm 1):
+          r_t      = exp(logp_theta_t - logp_behav_t)          # per-token ratio
+          M2_t     = (log r_t)^2                                # >= 0, no cancellation
+          eligible = (A_i>0 & r_t>1) | (A_i<0 & r_t<1)          # PPO trust region,
+                     & valid                                    # A_i = ROLLOUT advantage
+          greedily mask eligible tokens by descending M2_t until the mean M2 over
+          the REMAINING valid tokens <= m2po_tau.
+        ``logp_behav`` is TRL's ``old_per_token_logps`` (generation-time policy)."""
+        old_logps = inputs.get("old_per_token_logps")
+        prompt_ids = inputs.get("prompt_ids")
+        completion_ids = inputs.get("completion_ids")
+        if old_logps is None or prompt_ids is None or completion_ids is None:
+            return None
+
+        T = completion_ids.size(1)
+        ids = torch.cat([prompt_ids, completion_ids], dim=1)
+        attn = torch.cat([torch.ones_like(prompt_ids), completion_mask], dim=1)
+        with torch.no_grad():
+            with self.accelerator.autocast():
+                cur_logps, _ = self._get_per_token_logps_and_entropies(model, ids, attn, T)
+            log_r = (cur_logps - old_logps).float()              # (B, T)
+            keep = self._m2po_keep_from_logr(
+                log_r, adv_scalar, completion_mask.bool(), self.m2po_tau)
+        return keep
+
+    @staticmethod
+    def _m2po_keep_from_logr(log_r, adv_scalar, valid, tau):
+        """Pure-tensor M2PO greedy keep-mask (the validated core shared by the
+        live-batch and absorb-replay consumers).
+
+        ``log_r`` (B, T) = logπ_θ − logπ_behav per token; ``adv_scalar`` (B,) is
+        the ROLLOUT-level advantage A_i; ``valid`` (B, T) bool marks tokens that
+        count toward the second moment (real completion tokens with a finite
+        log_r). Returns a (B, T) float mask in {0, 1}: greedily zeros the highest
+        (log r)² trust-region tokens until the mean (log r)² over remaining valid
+        tokens ≤ ``tau``."""
+        log_r = log_r.float()
+        m2 = log_r * log_r
+        valid = valid.bool()
+        r = log_r.exp()
+        A = adv_scalar.float().unsqueeze(1)                      # (B, 1) rollout-level A_i
+        eligible = valid & (((A > 0) & (r > 1.0)) | ((A < 0) & (r < 1.0)))
+
+        keep = torch.ones_like(log_r)
+        n_valid = int(valid.sum().item())
+        if n_valid == 0:
+            return keep
+        total = m2[valid].sum()
+        if (total / n_valid) <= tau:                            # already inside trust region
+            return keep
+        e = m2[eligible]
+        if e.numel() == 0:
+            return keep                                          # nothing eligible to mask
+        e_sorted, _ = torch.sort(e, descending=True)
+        cs = torch.cumsum(e_sorted, dim=0)                       # sum of top-k M2
+        ks = torch.arange(1, e_sorted.numel() + 1, device=e.device, dtype=torch.float32)
+        rem_mean = (total - cs) / (n_valid - ks).clamp(min=1.0)  # mean after masking top-k
+        below = rem_mean <= tau
+        k = int(torch.argmax(below.int()).item()) + 1 if bool(below.any()) else e_sorted.numel()
+        # mask exactly the top-k eligible tokens by M2 (ties broken by flat order)
+        flat = torch.where(eligible, m2, m2.new_full((), float("-inf"))).reshape(-1)
+        topk = torch.topk(flat, k).indices
+        keep.view(-1)[topk] = 0.0
+        return keep
 
     # ------------------------------------------------------------------
     # Arsenal of Ideas
@@ -928,17 +1140,30 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         if adv is None or cids is None or mask is None or pkeys is None or adv.dim() != 1:
             return
         mb = mask.bool()
+        # Behavior-policy log-probs (π_behav) at generation time, persisted per
+        # token so M2PO can form importance ratios on REPLAYED buffer rollouts.
+        # Prefer the vLLM sampling logprobs (free at generation, true behavior
+        # policy); fall back to TRL's recomputed old_per_token_logps. None on the
+        # rare batch where neither is present -> logps simply stay NaN.
+        logp = out.get("sampling_per_token_logps")
+        logp_src = "vllm_sampling"
+        if logp is None:
+            logp, logp_src = out.get("old_per_token_logps"), "policy_recompute"
+        if logp is not None and getattr(self, "_buf_logp_src", None) != logp_src:
+            self._buf_logp_src = logp_src
+            print(f"[m2po-buffer] persisted logπ_behav source = {logp_src}", flush=True)
         # Per-rollout reward components for node stats, plus the synthetic total
         # reward used by the buffered baseline (Idea 3).
         rew_cols = {k: out[k] for k in self._opa_reward_keys if k in out}
         total = local.sum(dim=1) if local is not None else None
         for i, pkey in enumerate(pkeys):
             toks = [int(t) for t in cids[i][mb[i]].tolist()]
+            row_logp = logp[i][mb[i]].tolist() if logp is not None else None
             rdict = {k: float(v[i]) for k, v in rew_cols.items()}
             if total is not None:
                 rdict[_TOTAL_KEY] = float(total[i])
             trie = self._global_tries.setdefault(pkey, PrefixTrie())
-            trie.insert(toks, float(adv[i]), rewards=(rdict or None))
+            trie.insert(toks, float(adv[i]), rewards=(rdict or None), logps=row_logp)
 
     # ------------------------------------------------------------------
     # Idea 3: re-baseline advantages with the buffered group mean/std

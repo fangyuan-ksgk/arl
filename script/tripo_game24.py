@@ -667,6 +667,9 @@ def main() -> None:
         trainer_kwargs["resample_prefix"] = args.resample_prefix
         trainer_kwargs["resample_train_prefix"] = args.resample_train_prefix
         trainer_kwargs["resample_inject"] = args.resample_inject
+        trainer_kwargs["m2po"] = args.m2po
+        trainer_kwargs["m2po_tau"] = args.m2po_tau
+        trainer_kwargs["absorb_clip"] = args.absorb_clip
         if args.tree_persist_path:
             trainer_kwargs["tree_persist_path"] = args.tree_persist_path
 
@@ -693,6 +696,7 @@ def main() -> None:
                                         'inject_incorrect', 'resample_prefix',
                                         'resample_train_prefix', 'resample_inject')
                      if args.trainer == 'tree' and getattr(args, f))) +
+          (f' +m2po(tau={args.m2po_tau})' if (args.trainer == 'tree' and args.m2po) else '') +
           f" | num_generations={args.num_generations}"
           f" eval(sample@{num_generations_eval} t={args.temperature} + greedy@1 t=0)"
           f" splits={list(eval_datasets) if args.eval_steps > 0 else []}", flush=True)
@@ -824,8 +828,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resample-inject", action="store_true",
                    help="(tree) reserve one resampled slot for the buffered correct rollout "
                         "through the sampled prefix.")
+    p.add_argument("--m2po", action="store_true",
+                   help="(tree) M2PO token-level second-moment trust region (arXiv:2510.01161): "
+                        "mask the highest (log r)^2 trust-region tokens until batch-mean (log r)^2 "
+                        "<= --m2po-tau. Only bites on stale data (num_iterations>1 / async).")
+    p.add_argument("--m2po-tau", type=float, default=0.04,
+                   help="(tree) M2PO second-moment threshold tau_{M2} (paper default 0.04).")
     p.add_argument("--tree-persist-path", type=str, default=None,
                    help="(tree) JSON path to persist the global tries across runs.")
+    p.add_argument("--absorb-clip", type=str, default="none",
+                   choices=["none", "ppo", "m2po"],
+                   help="(tree) absorb_buffer off-policy objective using the stored "
+                        "behavior logp: 'none' ratio-1 GRPO, 'ppo' clipped surrogate, "
+                        "'m2po' second-moment masked surrogate (arXiv:2510.01161).")
     p.add_argument("--absorb-steps", type=int, default=0,
                    help="(tree) >0: before train(), absorb ALL buffered healthy groups "
                         "(>=1 correct + >=1 incorrect rollout per prompt trie) in exactly "
