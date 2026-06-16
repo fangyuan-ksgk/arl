@@ -88,7 +88,7 @@ for S in $SEEDS; do
         --trainer tree --use-global-tree \
         --tree-persist-path "$ACCUM" \
         --output-dir "$GD" --seed "$GSEED" --max-steps "$Y" \
-        --eval-steps 1000000 \
+        --eval-steps 0 \
         "${COMMON[@]}" \
         > "$GD.log" 2>&1 \
         && echo "    DONE   grow $i (Y=$Y)" \
