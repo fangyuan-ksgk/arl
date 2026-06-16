@@ -3,19 +3,18 @@
 # ---------------------------------------------------------------------------
 # Game-of-24, TreeTrainer absorb sweep, Qwen3-0.6B.
 #
-# For EACH target seed we re-spawn a FRESH pool from scratch (no recycling
-# across seeds): grow X seeds (Y steps each, accumulating into one trie), then
-# absorb that pool and train the target seed. Grow seeds are made per-target
-# distinct (1000*S + i) so each seed's pool is an independent draw, not a
-# byte-identical re-run.
+# Pools are grown ONCE up front and SHARED across every absorb experiment
+# (growing dominates: ~7 min/grow-seed, so per-seed regrow = 7*MAXX min per
+# target, far exceeding the ~hour absorb run). Phase 1 grows MAXX seeds per Y
+# (accumulating into one trie, snapshotted at each X) into $POOL_DIR; Phase 2
+# loops the target seeds and absorbs those shared pools.
 #
 # Sweep axes:
 #   (a) grow seeds count X  -> pool SIZE        (GROW_COUNTS)
 #   (b) grow seed steps  Y  -> OFF-POLICY-ness  (GROW_STEPS)
 #   (c) absorb steps     N                       (ABSORB_STEPS)
 #   (d) absorb_clip          none|ppo|m2po@0.04|m2po@0.10  (VARIANTS)
-# Within a seed, the grow accumulation is snapshotted at each X (one grow
-# sequence covers every X); pools are NEVER shared between seeds.
+# Grow cost is paid once (MAXX*|GROW_STEPS| runs total), not per target seed.
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -32,6 +31,7 @@ export PYTHONPATH="$ARL${PYTHONPATH:+:$PYTHONPATH}" \
 # --- config -----------------------------------------------------------------
 OUT="${OUT:-$HOME/game24_absorb_variants}"
 MODEL="${MODEL:-Qwen/Qwen3-0.6B}"
+POOL_DIR="${POOL_DIR:-$OUT/pools}"           # shared pools: $POOL_DIR/X<X>_Y<Y>.json
 
 SEEDS="${SEEDS:-0 1 2 3}"                     # target seeds to absorb+train on
 GROW_COUNTS="${GROW_COUNTS:-16 32}"          # axis (a): X grow seeds in the pool (any value)
