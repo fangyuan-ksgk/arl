@@ -557,7 +557,12 @@ def main() -> None:
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_batch_size,
         num_generations_eval=num_generations_eval,
-        per_device_eval_batch_size=num_generations_eval,
+        # FastEvalMixin skips the local forward, so eval-side memory is not the
+        # constraint -- vLLM throughput is. One prompt-group per call leaves the
+        # GPU idle (545 puzzles -> 545 tiny calls, dispatch-bound, ~26 min).
+        # Send 16 groups/call so vLLM continuous-batches across prompts (~15x
+        # faster). Must satisfy eval_batch % num_generations_eval == 0.
+        per_device_eval_batch_size=num_generations_eval * 16,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.learning_rate,
         max_steps=args.max_steps,
