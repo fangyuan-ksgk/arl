@@ -66,43 +66,47 @@ COMMON=(--model "$MODEL"
         --beta "$BETA" --scale-rewards "$SCALE"
         --vllm-mode colocate --vllm-gpu-memory-utilization "$MEM")
 
-echo "RUN=$RUN  OUT=$OUT"
+echo "RUN=$RUN  OUT=$OUT  POOL_DIR=$POOL_DIR"
 echo "SEEDS=[$SEEDS]  axes: X={$GROW_COUNTS} Y={$GROW_STEPS} N={$ABSORB_STEPS} clip={${VARIANTS[*]}}"
 echo "MAX_STEPS=$MAX_STEPS  CUDA_VISIBLE_DEVICES=$CVD"
-mkdir -p "$OUT"
+mkdir -p "$OUT" "$POOL_DIR"
 
-for S in $SEEDS; do
-  SDIR="$OUT/seed${S}"; PDIR="$SDIR/pools"; mkdir -p "$PDIR"
+# === Phase 1: grow SHARED pools ONCE (one accumulation per Y, snapshot at X) =
+# Reused by every target seed below. Skips a pool that already exists, so the
+# script is resumable and grow is never repeated.
+for Y in $GROW_STEPS; do
+  # if every X-snapshot for this Y is already on disk, skip the whole Y
+  need=0; for X in $GROW_COUNTS; do [ -f "$POOL_DIR/X${X}_Y${Y}.json" ] || need=1; done
+  if [ "$need" -eq 0 ]; then echo "=== pools for Y=$Y already present, skip grow ==="; continue; fi
 
-  # === grow FRESH per-seed pools (one accumulation per Y, snapshot at each X) =
-  for Y in $GROW_STEPS; do
-    ACCUM="$PDIR/_accum_Y${Y}.json"; rm -f "$ACCUM"
-    i=0
-    while [ "$i" -lt "$MAXX" ]; do
-      i=$((i + 1))
-      GSEED=$((1000 * S + i))               # per-target distinct -> independent pool
-      GD="$SDIR/grow/Y${Y}/g${i}"; mkdir -p "$GD"
-      echo ">>> [GROW seed $S | Y=$Y | pool size -> $i (gseed $GSEED) | GPU=$CVD] $(date)"
-      CUDA_VISIBLE_DEVICES="$CVD" \
-      python "$RUN" \
-        --trainer tree --use-global-tree \
-        --tree-persist-path "$ACCUM" \
-        --output-dir "$GD" --seed "$GSEED" --max-steps "$Y" \
-        --eval-steps 0 \
-        "${COMMON[@]}" \
-        > "$GD.log" 2>&1 \
-        && echo "    DONE   grow $i (Y=$Y)" \
-        || echo "    FAILED grow $i (Y=$Y)  (tail $GD.log)"
-      for X in $GROW_COUNTS; do
-        [ "$i" -eq "$X" ] && cp "$ACCUM" "$PDIR/X${X}_Y${Y}.json"
-      done
+  ACCUM="$POOL_DIR/_accum_Y${Y}.json"; rm -f "$ACCUM"
+  i=0
+  while [ "$i" -lt "$MAXX" ]; do
+    i=$((i + 1))
+    GD="$POOL_DIR/grow/Y${Y}/g${i}"; mkdir -p "$GD"
+    echo ">>> [GROW Y=$Y | pool size -> $i (gseed $i) | GPU=$CVD] $(date)"
+    CUDA_VISIBLE_DEVICES="$CVD" \
+    python "$RUN" \
+      --trainer tree --use-global-tree \
+      --tree-persist-path "$ACCUM" \
+      --output-dir "$GD" --seed "$i" --max-steps "$Y" \
+      --eval-steps 0 \
+      "${COMMON[@]}" \
+      > "$GD.log" 2>&1 \
+      && echo "    DONE   grow $i (Y=$Y)" \
+      || echo "    FAILED grow $i (Y=$Y)  (tail $GD.log)"
+    for X in $GROW_COUNTS; do
+      [ "$i" -eq "$X" ] && cp "$ACCUM" "$POOL_DIR/X${X}_Y${Y}.json"
     done
   done
+done
 
-  # === absorb sweep against THIS seed's fresh pools ==========================
+# === Phase 2: absorb sweep over target seeds against the SHARED pools ========
+for S in $SEEDS; do
+  SDIR="$OUT/seed${S}"
   for X in $GROW_COUNTS; do
     for Y in $GROW_STEPS; do
-      POOL="$PDIR/X${X}_Y${Y}.json"
+      POOL="$POOL_DIR/X${X}_Y${Y}.json"
       if [ ! -f "$POOL" ]; then
         echo "!!! skip seed $S X=$X Y=$Y: no pool at $POOL"; continue
       fi
@@ -135,5 +139,5 @@ done
 
 echo
 echo "================== all absorb variants done =================="
-echo "pools (per seed): $OUT/seed<S>/pools/X<X>_Y<Y>.json"
-echo "runs:            $OUT/seed<S>/X<X>_Y<Y>_step<N>_<clip[tau]>/"
+echo "shared pools: $POOL_DIR/X<X>_Y<Y>.json"
+echo "runs:         $OUT/seed<S>/X<X>_Y<Y>_step<N>_<clip[tau]>/"
