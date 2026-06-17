@@ -45,7 +45,7 @@ VARIANTS=(
   "m2po 0.10"
 )
 
-MAX_STEPS="${MAX_STEPS:-200}"                # training length per target seed
+MAX_STEPS="${MAX_STEPS:-120}"                # training length per target seed
 MAX_N="${MAX_N:-13}"
 EVAL_MIN="${EVAL_MIN:-200}"
 BETA="${BETA:-0.04}"
