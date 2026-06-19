@@ -465,6 +465,7 @@ def main() -> None:
     from src.game24utils import (
         build_puzzle_pool, split_train_eval, make_dataset,
         correctness_reward, format_reward, RolloutLogger,
+        Game24CorrectnessGatedLengthReward, Game24LengthGapReward,
     )
 
     out_dir = Path(args.output_dir)
@@ -630,6 +631,15 @@ def main() -> None:
               f"clip=±{args.predictive_velocity_clip}, norm_mode='{args.predictive_norm_mode}', "
               f"answer_source='{args.predictive_answer_source}'",
               flush=True)
+    if args.length_reg == "gated":
+        reward_funcs.append(Game24CorrectnessGatedLengthReward(tokenizer))
+        print("[reward] length-reg=gated (A.4)", flush=True)
+    elif args.length_reg in ("gap_correct", "gap_both"):
+        mode = "correct" if args.length_reg == "gap_correct" else "both"
+        reward_funcs.append(Game24LengthGapReward(tokenizer, mode=mode))
+        print(f"[reward] length-reg=gap_{mode} "
+              f"({'A.7' if mode == 'correct' else 'A.8'})", flush=True)
+
     if args.no_correctness_reward:
         print("[reward] correctness reward DISABLED for training "
               "(eval accuracy still logged by RolloutLogger)", flush=True)
@@ -675,6 +685,7 @@ def main() -> None:
         trainer_kwargs["m2po"] = args.m2po
         trainer_kwargs["m2po_tau"] = args.m2po_tau
         trainer_kwargs["absorb_clip"] = args.absorb_clip
+        trainer_kwargs["absorb_step_align"] = args.absorb_step_align
         if args.tree_persist_path:
             trainer_kwargs["tree_persist_path"] = args.tree_persist_path
 
@@ -805,6 +816,14 @@ def parse_args() -> argparse.Namespace:
                    help="Drop the correctness reward from training (e.g. to replace it with "
                         "--predictive-velocity-reward). Eval accuracy is unaffected: "
                         "RolloutLogger computes correctness independently.")
+    # Length-regularization rewards (src/game24utils.py; M2PO manuscript A.4/A.7/A.8).
+    #   gated      = A.4 correctness-gated inv-log-length (short-when-right, long-when-wrong).
+    #                A.5 = gated + --virtual-rollout insert_max; A.6 = gated + --inject-rollout.
+    #   gap_correct= A.7 within-group log length-gap, added to CORRECT rollouts only.
+    #   gap_both   = A.8 A.7's correct-side PLUS a format-gated incorrect-side gap term.
+    p.add_argument("--length-reg", type=str, default="none",
+                   choices=["none", "gated", "gap_correct", "gap_both"],
+                   help="Add a length-regularization reward (M2PO A.4/A.7/A.8).")
     # Buffer tricks (src/tree_trainer.py; tree trainer only, all default off).
     # 1.  --buffered-baseline : advantages rescaled by the BUFFERED reward std
     #     (stable across batches), re-centered to zero-sum per group.
@@ -853,6 +872,12 @@ def parse_args() -> argparse.Namespace:
                         "pre-grown --tree-persist-path buffer from the seed-lottery runs.")
     p.add_argument("--absorb-groups-per-query", type=int, default=1,
                    help="(tree) healthy groups stitched per healthy query for the absorb phase.")
+    p.add_argument("--no-absorb-step-align", dest="absorb_step_align",
+                   action="store_false", default=True,
+                   help="(tree) fall back to the OLD absorb behaviour: pool every healthy "
+                        "group across ALL grow steps, shuffle, and stride into --absorb-steps "
+                        "chunks. Default (on) replays grow step 0 first, step 1 next, … and "
+                        "treats --absorb-steps as a cap on the first N grow steps.")
     p.add_argument("--absorb-n-pos", type=int, default=1,
                    help="(tree) guaranteed correct rollouts per stitched group "
                         "(rest of the group is uniform over all buffered leaves).")

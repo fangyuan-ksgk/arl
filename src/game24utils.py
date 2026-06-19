@@ -18,6 +18,7 @@ from __future__ import annotations
 import ast
 import itertools
 import json
+import math
 import random
 import re
 import warnings
@@ -37,6 +38,7 @@ __all__ = [
     # rewards
     "completion_text", "_text", "extract_expr", "extract_expr_candidates",
     "normalize_math", "correctness_reward", "format_reward",
+    "Game24CorrectnessGatedLengthReward", "Game24LengthGapReward",
 ]
 
 
@@ -387,6 +389,139 @@ def correctness_reward(completions, numbers, target: float = TARGET, **_) -> Lis
 
 def format_reward(completions, **_) -> List[float]:
     return [0.2 if re.search(r"####\s*\S", completion_text(c)) else 0.0 for c in completions]
+
+
+# ---------------------------------------------------------------------------
+# Length-regularization rewards (M2PO manuscript A.4 / A.7 / A.8).
+#
+# These are Game-24-native: correctness is the `verify_24` arithmetic check on
+# `numbers` (NOT a GSM8K `####` float match), so they gate on exactly the same
+# signal as `correctness_reward`. Completion length `T_comp` is the completion
+# token count (no chat template), which is a cheap, monotone length proxy.
+# ---------------------------------------------------------------------------
+def _safe_log(x: float) -> float:
+    """log floored at 0: log(x) for x>1, else 0.0.
+
+    Flooring at 1 keeps every length term >= 0 and naturally zeroes a term when
+    its length gap is non-positive (e.g. a correct rollout LONGER than the wrong
+    mean, or a rollout SHORTER than the correct mean)."""
+    return math.log(x) if x > 1.0 else 0.0
+
+
+class Game24CorrectnessGatedLengthReward:
+    """A.4 — correctness-gated inverse-log-length shaping.
+
+    Correct rollouts are rewarded for being SHORT; incorrect rollouts are
+    (mildly) rewarded for being LONG — the asymmetric length shaping of the
+    M2PO manuscript.
+
+        v      = clip(1 / log(min(T_comp, D)), ±clip)        # > 0, larger when short
+        reward = v / scale_correct     (>0) if correct       # +, larger when short
+               = v / scale_incorrect   (<0) if wrong         # −, less negative when long
+
+    Combine with `--virtual-rollout insert_max` for A.5, or `--inject-rollout`
+    for A.6 — those are TreeTrainer group-repair flags, not separate rewards.
+    """
+
+    def __init__(self, tokenizer, scale_correct: float = 0.1,
+                 scale_incorrect: float = -0.1, clip: float = 1.0,
+                 stride: int = 8, D: int = 2048, target: float = TARGET):
+        self.tokenizer = tokenizer
+        self.scale_correct = scale_correct
+        self.scale_incorrect = scale_incorrect
+        self.clip = clip
+        self.stride = stride
+        self.D = D
+        self.target = target
+        self.__name__ = "gated_length_reward"
+
+    def _tok_len(self, text: str) -> int:
+        return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def __call__(self, completions, numbers, **kwargs) -> List[float]:
+        rewards: List[float] = []
+        for c, nums in zip(completions, numbers):
+            text = completion_text(c)
+            correct = any(verify_24(list(nums), e, self.target)
+                          for e in extract_expr_candidates(text))
+            sc = self.scale_correct if correct else self.scale_incorrect
+            if not sc:
+                rewards.append(0.0)
+                continue
+            T = self._tok_len(text)
+            if T < 2 * self.stride:
+                rewards.append(0.0)
+                continue
+            v = 1.0 / math.log(min(T, self.D))
+            v = max(-self.clip, min(v, self.clip))
+            rewards.append(v / sc)
+        return rewards
+
+
+class Game24LengthGapReward:
+    """A.7 / A.8 — within-group length-gap shaping.
+
+    Rollouts are grouped by puzzle (shared `numbers`). With `mean_len_wrong` /
+    `mean_len_correct` the mean completion token lengths of the incorrect /
+    correct rollouts, ONLY *mixed* groups (>=1 correct AND >=1 incorrect) earn
+    reward; pure groups get 0 (the gap is undefined).
+
+        correct-side  (A.7 + A.8):  correctness_i * log(mean_len_wrong − len_i)
+        incorrect-side  (A.8 only):  format_i * log(len_i − mean_len_correct)
+                                              / log(max_j(len_j − mean_len_correct))
+
+    `correctness_i` ∈ {0,1} is the Game-24 verifier (so the correct-side term
+    is added to correct rollouts only). `format_i` ∈ {0, 0.2} mirrors
+    `format_reward`. The incorrect-side normalizer lies in (0, 1]; `_safe_log`
+    floors every term at 0 so the correct-side term vanishes for long correct
+    rollouts and the incorrect-side term vanishes for short rollouts.
+    """
+
+    def __init__(self, tokenizer, mode: str = "correct", weight: float = 1.0,
+                 target: float = TARGET):
+        assert mode in ("correct", "both"), f"unknown mode: {mode}"
+        self.tokenizer = tokenizer
+        self.mode = mode
+        self.weight = weight
+        self.target = target
+        self.__name__ = f"length_gap_{mode}_reward"
+
+    def _tok_len(self, text: str) -> int:
+        return len(self.tokenizer(text, add_special_tokens=False)["input_ids"])
+
+    def __call__(self, completions, numbers, **kwargs) -> List[float]:
+        n = len(completions)
+        texts = [completion_text(c) for c in completions]
+        lens = [self._tok_len(t) for t in texts]
+        correct = [any(verify_24(list(nums), e, self.target)
+                       for e in extract_expr_candidates(t))
+                   for t, nums in zip(texts, numbers)]
+        fmt = [0.2 if re.search(r"####\s*\S", t) else 0.0 for t in texts]
+
+        groups: Dict[Tuple, List[int]] = {}
+        for i, nums in enumerate(numbers):
+            groups.setdefault(tuple(nums), []).append(i)
+
+        rewards = [0.0] * n
+        for idxs in groups.values():
+            corr = [i for i in idxs if correct[i]]
+            wrong = [i for i in idxs if not correct[i]]
+            if not corr or not wrong:            # only mixed groups are valid
+                continue
+            mean_len_wrong = sum(lens[i] for i in wrong) / len(wrong)
+            mean_len_correct = sum(lens[i] for i in corr) / len(corr)
+
+            for i in idxs:                       # correct-side (A.7 + A.8)
+                if correct[i]:
+                    rewards[i] += self.weight * _safe_log(mean_len_wrong - lens[i])
+
+            if self.mode == "both":              # incorrect-side (A.8)
+                denom = _safe_log(max(lens[j] - mean_len_correct for j in idxs))
+                if denom > 0.0:
+                    for i in idxs:
+                        rewards[i] += self.weight * fmt[i] * (
+                            _safe_log(lens[i] - mean_len_correct) / denom)
+        return rewards
 
 
 # ============================

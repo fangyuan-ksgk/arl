@@ -111,7 +111,7 @@ class PrefixTrie:
     (e.g. :func:`optimistic_prefix_advantages`) keep the original OPA behaviour.
     """
 
-    __slots__ = ("children", "a_max", "a_min", "count", "stats", "parent", "token", "logp")
+    __slots__ = ("children", "a_max", "a_min", "count", "stats", "parent", "token", "logp", "step")
 
     def __init__(self, parent: Optional["PrefixTrie"] = None,
                  token: Optional[Hashable] = None):
@@ -129,6 +129,12 @@ class PrefixTrie:
         # NaN until recorded; latest insertion wins (the trie is deduplicated, so
         # a shared node tracks the most recent snapshot that produced this token).
         self.logp: float = float("nan")
+        # GROW-step index (``trainer.state.global_step``) at which the rollout
+        # through this node was generated. Lets the absorb phase replay groups
+        # in the SAME grow-step order rather than shuffled (strict grow<->absorb
+        # step alignment). -1 = unrecorded; latest insertion wins (leaf is the
+        # per-rollout node we read in ``stitch_healthy_groups``).
+        self.step: int = -1
         # Per reward key: ``[n, mean, var, max]`` — EMA running mean/variance
         # (recency-weighted; see _accumulate) plus the optimistic max. A key may
         # appear on only a subset of the rollouts through this node.
@@ -159,7 +165,7 @@ class PrefixTrie:
 
     def insert(self, toks: Sequence[Hashable], adv: float,
                rewards: Optional[dict] = None, reward_ema: float = 0.9,
-               logps: Optional[Sequence[float]] = None) -> None:
+               logps: Optional[Sequence[float]] = None, step: int = -1) -> None:
         """Insert one rollout. ``rewards`` is an optional ``{key: value}`` map of
         per-rollout reward components (e.g. correctness / format); each node on the
         path keeps the running max plus an EMA mean/var per key. ``reward_ema`` is
@@ -178,6 +184,8 @@ class PrefixTrie:
             node._accumulate(adv, rewards, reward_ema)
             if logps is not None:
                 node.logp = float(logps[k])
+            if step >= 0:
+                node.step = int(step)
 
     def best_reward(self, key: Hashable, default: float = float("-inf")) -> float:
         """Max reward of ``key`` over rollouts through this prefix (optimistic)."""
@@ -228,6 +236,7 @@ class PrefixTrie:
             "a_min": self._enc_f(self.a_min),
             "count": self.count,
             "logp": self._enc_f(self.logp),
+            "step": self.step,
             "stats": {k: list(v) for k, v in self.stats.items()},
             "children": [[k, c.to_dict()] for k, c in self.children.items()],
         }
@@ -241,6 +250,7 @@ class PrefixTrie:
         node.a_min = cls._dec_f(d["a_min"])
         node.count = int(d["count"])
         node.logp = cls._dec_f(d.get("logp", "nan"))
+        node.step = int(d.get("step", -1))
         node.stats = {k: list(v) for k, v in d.get("stats", {}).items()}
         for tok, cd in d.get("children", []):
             node.children[tok] = cls.from_dict(cd, parent=node, token=tok)
@@ -520,6 +530,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  m2po: bool = False,
                  m2po_tau: float = 0.04,
                  absorb_clip: str = "none",
+                 absorb_step_align: bool = True,
                  **kwargs):
         if not _HAS_TRL:
             raise ImportError("TreeTrainer requires `trl` (and torch) to be installed")
@@ -604,6 +615,11 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         if self.absorb_clip not in ("none", "ppo", "m2po"):
             raise ValueError("absorb_clip must be 'none', 'ppo', or 'm2po', "
                              f"got {absorb_clip!r}")
+        # absorb step alignment: True -> stitch groups WITHIN a grow step and
+        # replay step-by-step (absorb-update k == grow-step k; ``steps`` caps to
+        # the first N grow steps). False -> OLD behaviour: pool every healthy
+        # group across all grow steps, shuffle, and stride into ``steps`` chunks.
+        self.absorb_step_align = bool(absorb_step_align)
         # ``use_global_tree`` ONLY controls the credit source in _compute_loss
         # (per-token A* read from the persistent trie instead of a per-batch
         # trie). Buffer maintenance is a separate, internal concern: the trie is
@@ -684,10 +700,19 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
     # Absorb phase: replay stitched healthy groups BEFORE trainer.train()
     # ------------------------------------------------------------------
     def stitch_healthy_groups(self, groups_per_query: int = 1, rng=None,
-                              n_pos: int = 1, n_neg: int = 1):
+                              n_pos: int = 1, n_neg: int = 1, step_align: bool = True):
         """Stitch healthy GRPO groups from the buffered trie dict.
            取出全部 healthy groups 每个 query 有固定数目的 group, 计算 advantage
            配比：n_pos 胜 + n_neg 败 + 其余随机（组内不放回采样）
+
+        STEP ALIGNMENT (``step_align=True``): leaves are bucketed by their
+        recorded grow step (``leaf.step``) and a group is stitched WITHIN a
+        single step, so an absorbed group is a genuine same-step GRPO group
+        rather than a mix of rollouts from different grow steps. Untagged
+        buffers share ``step == -1`` -> single bucket. With ``step_align=False``
+        every leaf of a prompt goes into ONE bucket (the OLD pooled behaviour:
+        filler drawn from all grow steps). Returns ``(step, pkey, prefixes,
+        adv)`` tuples sorted by step (ascending).
         """
         rng = rng or random
         g = self.num_generations
@@ -697,34 +722,45 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         groups = []
         for pkey, trie in self._global_tries.items():
             leaves = list(trie.leaves())
-            pos = [lf for lf in leaves if lf.best_reward("correctness_reward") > 0]
-            neg = [lf for lf in leaves if not (lf.best_reward("correctness_reward") > 0)]
-            if not pos or not neg:
-                continue
-            for _ in range(groups_per_query):
-                # Sample distinct within the group: n_pos wins + n_neg losses +
-                # filler, none repeated unless a pool runs out of distinct leaves.
-                chosen: set = set()
-                picks = self._pick_distinct(pos, n_pos, rng, chosen)
-                picks += self._pick_distinct(neg, n_neg, rng, chosen)
-                picks += self._pick_distinct(leaves, g - n_pos - n_neg, rng, chosen)
-                rng.shuffle(picks)
-                r = torch.tensor([lf.best_reward(_TOTAL_KEY) for lf in picks],
-                                 dtype=torch.float32)
-                assert torch.isfinite(r).all(), \
-                    f"buffered leaf missing _TOTAL_KEY reward for a healthy prompt"
-                adv = (r - r.mean()) / (r.std() + self.buffered_eps)
-                groups.append((pkey, [lf.prefix() for lf in picks], adv.tolist()))
+            if step_align:
+                # bucket this prompt's leaves by the grow step they were generated at
+                by_step: dict = {}
+                for lf in leaves:
+                    by_step.setdefault(lf.step, []).append(lf)
+            else:
+                by_step = {-1: leaves}   # single bucket -> old cross-step pooling
+            for step in sorted(by_step):
+                step_leaves = by_step[step]
+                pos = [lf for lf in step_leaves if lf.best_reward("correctness_reward") > 0]
+                neg = [lf for lf in step_leaves if not (lf.best_reward("correctness_reward") > 0)]
+                if not pos or not neg:
+                    continue
+                for _ in range(groups_per_query):
+                    # Sample distinct within the group (same step): n_pos wins +
+                    # n_neg losses + filler, none repeated unless a pool runs out.
+                    chosen: set = set()
+                    picks = self._pick_distinct(pos, n_pos, rng, chosen)
+                    picks += self._pick_distinct(neg, n_neg, rng, chosen)
+                    picks += self._pick_distinct(step_leaves, g - n_pos - n_neg, rng, chosen)
+                    rng.shuffle(picks)
+                    r = torch.tensor([lf.best_reward(_TOTAL_KEY) for lf in picks],
+                                     dtype=torch.float32)
+                    assert torch.isfinite(r).all(), \
+                        f"buffered leaf missing _TOTAL_KEY reward for a healthy prompt"
+                    adv = (r - r.mean()) / (r.std() + self.buffered_eps)
+                    groups.append((step, pkey, [lf.prefix() for lf in picks], adv.tolist()))
+        groups.sort(key=lambda gp: gp[0])   # ascending grow step; stable within step
         return groups
 
     def absorb_buffer(self, steps: int = 10, groups_per_query: int = 1,
                       n_pos: int = 1, n_neg: int = 1) -> None:
-        """Train on ALL stitched healthy groups in exactly ``steps`` gradient
-        updates, before ``trainer.train()`` starts.
+        """Replay stitched healthy groups grow-step by grow-step, before
+        ``trainer.train()`` starts.
 
-        The groups are packed into ``steps`` chunks (effective gradient
-        accumulation = ceil(n_groups / steps) groups per update, derived — not
-        configured). One forward per group (prompt is uniform within a group,
+        Each gradient update == ALL groups of ONE grow step, replayed in
+        ascending step order (absorb-update k == grow-step k); ``steps`` caps
+        how many of the earliest grow steps are absorbed (so ``steps=1`` absorbs
+        only the first grow step). One forward per group (prompt is uniform within a group,
         so no prompt padding). The off-policy objective is selected by
         ``absorb_clip`` (all using the per-token behavior logp stored in the
         trie at generation time):
@@ -749,16 +785,37 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
         """
         groups = self.stitch_healthy_groups(
             groups_per_query, rng=random.Random(self.args.seed),
-            n_pos=n_pos, n_neg=n_neg)
+            n_pos=n_pos, n_neg=n_neg, step_align=self.absorb_step_align)
         if not groups:
             print("[absorb] no healthy groups in buffer — skipped", flush=True)
             return
-        random.Random(self.args.seed).shuffle(groups) # -> redundant but fine
-        steps = min(int(steps), len(groups))
-        chunks = [groups[i::steps] for i in range(steps)]
-        print(f"[absorb] {len(groups)} healthy groups "
-              f"({groups_per_query}/query, group size {self.num_generations}) "
-              f"-> {steps} updates ({len(chunks[0])} groups/update)", flush=True)
+        if self.absorb_step_align:
+            # Strict grow<->absorb step alignment: one gradient update per
+            # distinct GROW step, replayed in ascending step order (NOT
+            # shuffled). ``steps`` caps the number of grow steps absorbed (the
+            # FIRST ``steps`` of them), so absorb-update k == grow-step k.
+            # ``groups`` already arrive sorted by step from stitch_healthy_groups.
+            by_step: dict = {}
+            for gp in groups:
+                by_step.setdefault(gp[0], []).append(gp)
+            ordered_steps = sorted(by_step)
+            steps = min(int(steps), len(ordered_steps))
+            chunks = [by_step[s] for s in ordered_steps[:steps]]
+            kept = sum(len(c) for c in chunks)
+            print(f"[absorb] {kept}/{len(groups)} healthy groups "
+                  f"({groups_per_query}/query, group size {self.num_generations}) "
+                  f"-> {steps} updates aligned to grow steps {ordered_steps[:steps]}",
+                  flush=True)
+        else:
+            # OLD behaviour: pool every healthy group across all grow steps,
+            # shuffle, and stride into ``steps`` chunks (each update mixes steps).
+            random.Random(self.args.seed).shuffle(groups)
+            steps = min(int(steps), len(groups))
+            chunks = [groups[i::steps] for i in range(steps)]
+            print(f"[absorb] {len(groups)} healthy groups "
+                  f"({groups_per_query}/query, group size {self.num_generations}) "
+                  f"-> {steps} updates ({len(chunks[0])} groups/update, "
+                  f"step-align OFF: pooled+shuffled)", flush=True)
         self.create_optimizer()
         opt = self.optimizer
         device = self.accelerator.device
@@ -783,7 +840,7 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
                  f" (tau={self.m2po_tau})" if clip == "m2po" else ""), flush=True)
         for chunk in chunks:
             opt.zero_grad(set_to_none=True)
-            for pkey, seqs, advs in chunk:
+            for _step, pkey, seqs, advs in chunk:
                 seqs = [list(s)[:width_cap] for s in seqs]
                 group_tokens = max(sum(len(s) for s in seqs), 1)
                 m2_trie = self._global_tries.get(pkey) if clip != "none" else None
@@ -1163,7 +1220,8 @@ class TreeTrainer(GRPOTrainer):  # type: ignore[misc]
             if total is not None:
                 rdict[_TOTAL_KEY] = float(total[i])
             trie = self._global_tries.setdefault(pkey, PrefixTrie())
-            trie.insert(toks, float(adv[i]), rewards=(rdict or None), logps=row_logp)
+            trie.insert(toks, float(adv[i]), rewards=(rdict or None), logps=row_logp,
+                        step=int(getattr(self.state, "global_step", -1)))
 
     # ------------------------------------------------------------------
     # Idea 3: re-baseline advantages with the buffered group mean/std
