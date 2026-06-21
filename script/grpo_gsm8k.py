@@ -256,6 +256,56 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         loss = torch.zeros((), device=self.accelerator.device)
         return loss, None, None
 
+    # ------------------------------------------------------------------
+    # Virtual-rollout advantage shaping (anti reward-hacking under length
+    # penalties). Mirrors src/tree_trainer.py: stash TRL's per-function reward
+    # matrix in _calculate_rewards, then in _generate_and_score_completions
+    # append a no-gradient virtual rollout to each GRPO group's reward vector
+    # before the z-score (src/arsenal.py:virtual_rollout_advantages). With
+    # "insert_max", every group gets a virtual max-reward rollout, so the real
+    # rollouts' advantages are measured against an ideal answer rather than
+    # against each other — collapsing the within-group length-only contrast
+    # that the optimizer would otherwise hack. Off (virtual_rollout_mode=None)
+    # leaves TRL's advantages untouched.
+    # ------------------------------------------------------------------
+    def _calculate_rewards(self, *args, **kwargs):
+        rpf = super()._calculate_rewards(*args, **kwargs)
+        self._last_rewards_per_func = rpf       # (B_gathered, n_funcs)
+        return rpf
+
+    def _local_rewards_per_func(self, out):
+        """This process's slice of the gathered per-func reward tensor."""
+        rpf = getattr(self, "_last_rewards_per_func", None)
+        adv = out.get("advantages")
+        if rpf is None or adv is None:
+            return None
+        Bp = adv.shape[0]
+        lo = self.accelerator.process_index * Bp     # same slice TRL applies
+        return rpf[lo:lo + Bp]
+
+    def _virtual_rollout_advantages(self, out, local):
+        from src.arsenal import virtual_rollout_advantages
+        adv = out.get("advantages")
+        names = self.reward_func_names
+        rewards = local.sum(dim=1)                    # total reward (sum over funcs)
+        if "correctness_reward" in names:
+            corrects = (local[:, names.index("correctness_reward")] == 1.0)
+        else:
+            corrects = torch.zeros_like(rewards, dtype=torch.bool)
+        return virtual_rollout_advantages(
+            rewards, corrects, self.num_generations,
+            max_reward=getattr(self, "virtual_max_reward", 1.2),
+            mode=self.virtual_rollout_mode,
+        ).to(adv)
+
+    def _generate_and_score_completions(self, inputs):
+        out = super()._generate_and_score_completions(inputs)
+        if getattr(self, "virtual_rollout_mode", None) and self.model.training:
+            local = self._local_rewards_per_func(out)
+            if local is not None and out.get("advantages") is not None:
+                out["advantages"] = self._virtual_rollout_advantages(out, local)
+        return out
+
 
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops.
@@ -529,6 +579,20 @@ def main():
     parser.add_argument("--prefix_from_correct", type=str, default="all",
                         choices=["all", "correct", "incorrect"],
                         help="Sample prefixes from: all / correct / incorrect rollouts")
+    # Virtual-rollout advantage shaping (anti reward-hacking under length penalties).
+    # Appends one no-gradient virtual rollout to each GRPO group's reward vector
+    # before the z-score (src/arsenal.py:virtual_rollout_advantages). "insert_max"
+    # gives every group a virtual max-reward rollout so the real rollouts are
+    # scored against an ideal answer instead of each other, killing the
+    # within-group length-only contrast the optimizer hacks.
+    parser.add_argument("--virtual_rollout", type=str, default="none",
+                        choices=["none", "insert_max", "insert_min", "insert_max_min",
+                                 "insert_max_all_incorrect", "insert_max_mixed"],
+                        help="Virtual-rollout advantage mode (default 'none' = off). "
+                             "Use 'insert_max' to mitigate length-penalty reward hacking.")
+    parser.add_argument("--virtual_max_reward", type=float, default=1.2,
+                        help="Reward value of the inserted virtual rollout (should sit "
+                             "just above the realistic max total reward; default 1.2).")
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
                         help="Use LoRA (PEFT) instead of full fine-tuning.")
@@ -865,6 +929,19 @@ def main():
     )
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger
+
+    # Virtual-rollout advantage shaping (None = TRL default advantages).
+    trainer.virtual_rollout_mode = (None if args.virtual_rollout == "none"
+                                    else args.virtual_rollout)
+    trainer.virtual_max_reward = args.virtual_max_reward
+    if trainer.virtual_rollout_mode is not None:
+        assert "correctness_reward" in trainer.reward_func_names or \
+            trainer.virtual_rollout_mode == "insert_max", \
+            ("--virtual_rollout modes other than 'insert_max' need a "
+             "'correctness_reward' function; got "
+             f"{trainer.reward_func_names}")
+        print(f"Virtual-rollout advantages enabled: mode={trainer.virtual_rollout_mode}, "
+              f"max_reward={trainer.virtual_max_reward}")
 
     # Bind model ref for MBE forward passes (MBEDynamicsLogger only, not RolloutRecorder)
     if mbe_logger is not None and hasattr(mbe_logger, "set_model"):
