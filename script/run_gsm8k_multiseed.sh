@@ -52,7 +52,7 @@ MAX_TOKENS=1024
 LR=5e-6
 NUM_GEN=8
 GRAD_ACCUM=8
-MAX_STEPS=300
+MAX_STEPS=467
 EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
 EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 
@@ -65,7 +65,7 @@ SEED=0
 # Checkpoint grid: early-training dynamics on a log-ish schedule (1,2,4,8) plus
 # mid-training and end. Forced via grpo_gsm8k.py's SaveAtStepsCallback regardless
 # of --save_strategy. Saved to <run_dir>/checkpoint-<step>.
-SAVE_STEPS_LIST="1,4,8,12,${MAX_STEPS}"
+SAVE_STEPS_LIST="1,4,${MAX_STEPS}"
 
 # MBE velocity defaults
 VELO_STRIDE=8
