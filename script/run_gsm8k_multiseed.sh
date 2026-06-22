@@ -353,7 +353,7 @@ for SEED in "${SEEDS[@]}"; do
     run_cell "baseline_grpo_seed${SEED}"     trajectory     off
 
     # 2) InvLogLength-short, w=10 (scale 0.1): reward 1/log(T) positive → short CoT.
-    run_cell "invlog_short_w10_seed${SEED}"  invlog         0.1
+    # run_cell "invlog_short_w10_seed${SEED}"  invlog         0.1
 done
 
 # =============================================
