@@ -52,7 +52,7 @@ MAX_TOKENS=1024
 LR=5e-6
 NUM_GEN=8
 GRAD_ACCUM=8
-MAX_STEPS=467
+MAX_STEPS=300
 EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
 EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 
