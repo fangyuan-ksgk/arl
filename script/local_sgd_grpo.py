@@ -1,28 +1,9 @@
-"""Branch-train-merge GRPO  ==  Local SGD / FedAvg / DiLoCo with communication period P.
-
-Idea (the user's "Idea 1"): fully-synchronous data-parallel GRPO all-reduces *gradients*
-every optimizer step. Branch-train -> merge -> branch-train -> merge all-reduces *weights*
-every P steps. P is the synchronization ("periodic steps") knob:
+"""Branch-train-merge GRPO with period P
 
     P = 1    ->  merge every step          == the "undelayed / fully-synchronized" baseline
     P = T    ->  merge once, at the very end == independent seeds + a single final soup
                                                (the pure "lottery gap" endpoint)
     1<P<T    ->  delayed synchronization     == what we hope is optimal
-
-This driver runs K branches in parallel, one per GPU, each a colocate-vLLM GRPO run started
-from the SHARED current weights for P steps (fresh inner AdamW, constant LR so the per-round
-restart does not confound P). After every branch finishes its P steps we uniform-soup the K
-checkpoints (script/merge_soup.py), eval the merged model, rebroadcast it as the next init,
-and repeat for ceil(T/P) rounds. Total optimizer steps per branch == T for every P, so the
-sweep over P is a matched-compute ablation.
-
-At the final round we also eval each branch separately to report the lottery gap
-(avg vs union acc) alongside the merged acc.
-
-Robustness choice: each round is a fresh subprocess (clean CUDA + vLLM context per round).
-This is slower for small P (per-round vLLM init ~30-45s dominates) but sidesteps the vLLM
-context-leak / wedged-server failure modes documented in claude.md. The *science* (final acc
-at matched steps) is unaffected by the wall-clock overhead.
 
 Usage (one P setting):
     python script/local_sgd_grpo.py --tag gsm8k_P4 --period 4 --total_steps 120 \
@@ -40,31 +21,29 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import merge_soup  # noqa: E402
-import diloco_merge  # noqa: E402
+import merge_soup 
+import diloco_merge
 
 # Per-task wiring: inner GRPO script, eval script, family (train-cmd template), budgets, metric.
 # Reward gadgets (MBE-velocity, virtual-rollout) are OFF by default and controlled per-run via
 # --mbe_velocity_reward / --virtual_rollout (R1d), passed through to every branch.
-VENV_PY = "/home/claudeuser/venv_qwen35/bin/python"   # isolated venv (torch2.8/cu128 + transformers 5.13.0.dev0:
-                                                       # has qwen3_5 + fixes the mrope bug) for the geo8k Qwen3.5-4B task
 
 # R1g: per-task wiring. family selects the train-cmd template (the inner scripts have divergent CLIs);
 # maxlen/eval_tok are the per-task train + eval budgets (eval budget == train budget, the eval rule);
 # metric is the eval-JSON accuracy key; majority=False where output-vote is undefined (code/vlm).
 TASKS = {
     "gsm8k": {"script": os.path.join(HERE, "grpo_gsm8k.py"), "eval": os.path.join(HERE, "eval_gsm8k.py"),
-              "py": sys.executable, "family": "text", "maxlen": 1024, "eval_tok": 1024,
+              "family": "text", "maxlen": 1024, "eval_tok": 1024,
               "metric": "accuracy", "majority": True, "eval_flags": [], "train_extra": [], "branch_flags": []},
     "math":  {"script": os.path.join(HERE, "grpo_math.py"), "eval": os.path.join(HERE, "eval_math.py"),
-              "py": sys.executable, "family": "text", "maxlen": 3072, "eval_tok": 3072,
+              "family": "text", "maxlen": 3072, "eval_tok": 3072,
               "metric": "accuracy", "majority": True, "eval_flags": [], "train_extra": [], "branch_flags": []},
     "mbpp":  {"script": os.path.join(HERE, "grpo_code.py"), "eval": os.path.join(HERE, "eval_code.py"),
-              "py": sys.executable, "family": "code", "maxlen": 1024, "eval_tok": 1024,
+              "family": "code", "maxlen": 1024, "eval_tok": 1024,
               "metric": "pass@1", "majority": False, "eval_flags": ["--bench", "humanevalplus", "--no-think"],
               "train_extra": ["--dataset", "mbppplus"], "branch_flags": []},
     "geo8k": {"script": os.path.join(HERE, "grpo_geometry.py"), "eval": os.path.join(HERE, "eval_geometry.py"),
-              "py": VENV_PY, "family": "vlm", "maxlen": 1024, "eval_tok": 1024,
+              "family": "vlm", "maxlen": 1024, "eval_tok": 1024,
               "metric": "acc", "majority": False, "eval_flags": [], "train_extra": ["--no_geoqa"],
               "branch_flags": []},   # geo8k: Qwen3.5-4B + native-vLLM (.venv-vllm: vllm 0.24 + transformers 5.13.dev0)
 }
@@ -141,7 +120,7 @@ def _launch_vllm_server(gpu, model, port, a, out_dir):
 
 def build_train_cmd(tc, a, init_model, out_dir, steps, seed, vllm_flags, reward_flags):
     """Per-family train command (the inner GRPO scripts have divergent CLIs — R1g)."""
-    py = a.train_py or tc["py"]
+    py = sys.executable
     lora = ["--use_lora", "--lora_r", str(a.lora_r)] if a.use_lora else []
     base = [py, tc["script"], "--model", init_model, "--output_dir", out_dir,
             "--max_steps", str(steps), "--num_generations", str(a.num_generations),
@@ -198,7 +177,7 @@ def run_eval(model_dir, gpu, out_json, a, limit=None, pass_k=1):
     Per-family CLI (text/code use --max_tokens; vlm uses --max_new_tokens). Normalizes metric->'accuracy'."""
     tc = TASKS[a.task]
     env = sh_env(); env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    py = a.train_py or tc["py"]        # venv-only archs (gemma4 / qwen3_5) eval under the venv too
+    py = sys.executable
     mt = a.eval_tok
     lim = ["--limit", str(limit)] if limit else []
     pk = ["--pass_k", str(pass_k)] if (pass_k > 1 and tc["family"] == "text") else []
@@ -256,11 +235,8 @@ def main():
                              "insert_max_all_incorrect", "insert_max_mixed"])
     ap.add_argument("--virtual_max_reward", type=float, default=1.2)
     ap.add_argument("--use_lora", action="store_true", help="R1f: optional LoRA branches.")
-    ap.add_argument("--lora_r", type=int, default=32)
-    # Venv-only / vLLM-unsupported archs (e.g. google/gemma-4-E4B-it [gemma4], Qwen3.5): run the inner
-    # GRPO script under a different interpreter and/or force HF generation.
-    ap.add_argument("--train_py", default="", help="Interpreter override for the inner GRPO script "
-                    "(e.g. /home/claudeuser/venv_qwen35/bin/python for gemma4 / qwen3_5).")
+    ap.add_argument("--lora_r", type=int, default=512)
+    # vLLM-unsupported archs (e.g. google/gemma-4-E4B-it [gemma4]): force HF generation in the branches.
     ap.add_argument("--no_vllm", action="store_true",
                     help="Force HF generation in the branches (archs vLLM can't serve, e.g. gemma4).")
     # Dr.GRPO recipe (Item 0): unbiased length + no std scaling + anti length-collapse
@@ -269,7 +245,7 @@ def main():
     ap.add_argument("--mask_truncated", action=argparse.BooleanOptionalAction, default=True,
                     help="Mask truncated completions from the loss (prevents CoT length collapse).")
     # eval cadence
-    ap.add_argument("--eval_limit", type=int, default=500, help="Per-round eval subset size (0=skip per-round eval)")
+    ap.add_argument("--eval_limit", type=int, default=0, help="Per-round eval subset size (0=skip per-round eval)")
     ap.add_argument("--final_eval_limit", type=int, default=0, help="Final eval size (0=full 1319)")
     ap.add_argument("--final_pass_k", type=int, default=8,
                     help="pass@k of the final merged model (text tasks; 0/1=skip). Costs k x generation.")
