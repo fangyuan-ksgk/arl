@@ -24,6 +24,35 @@ sys.path.insert(0, HERE)
 import merge_soup 
 import diloco_merge
 
+
+def has_full_weights(d):
+    """True if `d` holds full model weights (single OR sharded safetensors, or .bin) — what
+    merge_soup / vLLM eval need. 4B/8B full-FT checkpoints shard, so a single-file check is wrong."""
+    import glob
+    return bool(
+        os.path.exists(os.path.join(d, "model.safetensors"))
+        or os.path.exists(os.path.join(d, "model.safetensors.index.json"))
+        or glob.glob(os.path.join(d, "model-*-of-*.safetensors"))
+        or os.path.exists(os.path.join(d, "pytorch_model.bin"))
+    )
+
+
+def lora_to_full(adapter_dir, base_model, full_dir):
+    """Merge a LoRA adapter (adapter_model.safetensors) into `base_model` and save a full, loadable
+    model dir. Needed because merge_soup + the eval scripts (vLLM) require full weights, not adapters.
+    `base_model` is the init the adapter was trained on (base_model for round 0, prev merged dir after)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from peft import PeftModel
+    base = AutoModelForCausalLM.from_pretrained(base_model, dtype=torch.bfloat16)
+    merged = PeftModel.from_pretrained(base, adapter_dir).merge_and_unload()
+    Path(full_dir).mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(full_dir)
+    AutoTokenizer.from_pretrained(adapter_dir).save_pretrained(full_dir)
+    del base, merged
+    torch.cuda.empty_cache()
+    return full_dir
+
 # Per-task wiring: inner GRPO script, eval script, family (train-cmd template), budgets, metric.
 # Reward gadgets (MBE-velocity, virtual-rollout) are OFF by default and controlled per-run via
 # --mbe_velocity_reward / --virtual_rollout (R1d), passed through to every branch.
@@ -161,8 +190,8 @@ def launch_branch(train_gpu, serve_gpu, init_model, out_dir, steps, seed, a, por
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     tc = TASKS[a.task]
     server = None
-    if a.no_vllm:  # HF generation (archs vLLM can't serve, e.g. gemma4); text/code honor --no-use_vllm
-        vllm_flags = ["--no-use_vllm"]
+    if a.no_vllm:  # HF generation (archs vLLM can't serve, e.g. gemma4); grpo_math/grpo_code take --no_vllm
+        vllm_flags = ["--no_vllm"]
     elif a.vllm_mode == "server" and tc["family"] != "vlm":
         sport = port + 1000
         server = _launch_vllm_server(serve_gpu, init_model, sport, a, out_dir)
@@ -220,7 +249,9 @@ def main():
                     help="Which GRPO task: gsm8k or math.")
     ap.add_argument("--base_model", default="Qwen/Qwen3-0.6B")
     ap.add_argument("--period", type=int, required=True, help="Sync period P (steps between merges)")
-    ap.add_argument("--total_steps", type=int, required=True, help="Total optimizer steps per branch T")
+    ap.add_argument("--total_steps", type=int, required=True,
+                    help="Total optimizer steps per branch T. Use -1 for EPOCH MODE: each branch trains "
+                         "one full epoch in a single one-shot round (--period is ignored).")
     ap.add_argument("--gpus", default="0,1,2")
     ap.add_argument("--seeds", default="0,1,2", help="One seed per branch (K = len)")
     # training hyperparams (kept close to the multiseed lottery-gap regime)
@@ -277,71 +308,101 @@ def main():
     tc = TASKS[a.task]
     a.maxlen = a.max_completion_length if a.max_completion_length > 0 else tc["maxlen"]
     a.eval_tok = tc["eval_tok"]
-    # R1f GPU layout: colocate = 1 GPU/branch; server = 2 GPUs/branch (vLLM serve + training).
-    if a.vllm_mode == "server":
-        assert len(gpus) >= 2 * K, f"server mode needs 2 GPUs/branch -> {2*K} for K={K} (got {len(gpus)})"
-        branch_gpus = [(gpus[2 * b + 1], gpus[2 * b]) for b in range(K)]   # (train_gpu, serve_gpu)
+    # GPU layout as concurrency SLOTS (wave topology): per_branch = 2 GPUs for server-mode vLLM
+    # (serve + train), else 1 (colocate, or --no_vllm/HF-gen e.g. gemma4). conc = #slots; K branches
+    # run in ceil(K/conc) waves, REUSING slots — so 6 GPUs run K=4 server-mode branches in 2 waves.
+    per_branch = 2 if (a.vllm_mode == "server" and not a.no_vllm and tc["family"] != "vlm") else 1
+    assert len(gpus) >= per_branch, f"need >= {per_branch} GPU(s) ({a.vllm_mode} mode); got {len(gpus)}"
+    if per_branch == 2:
+        conc = min(K, len(gpus) // 2)
+        slots = [(gpus[2 * i + 1], gpus[2 * i]) for i in range(conc)]   # (train_gpu, serve_gpu)
     else:
-        assert K <= len(gpus), f"need >= {K} gpus for {K} branches"
-        branch_gpus = [(gpus[b], None) for b in range(K)]
-    P, T = a.period, a.total_steps
-    n_rounds = (T + P - 1) // P
+        conc = min(K, len(gpus))
+        slots = [(gpus[i], None) for i in range(conc)]
+    n_waves = (K + conc - 1) // conc
+    # Epoch mode (--total_steps < 0): each branch trains ONE full epoch in a single round (one-shot).
+    epoch_mode = a.total_steps < 0
+    if epoch_mode:
+        P, T, n_rounds = 1, -1, 1
+    else:
+        P, T = a.period, a.total_steps
+        n_rounds = (T + P - 1) // P
 
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
     results = {"tag": a.tag, "config": vars(a), "K": K, "n_rounds": n_rounds, "rounds": []}
     results_path = out / "results.json"
 
     kill_orphans(gpus)   # GPU-scoped: only clears the GPUs this run uses (won't touch other jobs)
-    print(f"=== Local-SGD GRPO  tag={a.tag}  P={P}  T={T}  K={K}  rounds={n_rounds} ===", flush=True)
-    print(f"    seeds={seeds} gpus={gpus[:K]} lr={a.learning_rate} ng={a.num_generations} ga={a.grad_accum}", flush=True)
+    Tdesc = "1-epoch" if epoch_mode else str(T)
+    print(f"=== Local-SGD GRPO  tag={a.tag}  P={P}  T={Tdesc}  K={K}  rounds={n_rounds}  "
+          f"slots={conc}  waves={n_waves}  use_lora={a.use_lora}  no_vllm={a.no_vllm} ===", flush=True)
+    print(f"    seeds={seeds} gpus={gpus} lr={a.learning_rate} ng={a.num_generations} ga={a.grad_accum}", flush=True)
 
     # Eval at a fixed set of step-milestones (NOT every round) so eval cost is independent
     # of P: small-P runs have many rounds but we still eval only ~6 times + the final step.
+    # (epoch mode has a single round -> the final-round eval covers it.)
     n_milestones = max(1, min(6, n_rounds))
-    milestones = sorted(set(
+    milestones = ([] if epoch_mode else sorted(set(
         [int(round(T * k / n_milestones)) for k in range(1, n_milestones + 1)] + [T]
-    ))
+    )))
     init_model = a.base_model
     prev_merged_weights = None       # path to delete once consumed
     done_steps = 0
     t_start = time.time()
 
     for r in range(n_rounds):
-        this_P = min(P, T - done_steps)
+        this_P = -1 if epoch_mode else min(P, T - done_steps)
         round_dir = out / f"round{r}"
         round_dir.mkdir(parents=True, exist_ok=True)
         is_final = (r == n_rounds - 1)
         t_r = time.time()
 
-        # ensure GPUs are clean before launching this round's branches (prior eval freed)
-        used_gpus = sorted({g for pair in branch_gpus for g in pair if g is not None})
-        wait_gpu_free(used_gpus)
-
-        # ---- launch K branches in parallel (1 GPU/branch colocate, 2 GPUs/branch server) ----
-        procs, logs, ckpts, servers = [], [], [], []
-        for b in range(K):
-            bdir = str(round_dir / f"branch{b}")
-            seed = seeds[b] * a.seed_round_offset + r
-            port = 29500 + (r * K + b) % 2000
-            train_gpu, serve_gpu = branch_gpus[b]
-            p, log, server = launch_branch(train_gpu, serve_gpu, init_model, bdir, this_P, seed, a, port)
-            procs.append(p); logs.append(log)
-            if server is not None:
-                servers.append(server)
-            ckpts.append(os.path.join(bdir, f"checkpoint-{this_P}"))
-        rcs = [p.wait() for p in procs]
-        for s in servers:           # R1d: tear down per-branch vLLM servers
-            s.terminate()
-        for log in logs:
-            log.close()
+        # ---- launch K branches in WAVES of `conc` slots (reuse slots across waves) ----
+        # ckpts[b] = the dir holding branch b's trained weights: epoch mode -> branch out_dir
+        # (inner script's final save_model); fixed-step -> checkpoint-<this_P>.
+        ckpts = [None] * K
+        rcs = [None] * K
+        for w0 in range(0, K, conc):
+            wave = list(range(w0, min(w0 + conc, K)))
+            wused = sorted({g for i in range(len(wave)) for g in slots[i] if g is not None})
+            wait_gpu_free(wused)                  # CUDA frees lazily; don't launch into a busy GPU
+            wprocs = []
+            for i, b in enumerate(wave):
+                bdir = str(round_dir / f"branch{b}")
+                seed = seeds[b] * a.seed_round_offset + r
+                port = 29500 + (r * K + b) % 2000
+                train_gpu, serve_gpu = slots[i]
+                p, log, server = launch_branch(train_gpu, serve_gpu, init_model, bdir, this_P, seed, a, port)
+                ckpts[b] = bdir if epoch_mode else os.path.join(bdir, f"checkpoint-{this_P}")
+                wprocs.append((b, p, log, server))
+            for b, p, log, server in wprocs:
+                rcs[b] = p.wait(); log.close()
+                if server is not None:
+                    server.terminate()
+            kill_orphans(wused)                   # reap vLLM EngineCore children before the next wave
+            wait_gpu_free(wused)
         if any(rc != 0 for rc in rcs):
             print(f"[round {r}] branch failure rcs={rcs}; see {round_dir}/branch*/train.log", flush=True)
             results["error"] = f"round {r} branch rcs={rcs}"
             results_path.write_text(json.dumps(results, indent=2))
             sys.exit(1)
-        for c in ckpts:
-            if not os.path.exists(os.path.join(c, "model.safetensors")):
-                print(f"[round {r}] missing checkpoint {c}", flush=True)
+
+        # ---- LoRA branches save adapters; merge_soup + vLLM eval need FULL weights. Merge each
+        #      adapter into the round's init (the model it was trained on) up front. ----
+        if a.use_lora:
+            full_ckpts = []
+            for b, c in enumerate(ckpts):
+                if not os.path.exists(os.path.join(c, "adapter_model.safetensors")):
+                    print(f"[round {r}] missing adapter {c}", flush=True)
+                    results["error"] = f"round {r} missing adapter {c}"
+                    results_path.write_text(json.dumps(results, indent=2))
+                    sys.exit(1)
+                full_ckpts.append(lora_to_full(c, init_model, str(round_dir / f"branch{b}_full")))
+        else:
+            full_ckpts = ckpts
+        for c in full_ckpts:
+            if not has_full_weights(c):
+                print(f"[round {r}] missing checkpoint weights in {c}", flush=True)
                 results["error"] = f"round {r} missing {c}"
                 results_path.write_text(json.dumps(results, indent=2))
                 sys.exit(1)
@@ -352,15 +413,15 @@ def main():
         # ---- merge: uniform soup (memoryless) or DiLoCo outer step (memory-ful) ----
         merged_dir = str(round_dir / "merged")
         if a.merge_mode == "soup":
-            merge_soup.merge(ckpts, merged_dir)
+            merge_soup.merge(full_ckpts, merged_dir)
         else:
             diloco_merge.outer_merge(
-                prev_global=init_model, ckpt_dirs=ckpts, out_dir=merged_dir,
+                prev_global=init_model, ckpt_dirs=full_ckpts, out_dir=merged_dir,
                 momentum_path=str(out / "outer_momentum.pt"),
                 outer_lr=a.outer_lr, momentum=a.outer_momentum,
                 nesterov=(not a.no_nesterov),
                 decoupled=(a.merge_mode == "diloco_decoupled"))
-        done_steps += this_P
+        done_steps += (1 if epoch_mode else this_P)
 
         rec = {"round": r, "steps_this_round": this_P, "cum_steps": done_steps}
 
@@ -387,7 +448,7 @@ def main():
                 # per-branch eval on the SAME question set -> avg & union (lottery gap)
                 branch_correct, branch_accs, branch_preds = [], [], []
                 for b in range(K):
-                    bev = run_eval(ckpts[b], gpus[0], str(round_dir / f"eval_branch{b}.json"), a, limit=limit)
+                    bev = run_eval(full_ckpts[b], gpus[0], str(round_dir / f"eval_branch{b}.json"), a, limit=limit)
                     if bev:
                         branch_accs.append(bev["accuracy"])
                         branch_correct.append(bev.get("correct"))
@@ -423,7 +484,7 @@ def main():
         results["rounds"].append(rec)
         results["elapsed_s"] = round(time.time() - t_start, 1)
         results_path.write_text(json.dumps(results, indent=2))
-        msg = f"[round {r}/{n_rounds-1}] steps={done_steps}/{T} merged_acc={rec.get('merged_acc')}"
+        msg = f"[round {r}/{n_rounds-1}] steps={done_steps}/{Tdesc} merged_acc={rec.get('merged_acc')}"
         if "branch_avg_acc" in rec:
             msg += f" | avg={rec['branch_avg_acc']:.4f} union={rec['branch_union_acc']:.4f}"
             if rec.get("majority_acc") is not None:
@@ -439,6 +500,7 @@ def main():
         if not is_final:
             for b in range(K):
                 shutil.rmtree(round_dir / f"branch{b}", ignore_errors=True)
+                shutil.rmtree(round_dir / f"branch{b}_full", ignore_errors=True)   # LoRA->full intermediates
         # delete the previous round's merged weights once this round consumed them as init
         if prev_merged_weights and os.path.isdir(prev_merged_weights):
             shutil.rmtree(prev_merged_weights, ignore_errors=True)
