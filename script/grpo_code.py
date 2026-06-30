@@ -12,7 +12,7 @@ Server mode (2-GPU):
 
 Datasets supported:
     --dataset mbpp       (default) Google MBPP — 374 train / 500 test
-    --dataset apps       APPS (introductory level) — larger, harder
+    --dataset apps       APPS (ALL difficulty levels) — larger, harder
 """
 
 import argparse
@@ -178,7 +178,7 @@ def load_mbpp():
 
 def load_apps():
     dataset = load_dataset("codeparrot/apps", trust_remote_code=True)
-    # Filter to introductory difficulty only (most tractable for small models)
+    # NO difficulty filter — use ALL APPS levels (intro/interview/competition) per user request.
     import json
 
     def format_example(example):

@@ -17,10 +17,22 @@ import re
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+
+
+class SaveAtStepsCallback(TrainerCallback):
+    """Force checkpoint saves at arbitrary steps (HF save_steps only supports fixed intervals) ->
+    checkpoint-<step>. run_seed_scaling_lora / local_sgd read the adapter from checkpoint-<steps>."""
+    def __init__(self, steps):
+        self.steps = set(int(s) for s in steps)
+
+    def on_step_end(self, args, state, control, **kw):
+        if state.global_step in self.steps:
+            control.should_save = True
+        return control
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +151,23 @@ SYSTEM_PROMPT = (
 )
 
 
+def load_math_any():
+    """Load Hendrycks MATH via a WORKING mirror ('hendrycks/competition_math' is gone from the Hub).
+    DigitalLearningGmbH/MATH-lighteval = the official 7500 train / 5000 test (disjoint). eval_math
+    imports this."""
+    last = None
+    for repo, cfg in [("DigitalLearningGmbH/MATH-lighteval", None),
+                      ("EleutherAI/hendrycks_math", "default"),
+                      ("nlile/hendrycks-MATH-benchmark", None)]:
+        try:
+            return load_dataset(repo) if cfg is None else load_dataset(repo, cfg)
+        except Exception as e:  # noqa
+            last = e
+    raise RuntimeError(f"Could not load any MATH mirror: {last}")
+
+
 def load_math_dataset():
-    dataset = load_dataset("hendrycks/competition_math")
+    dataset = load_math_any()
 
     def format_example(example):
         example["prompt"] = [
@@ -247,6 +274,17 @@ def main():
     parser.add_argument("--lora_r", type=int, default=512)
     parser.add_argument("--lora_alpha", type=int, default=32)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    # Dr.GRPO recipe + scheduler + save-at-step + seed (consumed by run_seed_scaling_lora / local_sgd)
+    parser.add_argument("--lr_scheduler_type", type=str, default="constant")
+    parser.add_argument("--warmup_steps", type=int, default=0)
+    parser.add_argument("--loss_type", type=str, default="dr_grpo",
+                        choices=["grpo", "dapo", "bnpo", "dr_grpo"])
+    parser.add_argument("--scale_rewards", type=str, default="none",
+                        choices=["group", "batch", "none"])
+    parser.add_argument("--save_steps_list", type=str, default=None,
+                        help="comma-sep steps to force-save (e.g. the final step) -> checkpoint-<step>")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mask_truncated_completions", action="store_true")
     # MBE velocity reward + insert-max virtual-rollout (the necessary anti-reward-hacking pair).
     parser.add_argument("--mbe_velocity_reward", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--mbe_velocity_scale", type=float, default=5.0)
@@ -258,9 +296,16 @@ def main():
                         choices=["none", "insert_max", "insert_min", "insert_max_min",
                                  "insert_max_all_incorrect", "insert_max_mixed"])
     parser.add_argument("--virtual_max_reward", type=float, default=1.2)
+    parser.add_argument("--data_shard", default="",
+                        help="i/N -> train on the disjoint shard i of N (MoLoRA v2: per-expert data split)")
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_math_dataset()
+
+    if args.data_shard:                                    # MoLoRA v2: disjoint per-expert data shard
+        i, N = (int(x) for x in args.data_shard.split("/"))
+        train_dataset = train_dataset.shuffle(seed=1234).shard(num_shards=N, index=i)
+        print(f"[shard] training on disjoint shard {i}/{N}: {len(train_dataset)} examples", flush=True)
 
     config_kwargs = dict(
         output_dir=args.output_dir,
@@ -275,6 +320,14 @@ def main():
         gradient_checkpointing=args.gradient_checkpointing,
         save_strategy=args.save_strategy,
         report_to=args.report_to,
+        # Dr.GRPO: unbiased length (loss_type) + no std/group reward scaling (scale_rewards none -> False)
+        loss_type=args.loss_type,
+        scale_rewards=(False if args.scale_rewards == "none" else args.scale_rewards),
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
+        beta=0.0,
+        seed=args.seed,
+        mask_truncated_completions=args.mask_truncated_completions,
     )
     if args.max_steps > 0:
         config_kwargs["max_steps"] = args.max_steps
@@ -363,6 +416,12 @@ def main():
             eval_dataset = test_dataset.select(range(min(args.eval_samples, len(test_dataset))))
         print(f"Eval enabled: {len(eval_dataset)} samples every {args.eval_steps} steps")
 
+    callbacks = []
+    if args.save_steps_list:
+        steps_list = [int(s) for s in args.save_steps_list.split(",") if s.strip()]
+        callbacks.append(SaveAtStepsCallback(steps_list))
+        print(f"Forced checkpoint saves at steps {sorted(set(steps_list))} -> {args.output_dir}/checkpoint-<step>")
+
     trainer = VirtualRolloutGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
@@ -370,6 +429,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         peft_config=peft_config,
+        callbacks=callbacks,
     )
     trainer.virtual_rollout_mode = None if args.virtual_rollout == "none" else args.virtual_rollout
     trainer.virtual_max_reward = args.virtual_max_reward

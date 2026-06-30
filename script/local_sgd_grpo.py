@@ -218,7 +218,7 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--max_completion_length", type=int, default=0,
                     help="0 = use the task's default budget (gsm8k 1024, math 3072, ...) — R1g.")
-    ap.add_argument("--learning_rate", type=float, default=2e-6)   # validated stable to 120 steps (Item 0)
+    ap.add_argument("--learning_rate", type=float, default=2e-5)
     ap.add_argument("--lr_scheduler", default="constant", help="constant|linear|cosine (per-round)")
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--vllm_gpu_mem", type=float, default=0.35)
@@ -235,7 +235,7 @@ def main():
                              "insert_max_all_incorrect", "insert_max_mixed"])
     ap.add_argument("--virtual_max_reward", type=float, default=1.2)
     ap.add_argument("--use_lora", action="store_true", help="R1f: optional LoRA branches.")
-    ap.add_argument("--lora_r", type=int, default=512)
+    ap.add_argument("--lora_r", type=int, default=256)
     # vLLM-unsupported archs (e.g. google/gemma-4-E4B-it [gemma4]): force HF generation in the branches.
     ap.add_argument("--no_vllm", action="store_true",
                     help="Force HF generation in the branches (archs vLLM can't serve, e.g. gemma4).")

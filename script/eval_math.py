@@ -43,7 +43,7 @@ def main():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max_tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.0)
-    p.add_argument("--max_model_len", type=int, default=3072)
+    p.add_argument("--max_model_len", type=int, default=4608)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pass_k", type=int, default=1, help="pass@k: sample k completions, correct if any correct")

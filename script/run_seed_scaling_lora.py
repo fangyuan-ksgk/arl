@@ -16,7 +16,7 @@ Usage:
     python script/run_seed_scaling_lora.py --model Qwen/Qwen3-1.7B --n_seeds 4 --steps 100 \
         --out output/seed_scaling_math_1p7b
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, signal, subprocess, sys, time
 from pathlib import Path
 from collections import Counter
 
@@ -51,8 +51,56 @@ def wait_free(gpus, need=55000, timeout=300):
 # [Question 1]. we are not using a seperate device for each seed's training right? 
 #               my question is if we'd like to do server-model training, how is this script 
 
-def train_seed(seed, gpu, out_dir, a):
+def _launch_vllm_server(gpu, model, port, out_dir):
+    """Server mode (Question 1): start a trl vLLM server for one seed on `gpu`; return Popen once healthy."""
+    import urllib.request
+    env = base_env(gpu, 29900 + gpu)
+    cmd = ["trl", "vllm-serve", "--model", model, "--port", str(port), "--gpu_memory_utilization", "0.9"]
+    proc = subprocess.Popen(cmd, env=env, stdout=open(os.path.join(out_dir, "vllm_server.log"), "w"),
+                            stderr=subprocess.STDOUT, start_new_session=True)  # own pgroup -> killpg later
+    for _ in range(240):
+        if proc.poll() is not None:
+            break
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/health/", timeout=2); return proc
+        except Exception:
+            time.sleep(2)
+    return proc
+
+
+def _kill_server(server, serve_gpu):
+    """Hard-kill a vLLM server AND its EngineCore children (SIGTERM to the parent leaves the engine
+    holding VRAM -> next wave's server OOMs). Kill the whole process group, then sweep the serve GPU."""
+    if server is not None:
+        try:
+            os.killpg(os.getpgid(server.pid), signal.SIGKILL)
+        except Exception:
+            try: server.kill()
+            except Exception: pass
+    if serve_gpu is not None:                       # belt-and-suspenders: clear any stragglers on that GPU
+        try:
+            pids = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits", "-i", str(serve_gpu)],
+                text=True).split()
+            for pid in pids:
+                if pid.strip().isdigit():
+                    subprocess.run(["kill", "-9", pid.strip()], stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+
+def train_seed(seed, train_gpu, serve_gpu, out_dir, a):
+    """One LoRA seed. serve_gpu=None -> colocate (1 GPU); else server mode (vLLM serve on serve_gpu,
+    training on train_gpu — avoids the model×max_new_tokens colocate OOM on bigger models)."""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
+    server = None
+    if serve_gpu is None:
+        vllm_flags = ["--use_vllm", "--vllm_mode", "colocate", "--vllm_gpu_memory_utilization", str(a.vllm_mem)]
+    else:
+        sport = 8200 + seed
+        server = _launch_vllm_server(serve_gpu, a.model, sport, out_dir)
+        vllm_flags = ["--use_vllm", "--vllm_mode", "server", "--vllm_server_host", "127.0.0.1",
+                      "--vllm_server_port", str(sport)]
     cmd = [sys.executable, GRPO_MATH, "--model", a.model, "--output_dir", out_dir,
            "--max_steps", str(a.steps), "--num_generations", str(a.num_gen),
            "--max_completion_length", str(a.maxlen),
@@ -61,14 +109,14 @@ def train_seed(seed, gpu, out_dir, a):
            "--loss_type", "dr_grpo", "--scale_rewards", "none",
            *(["--mask_truncated_completions"] if a.mask_truncated else []),
            "--use_lora", "--lora_r", str(a.lora_r), "--lora_alpha", str(2*a.lora_r),
-           "--logging_steps", "20", "--use_vllm", "--vllm_mode", "colocate",
-           "--vllm_gpu_memory_utilization", str(a.vllm_mem), "--gradient_checkpointing",
+           "--logging_steps", "20", "--gradient_checkpointing",
            "--save_strategy", "steps", "--save_steps_list", str(a.steps), "--eval_steps", "0",
-           "--seed", str(seed), "--report_to", "none"]
-    if a.vllm_max_model_len > 0:
-        cmd += ["--vllm_max_model_len", str(a.vllm_max_model_len)]
+           "--seed", str(seed), "--report_to", "none"] + vllm_flags
+    if getattr(a, "shard_data", False):                    # MoLoRA v2: each expert on a disjoint data shard
+        cmd += ["--data_shard", f"{seed}/{a.n_seeds}"]
     log = open(os.path.join(out_dir, "train.log"), "w")
-    return subprocess.Popen(cmd, env=base_env(gpu, 29810 + seed), stdout=log, stderr=subprocess.STDOUT), log
+    p = subprocess.Popen(cmd, env=base_env(train_gpu, 29810 + seed), stdout=log, stderr=subprocess.STDOUT)
+    return p, log, server
 
 
 def lora_to_full(adapter_dir, base_model, full_dir):
@@ -112,6 +160,11 @@ def main():
     ap.add_argument("--lr_scheduler", default="constant")
     ap.add_argument("--warmup", type=int, default=0)
     ap.add_argument("--vllm_mem", type=float, default=0.25)
+    ap.add_argument("--vllm_mode", default="colocate", choices=["colocate", "server"],
+                    help="server = 2 GPUs/seed (vLLM-serve + train); avoids colocate OOM on bigger models")
+    ap.add_argument("--shard_data", action="store_true",
+                    help="MoLoRA v2: train each expert on a DISJOINT data shard (seed i -> shard i/n_seeds) "
+                         "instead of all-data (v1). Tests whether semantic experts beat stochastic ones.")
     ap.add_argument("--vllm_max_model_len", type=int, default=0,
                     help="Cap vLLM context for big models (8B) so KV fits a small colocate pool. 0=native.")
     a = ap.parse_args()
@@ -119,17 +172,33 @@ def main():
     out = Path(a.out); out.mkdir(parents=True, exist_ok=True)
 
     # ---- train N LoRA seeds in waves ----
+    # GPU slots: colocate = 1 GPU/seed; server = 2 GPUs/seed (train + vLLM-serve). Seeds run in WAVES
+    # of `conc = len(gpus)//per_seed`, REUSING the same slots (so 2 GPUs run K seeds across K waves).
+    per_seed = 2 if a.vllm_mode == "server" else 1
+    assert len(gpus) >= per_seed, f"{a.vllm_mode} mode needs >= {per_seed} GPU(s); got {len(gpus)}"
+    conc = max(1, len(gpus) // per_seed)
+    slots = ([(gpus[2*i+1], gpus[2*i]) for i in range(conc)] if a.vllm_mode == "server"
+             else [(gpus[i], None) for i in range(conc)])
+    print(f"[train] {a.vllm_mode} mode: {per_seed} gpu/seed -> {conc} seed(s) concurrent, "
+          f"{(a.n_seeds + conc - 1)//conc} wave(s)", flush=True)
     adapters = {}
-    for w0 in range(0, a.n_seeds, len(gpus)):
-        wave = list(range(w0, min(w0 + len(gpus), a.n_seeds)))
-        wait_free(gpus[:len(wave)]); print(f"[train] wave {wave}", flush=True)
-        procs = [(s, str(out / f"seed{s}"), *train_seed(s, gpus[i], str(out / f"seed{s}"), a)) for i, s in enumerate(wave)]
-        for s, d, p, log in procs:
+    for w0 in range(0, a.n_seeds, conc):
+        wave = list(range(w0, min(w0 + conc, a.n_seeds)))
+        used = sorted({g for i in range(len(wave)) for g in slots[i] if g is not None})
+        wait_free(used); print(f"[train] wave {wave}", flush=True)
+        procs = []
+        for i, s in enumerate(wave):
+            tg, sg = slots[i]
+            p, log, server = train_seed(s, tg, sg, str(out / f"seed{s}"), a)
+            procs.append((s, str(out / f"seed{s}"), p, log, server, sg))
+        for s, d, p, log, server, sg in procs:
             rc = p.wait(); log.close()
+            _kill_server(server, sg)        # hard pgroup kill so the next wave's server isn't OOM'd
             ad = os.path.join(d, f"checkpoint-{a.steps}")
             ok = rc == 0 and os.path.exists(os.path.join(ad, "adapter_model.safetensors"))
             print(f"[train] seed{s} rc={rc} adapter_ok={ok}", flush=True)
             if ok: adapters[s] = ad
+        wait_free(used)                     # let the serve-GPU VRAM actually free before the next wave
     seeds = sorted(adapters)
 
     # ---- merge each adapter -> full model ----
