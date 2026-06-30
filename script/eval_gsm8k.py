@@ -9,14 +9,14 @@ Prompt / answer conventions are copied verbatim from the GRPO training recipe
 (`script/grpo_gsm8k.py`) so eval matches the format the checkpoints were trained under:
 Qwen3 thinking mode via the trailing " /think", answer marked by a final `#### <number>`.
 
-Eval hygiene (matters for merge comparisons): use --max_tokens 2048 and the strict `####`
+Eval hygiene (matters for merge comparisons): use --max_tokens 1024 and the strict `####`
 extraction. The GSM8K greedy@1 noise floor is ~+/-0.015; gaps smaller than ~1.5 points are
-not meaningful. Short context (1024) inflates truncation and adds noise.
+not meaningful. 
 
 Usage:
-    python repro/eval_gsm8k.py --model_path <dir> --out results.json --max_tokens 2048
+    python repro/eval_gsm8k.py --model_path <dir> --out results.json --max_tokens 1024
     python repro/eval_gsm8k.py --repo Ksgk-fy/arl-gsm8k-multiseed \
-        --subfolder seed0/checkpoint-200 --out seed0.json --max_tokens 2048
+        --subfolder seed0/checkpoint-200 --out seed0.json --max_tokens 1024
 """
 import argparse
 import json
@@ -85,13 +85,12 @@ def main():
     p.add_argument("--label", default=None, help="Name recorded in the output JSON.")
     p.add_argument("--out", required=True, help="Output JSON path.")
     p.add_argument("--limit", type=int, default=None, help="Eval only the first N test questions (debug).")
-    p.add_argument("--max_tokens", type=int, default=2048, help="Max generated tokens (use 2048 for clean comparisons).")
+    p.add_argument("--max_tokens", type=int, default=1024, help="Max generated tokens (use 1024 for clean comparisons).")
     p.add_argument("--temperature", type=float, default=0.0, help="0.0 = greedy pass@1.")
-    p.add_argument("--max_model_len", type=int, default=3072)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--pass_k", type=int, default=1, help="pass@k: sample k completions, correct if any correct")
-    p.add_argument("--pass_temp", type=float, default=0.8, help="sampling temperature when pass_k>1")
+    p.add_argument("--pass_temp", type=float, default=1.0, help="sampling temperature when pass_k>1")
     p.add_argument("--save_logprobs", action="store_true",
                    help="Also save own-model mean_logprob + completion text (for verifier-free selection study).")
     args = p.parse_args()
@@ -119,7 +118,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = build_prompts(tokenizer, questions)
 
-    llm = LLM(model=model_dir, dtype="bfloat16", max_model_len=args.max_model_len,
+    llm = LLM(model=model_dir, dtype="bfloat16",
               gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True, seed=args.seed)
     # pass@k mode: sample k completions (temp>0) per question; correct = any sample correct.
     passk = max(1, args.pass_k)
