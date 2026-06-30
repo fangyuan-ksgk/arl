@@ -1,9 +1,28 @@
-""" Branch Train Merge (Dr.)GRPO with period P
+"""Branch-train-merge GRPO  ==  Local SGD / FedAvg / DiLoCo with communication period P.
+
+Idea (the user's "Idea 1"): fully-synchronous data-parallel GRPO all-reduces *gradients*
+every optimizer step. Branch-train -> merge -> branch-train -> merge all-reduces *weights*
+every P steps. P is the synchronization ("periodic steps") knob:
 
     P = 1    ->  merge every step          == the "undelayed / fully-synchronized" baseline
     P = T    ->  merge once, at the very end == independent seeds + a single final soup
                                                (the pure "lottery gap" endpoint)
     1<P<T    ->  delayed synchronization     == what we hope is optimal
+
+This driver runs K branches in parallel, one per GPU, each a colocate-vLLM GRPO run started
+from the SHARED current weights for P steps (fresh inner AdamW, constant LR so the per-round
+restart does not confound P). After every branch finishes its P steps we uniform-soup the K
+checkpoints (script/merge_soup.py), eval the merged model, rebroadcast it as the next init,
+and repeat for ceil(T/P) rounds. Total optimizer steps per branch == T for every P, so the
+sweep over P is a matched-compute ablation.
+
+At the final round we also eval each branch separately to report the lottery gap
+(avg vs union acc) alongside the merged acc.
+
+Robustness choice: each round is a fresh subprocess (clean CUDA + vLLM context per round).
+This is slower for small P (per-round vLLM init ~30-45s dominates) but sidesteps the vLLM
+context-leak / wedged-server failure modes documented in claude.md. The *science* (final acc
+at matched steps) is unaffected by the wall-clock overhead.
 
 Usage (one P setting):
     python script/local_sgd_grpo.py --tag gsm8k_P4 --period 4 --total_steps 120 \
@@ -21,13 +40,14 @@ from pathlib import Path
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROJECT = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
-import merge_soup
-import diloco_merge
+import merge_soup  # noqa: E402
+import diloco_merge  # noqa: E402
 
-# Per-task wiring: inner GRPO script, eval script, and any task-specific train flags.
-# gsm8k's trainer enables an MBE-velocity reward by default -> disable it for a clean
-# correctness+format baseline. grpo_math.py already uses only correctness+format.
-VENV_PY = "/home/claudeuser/venv_qwen35/bin/python"   # transformers 5.12.1 stack for VLM (qwen3_vl) tasks
+# Per-task wiring: inner GRPO script, eval script, family (train-cmd template), budgets, metric.
+# Reward gadgets (MBE-velocity, virtual-rollout) are OFF by default and controlled per-run via
+# --mbe_velocity_reward / --virtual_rollout (R1d), passed through to every branch.
+VENV_PY = "/home/claudeuser/venv_qwen35/bin/python"   # isolated venv (torch2.8/cu128 + transformers 5.13.0.dev0:
+                                                       # has qwen3_5 + fixes the mrope bug) for the geo8k Qwen3.5-4B task
 
 # R1g: per-task wiring. family selects the train-cmd template (the inner scripts have divergent CLIs);
 # maxlen/eval_tok are the per-task train + eval budgets (eval budget == train budget, the eval rule);
@@ -74,10 +94,19 @@ def wait_gpu_free(gpus, need_mib=60000, timeout=180):
     return False
 
 
-def kill_orphans():
-    """Kill stale GRPO/vLLM workers that pin VRAM (the claude.md golden line)."""
-    subprocess.run("ps -ef | grep -iE 'grpo_gsm8k|grpo_math|grpo_code|grpo_geometry|vllm-serve|VLLM::EngineCore' "
-                   "| grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null", shell=True)
+def kill_orphans(gpus):
+    """Kill stale compute procs ON THE GPUs THIS RUN WILL USE (GPU-scoped via nvidia-smi compute-apps),
+    so it clears our own GPUs without touching other jobs running on other GPUs."""
+    for g in gpus:
+        try:
+            pids = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits", "-i", str(g)],
+                text=True).split()
+            for pid in pids:
+                if pid.strip().isdigit():
+                    subprocess.run(["kill", "-9", pid.strip()], stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
     time.sleep(2)
 
 
@@ -97,7 +126,7 @@ def _launch_vllm_server(gpu, model, port, a, out_dir):
     import urllib.request
     env = sh_env(); env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     cmd = ["trl", "vllm-serve", "--model", model, "--port", str(port),
-           "--gpu_memory_utilization", "0.9", "--max_model_len", str(a.maxlen + 2048)]
+           "--gpu_memory_utilization", "0.9"]
     proc = subprocess.Popen(cmd, env=env, stdout=open(os.path.join(out_dir, "vllm_server.log"), "w"),
                             stderr=subprocess.STDOUT)
     for _ in range(180):
@@ -112,7 +141,7 @@ def _launch_vllm_server(gpu, model, port, a, out_dir):
 
 def build_train_cmd(tc, a, init_model, out_dir, steps, seed, vllm_flags, reward_flags):
     """Per-family train command (the inner GRPO scripts have divergent CLIs — R1g)."""
-    py = tc["py"]
+    py = a.train_py or tc["py"]
     lora = ["--use_lora", "--lora_r", str(a.lora_r)] if a.use_lora else []
     base = [py, tc["script"], "--model", init_model, "--output_dir", out_dir,
             "--max_steps", str(steps), "--num_generations", str(a.num_generations),
@@ -120,8 +149,7 @@ def build_train_cmd(tc, a, init_model, out_dir, steps, seed, vllm_flags, reward_
     if tc["family"] == "vlm":   # grpo_geometry: --grad_accum, always-LoRA, native-vLLM qwen3_5 (vLLM 0.24)
         return base + ["--grad_accum", str(a.grad_accum), "--lora_r", str(a.lora_r),
                        "--use_vllm", "--vllm_model_impl", "vllm",
-                       "--vllm_gpu_mem", str(a.vllm_gpu_mem),
-                       "--vllm_max_model_len", str(a.maxlen + 2048)] + tc["train_extra"] + tc["branch_flags"]
+                       "--vllm_gpu_mem", str(a.vllm_gpu_mem)] + tc["train_extra"] + tc["branch_flags"]
     cmd = base + ["--per_device_train_batch_size", str(a.num_generations),
                   "--gradient_accumulation_steps", str(a.grad_accum),
                   "--gradient_checkpointing", "--eval_steps", "0"] + lora + vllm_flags + reward_flags
@@ -144,7 +172,9 @@ def launch_branch(train_gpu, serve_gpu, init_model, out_dir, steps, seed, a, por
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     tc = TASKS[a.task]
     server = None
-    if a.vllm_mode == "server" and tc["family"] != "vlm":
+    if a.no_vllm:  # HF generation (archs vLLM can't serve, e.g. gemma4); text/code honor --no-use_vllm
+        vllm_flags = ["--no-use_vllm"]
+    elif a.vllm_mode == "server" and tc["family"] != "vlm":
         sport = port + 1000
         server = _launch_vllm_server(serve_gpu, init_model, sport, a, out_dir)
         vllm_flags = ["--use_vllm", "--vllm_mode", "server",
@@ -163,24 +193,26 @@ def launch_branch(train_gpu, serve_gpu, init_model, out_dir, steps, seed, a, por
     return p, log, server
 
 
-def run_eval(model_dir, gpu, out_json, a, limit=None):
-    """Greedy eval of one model dir at the task's eval budget (== train budget). Per-family CLI
-    (text/code use --max_tokens; vlm uses --max_new_tokens). Normalizes the metric key to 'accuracy'."""
+def run_eval(model_dir, gpu, out_json, a, limit=None, pass_k=1):
+    """Greedy eval at the task's budget (== train budget). pass_k>1 -> pass@k (text tasks only).
+    Per-family CLI (text/code use --max_tokens; vlm uses --max_new_tokens). Normalizes metric->'accuracy'."""
     tc = TASKS[a.task]
     env = sh_env(); env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    py = a.train_py or tc["py"]        # venv-only archs (gemma4 / qwen3_5) eval under the venv too
     mt = a.eval_tok
     lim = ["--limit", str(limit)] if limit else []
+    pk = ["--pass_k", str(pass_k)] if (pass_k > 1 and tc["family"] == "text") else []
     if tc["family"] == "vlm":
-        cmd = [tc["py"], tc["eval"], "--model_path", model_dir, "--out", out_json,
+        cmd = [py, tc["eval"], "--model_path", model_dir, "--out", out_json,
                "--max_new_tokens", str(mt)] + lim + tc["eval_flags"]
     elif tc["family"] == "code":
-        cmd = [tc["py"], tc["eval"], "--model_path", model_dir, "--out", out_json,
+        cmd = [py, tc["eval"], "--model_path", model_dir, "--out", out_json,
                "--max_tokens", str(mt), "--max_model_len", str(mt + 1024),
                "--gpu_memory_utilization", "0.85"] + lim + tc["eval_flags"]
     else:  # text
-        cmd = [tc["py"], tc["eval"], "--model_path", model_dir, "--out", out_json,
+        cmd = [py, tc["eval"], "--model_path", model_dir, "--out", out_json,
                "--max_tokens", str(mt), "--temperature", "0.0", "--max_model_len", str(mt + 1024),
-               "--gpu_memory_utilization", "0.85"] + lim
+               "--gpu_memory_utilization", "0.85"] + lim + pk
     p = subprocess.run(cmd, env=env, capture_output=True, text=True)
     if p.returncode != 0:
         print(f"[eval] FAILED {model_dir}\n{p.stderr[-1500:]}", flush=True)
@@ -225,6 +257,12 @@ def main():
     ap.add_argument("--virtual_max_reward", type=float, default=1.2)
     ap.add_argument("--use_lora", action="store_true", help="R1f: optional LoRA branches.")
     ap.add_argument("--lora_r", type=int, default=32)
+    # Venv-only / vLLM-unsupported archs (e.g. google/gemma-4-E4B-it [gemma4], Qwen3.5): run the inner
+    # GRPO script under a different interpreter and/or force HF generation.
+    ap.add_argument("--train_py", default="", help="Interpreter override for the inner GRPO script "
+                    "(e.g. /home/claudeuser/venv_qwen35/bin/python for gemma4 / qwen3_5).")
+    ap.add_argument("--no_vllm", action="store_true",
+                    help="Force HF generation in the branches (archs vLLM can't serve, e.g. gemma4).")
     # Dr.GRPO recipe (Item 0): unbiased length + no std scaling + anti length-collapse
     ap.add_argument("--loss_type", default="dr_grpo", choices=["grpo", "dapo", "bnpo", "dr_grpo"])
     ap.add_argument("--scale_rewards", default="none", choices=["group", "batch", "none"])
@@ -233,6 +271,8 @@ def main():
     # eval cadence
     ap.add_argument("--eval_limit", type=int, default=500, help="Per-round eval subset size (0=skip per-round eval)")
     ap.add_argument("--final_eval_limit", type=int, default=0, help="Final eval size (0=full 1319)")
+    ap.add_argument("--final_pass_k", type=int, default=8,
+                    help="pass@k of the final merged model (text tasks; 0/1=skip). Costs k x generation.")
     ap.add_argument("--seed_round_offset", type=int, default=1000,
                     help="Per-round seed = base_seed*offset + round, so each round sees fresh data ordering.")
     # merge step (Item 2): soup == memoryless; diloco == memory-ful outer optimizer
@@ -265,7 +305,7 @@ def main():
     results = {"tag": a.tag, "config": vars(a), "K": K, "n_rounds": n_rounds, "rounds": []}
     results_path = out / "results.json"
 
-    kill_orphans()
+    kill_orphans(gpus)   # GPU-scoped: only clears the GPUs this run uses (won't touch other jobs)
     print(f"=== Local-SGD GRPO  tag={a.tag}  P={P}  T={T}  K={K}  rounds={n_rounds} ===", flush=True)
     print(f"    seeds={seeds} gpus={gpus[:K]} lr={a.learning_rate} ng={a.num_generations} ga={a.grad_accum}", flush=True)
 
@@ -348,7 +388,16 @@ def main():
             ev = run_eval(merged_dir, gpus[0], str(round_dir / "eval_merged.json"), a, limit=limit)
             rec["merged_acc"] = ev["accuracy"] if ev else None
             rec["merged_n"] = ev["n"] if ev else None
+            if ev and ev.get("records"):
+                import statistics as _st
+                rec["mean_cot_len"] = round(_st.mean(r.get("n_gen_tokens", 0) for r in ev["records"]), 1)
             if is_final and ev:
+                # merged-model pass@k (text tasks only; sample k, any-correct)
+                if a.final_pass_k > 1 and tc["family"] == "text":
+                    ev8 = run_eval(merged_dir, gpus[0], str(round_dir / "eval_merged_passk.json"),
+                                   a, limit=limit, pass_k=a.final_pass_k)
+                    rec["merged_pass_k"] = ev8["accuracy"] if ev8 else None
+                    rec["pass_k"] = a.final_pass_k
                 # per-branch eval on the SAME question set -> avg & union (lottery gap)
                 branch_correct, branch_accs, branch_preds = [], [], []
                 for b in range(K):
@@ -410,8 +459,37 @@ def main():
         prev_merged_weights = merged_dir
         init_model = merged_dir
 
+    # ---- one-row results.csv: config + final-round metrics + training time ----
+    import csv
+    fr = results["rounds"][-1] if results["rounds"] else {}
+    row = {
+        # (1) config
+        "tag": a.tag, "task": a.task, "base_model": a.base_model, "K": K,
+        "period_P": P, "total_steps_T": T, "merge_mode": a.merge_mode,
+        "lr": a.learning_rate, "num_generations": a.num_generations, "grad_accum": a.grad_accum,
+        "maxlen": a.maxlen, "lr_scheduler": a.lr_scheduler, "loss_type": a.loss_type,
+        "scale_rewards": a.scale_rewards, "mask_truncated": a.mask_truncated,
+        "use_lora": a.use_lora, "lora_r": (a.lora_r if a.use_lora else None),
+        "mbe_velocity_reward": a.mbe_velocity_reward, "virtual_rollout": a.virtual_rollout,
+        # (2) results (final round)
+        "avg_acc": fr.get("branch_avg_acc"), "union_acc": fr.get("branch_union_acc"),
+        "merge_acc": fr.get("merged_acc"), "majority_acc": fr.get("majority_acc"),
+        "lottery_gap": fr.get("lottery_gap"), "mean_cot_len": fr.get("mean_cot_len"),
+        f"pass@{a.final_pass_k}": fr.get("merged_pass_k"), "eval_n": fr.get("merged_n"),
+        # (3) training time
+        "train_time_s": results.get("elapsed_s"),
+        "train_time_h": round((results.get("elapsed_s") or 0) / 3600, 3),
+    }
+    csv_path = out / "results.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys())); w.writeheader(); w.writerow(row)
+
     print(f"=== DONE {a.tag}: {json.dumps(results['rounds'][-1])} ===", flush=True)
     print(f"    results -> {results_path}", flush=True)
+    print(f"    summary CSV -> {csv_path}", flush=True)
+    print("    | " + " | ".join(f"{k}={row[k]}" for k in
+          ["avg_acc", "union_acc", "merge_acc", "majority_acc", "mean_cot_len",
+           f"pass@{a.final_pass_k}", "train_time_h"] if row.get(k) is not None), flush=True)
 
 
 if __name__ == "__main__":

@@ -33,8 +33,7 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
 # ---------------------------------------------------------------------------
-# Reward functions | @FY. apparently we allows for producing #### answer directly within the CoT (before </think> tag even appears)
-#                    this is fine, but we need to be consistent
+# Reward functions
 # ---------------------------------------------------------------------------
 def extract_answer_from_completion(text: str) -> str:
     match = re.search(r"####\s*([\d,\.\-]+)", text)
@@ -396,9 +395,28 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--loss_type", type=str, default="dapo",
+                        choices=["grpo", "dapo", "bnpo", "dr_grpo"],
+                        help="GRPO loss aggregation. 'dr_grpo' = Dr.GRPO (normalize by constant "
+                             "max_completion_length; unbiased length).")
+    parser.add_argument("--scale_rewards", type=str, default="group",
+                        choices=["group", "batch", "none"],
+                        help="Advantage scaling. 'none' = Dr.GRPO (no std division → removes the "
+                             "question-level difficulty bias).")
+    parser.add_argument("--mask_truncated_completions", action="store_true",
+                        help="Exclude truncated (length-capped, no-EOS) completions from the loss. "
+                             "Prevents the length-collapse pathology where truncation pressure pulls "
+                             "CoT shorter instead of improving correctness.")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear",
+                        help="HF LR scheduler. Use 'constant' for branch-train-merge "
+                             "(Local SGD) rounds so the per-round restart does not "
+                             "re-warm/decay and confound the sync-period ablation.")
+    parser.add_argument("--warmup_steps", type=int, default=0,
+                        help="LR warmup steps (keep 0 for Local-SGD rounds).")
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--use_vllm", action="store_true", default=True)
+    parser.add_argument("--use_vllm", action=argparse.BooleanOptionalAction, default=True,
+                        help="--no-use_vllm => HF generation (for archs vLLM can't serve, e.g. gemma4).")
     parser.add_argument("--no_vllm", action="store_true")
     parser.add_argument("--vllm_mode", type=str, default="colocate",
                         choices=["colocate", "server"],
@@ -617,6 +635,11 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
+        lr_scheduler_type=args.lr_scheduler_type,
+        warmup_steps=args.warmup_steps,
+        loss_type=args.loss_type,
+        scale_rewards=(False if args.scale_rewards == "none" else args.scale_rewards),
+        mask_truncated_completions=args.mask_truncated_completions,
         logging_steps=args.logging_steps,
         bf16=True,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -660,12 +683,15 @@ def main():
     peft_config = None
     if args.use_lora:
         from peft import LoraConfig
+        from transformers import AutoConfig as _AC
+        _mods = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        _g4 = "gemma4" in (getattr(_AC.from_pretrained(args.model), "model_type", "") or "")
+        _tm = [f"{m}.linear" for m in _mods] if _g4 else _mods  # gemma4: inner nn.Linear of Gemma4ClippableLinear
         peft_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
+            target_modules=_tm,
             task_type="CAUSAL_LM",
         )
         print(f"LoRA enabled: r={args.lora_r}, alpha={args.lora_alpha}")

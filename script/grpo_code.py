@@ -288,7 +288,8 @@ def main():
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--use_vllm", action="store_true", default=True)
+    parser.add_argument("--use_vllm", action=argparse.BooleanOptionalAction, default=True,
+                        help="--no-use_vllm => HF generation (for archs vLLM can't serve, e.g. gemma4).")
     parser.add_argument("--no_vllm", action="store_true")
     parser.add_argument("--vllm_mode", type=str, default="colocate",
                         choices=["colocate", "server"])
@@ -366,12 +367,15 @@ def main():
     peft_config = None
     if args.use_lora:
         from peft import LoraConfig
+        from transformers import AutoConfig as _AC
+        _mods = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        _g4 = "gemma4" in (getattr(_AC.from_pretrained(args.model), "model_type", "") or "")
+        _tm = [f"{m}.linear" for m in _mods] if _g4 else _mods  # gemma4: inner nn.Linear of Gemma4ClippableLinear
         peft_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
+            target_modules=_tm,
             task_type="CAUSAL_LM",
         )
 

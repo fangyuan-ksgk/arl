@@ -9,8 +9,6 @@ Server mode (2-GPU):
     GPU 0: trl vllm-serve --model Qwen/Qwen3-0.6B --port 8000
     GPU 1: CUDA_VISIBLE_DEVICES=1 python script/grpo_math.py \
                --use_vllm --vllm_mode server --vllm_server_port 8000 --max_steps 200
-
-[TBD]. Dr.GRPO | Dr.GRPO + MBE velocity reward + virtual max reward 
 """
 
 import argparse
@@ -195,7 +193,7 @@ class VirtualRolloutGRPOTrainer(GRPOTrainer):
             rewards, corrects, self.num_generations,
             max_reward=getattr(self, "virtual_max_reward", 1.2),
             mode=self.virtual_rollout_mode,
-        ).to(adv) # here we are assuming 'mbe velocity reward' doesn't exist, otherwise we should have 1.4 as max reward
+        ).to(adv)
 
     def _generate_and_score_completions(self, inputs):
         out = super()._generate_and_score_completions(inputs)
@@ -274,14 +272,12 @@ def main():
                         help="Comma-separated steps to force-save a checkpoint (e.g. the merge step P).")
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
     parser.add_argument("--logging_steps", type=int, default=10)
-    parser.add_argument("--use_vllm", action="store_true", default=True)
+    parser.add_argument("--use_vllm", action=argparse.BooleanOptionalAction, default=True,
+                        help="--no-use_vllm => HF generation (for archs vLLM can't serve, e.g. gemma4).")
     parser.add_argument("--no_vllm", action="store_true")
     parser.add_argument("--vllm_mode", type=str, default="colocate",
                         choices=["colocate", "server"])
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.5)
-    parser.add_argument("--vllm_max_model_len", type=int, default=0,
-                        help="Cap vLLM context (prompt+gen) to bound KV-cache memory. 0=use model native. "
-                             "Set for big models (e.g. 8B) so KV fits a small colocate pool.")
     parser.add_argument("--vllm_server_host", type=str, default="0.0.0.0")
     parser.add_argument("--vllm_server_port", type=int, default=8000)
     parser.add_argument("--gradient_checkpointing", action="store_true")
@@ -354,8 +350,6 @@ def main():
         config_kwargs["vllm_mode"] = args.vllm_mode
         if args.vllm_mode == "colocate":
             config_kwargs["vllm_gpu_memory_utilization"] = args.vllm_gpu_memory_utilization
-            if args.vllm_max_model_len > 0:
-                config_kwargs["vllm_max_model_length"] = args.vllm_max_model_len
         elif args.vllm_mode == "server":
             config_kwargs["vllm_server_host"] = args.vllm_server_host
             config_kwargs["vllm_server_port"] = args.vllm_server_port
@@ -370,12 +364,15 @@ def main():
     peft_config = None
     if args.use_lora:
         from peft import LoraConfig
+        from transformers import AutoConfig as _AC
+        _mods = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        _g4 = "gemma4" in (getattr(_AC.from_pretrained(args.model), "model_type", "") or "")
+        _tm = [f"{m}.linear" for m in _mods] if _g4 else _mods  # gemma4: inner nn.Linear of Gemma4ClippableLinear
         peft_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                            "gate_proj", "up_proj", "down_proj"],
+            target_modules=_tm,
             task_type="CAUSAL_LM",
         )
         print(f"LoRA enabled: r={args.lora_r}, alpha={args.lora_alpha}")

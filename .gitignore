@@ -2,3 +2,5 @@
 logs/*
 *.DS_Store
 output/figures/*
+tree_outputs/*
+design/*

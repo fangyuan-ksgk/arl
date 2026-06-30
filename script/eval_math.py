@@ -46,6 +46,8 @@ def main():
     p.add_argument("--max_model_len", type=int, default=3072)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pass_k", type=int, default=1, help="pass@k: sample k completions, correct if any correct")
+    p.add_argument("--pass_temp", type=float, default=0.8, help="sampling temperature when pass_k>1")
     args = p.parse_args()
 
     from transformers import AutoTokenizer
@@ -65,21 +67,25 @@ def main():
 
     llm = LLM(model=model_dir, dtype="bfloat16", max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True, seed=args.seed)
-    sampling = SamplingParams(temperature=args.temperature, top_p=1.0, max_tokens=args.max_tokens,
-                              seed=args.seed if args.temperature > 0 else None)
+    passk = max(1, args.pass_k)
+    temp = args.pass_temp if passk > 1 else args.temperature
+    sampling = SamplingParams(temperature=temp, top_p=1.0, max_tokens=args.max_tokens, n=passk,
+                              seed=(args.seed if temp > 0 else None))
     outputs = llm.generate(prompts, sampling)
 
     records, correct_flags, n_truncated = [], [], 0
     for i, out in enumerate(outputs):
+        sample_ok = [answers_equal(extract_answer_from_completion(c.text), golds[i]) for c in out.outputs]
+        ok = any(sample_ok)                                    # pass@k (k=1 -> greedy)
         comp = out.outputs[0]
         pred = extract_answer_from_completion(comp.text)
-        ok = answers_equal(pred, golds[i])
         truncated = comp.finish_reason == "length"
         n_truncated += int(truncated)
         correct_flags.append(ok)
         records.append({"idx": i, "gold": golds[i], "pred": pred, "correct": ok,
-                        "has_marker": bool(extract_boxed(comp.text)),
-                        "truncated": truncated, "n_gen_tokens": len(comp.token_ids)})
+                        "pass1": sample_ok[0], "n_correct_of_k": int(sum(sample_ok)), "k": passk,
+                        "has_marker": bool(extract_boxed(comp.text)), "truncated": truncated,
+                        "n_gen_tokens": sum(len(c.token_ids) for c in out.outputs) / len(out.outputs)})
 
     n = len(correct_flags)
     accuracy = sum(correct_flags) / n if n else 0.0
