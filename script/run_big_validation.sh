@@ -7,10 +7,10 @@
 #   3. Delayed sync ~ one-shot:   merged_acc(P=1) ≈ merged_acc(P=32) ≈ merged_acc(one-shot)
 #                                 (limited gains from more frequent synchronization)
 #
-# Models:   Qwen3-4B, Qwen3-8B  (server mode: 1 GPU serve + 1 GPU train/branch),
-#           google/gemma-4-E4B-it (vLLM CANNOT serve gemma4 -> --no_vllm / HF generation).
+# Models:   Qwen3-4B, Qwen3-8B, google/gemma-4-E4B-it — ALL in vLLM server mode
+#           (1 GPU serve + 1 GPU train per branch).
 # Common:   lr=2e-5, K=4 seeds, MATH datasets eval full test; APPS eval = HumanEval+ (proxy).
-#           6 GPUs => server mode runs K=4 branches in 2 waves (3 slots); no_vllm runs 4 in 1 wave.
+#           6 GPUs => server mode runs K=4 branches in 2 waves (3 slots of 2 GPUs).
 #
 # Per (model, dataset) grid (4 runs):
 #   r1  plain Dr.GRPO            one-shot, ONE EPOCH  (--total_steps -1, --period 1)   [lottery gap]
@@ -55,11 +55,8 @@ run_cell () {
     if [[ "$task" == "math" ]]; then
         lora=(--use_lora --lora_r "$LORA_R")
     fi
-    # gemma4 cannot be vLLM-served -> HF generation (colocate, 1 GPU/branch)
+    # vLLM server mode for ALL models (incl. gemma4): 1 GPU serve + 1 GPU train per branch.
     local vllm=(--vllm_mode server)
-    if [[ "$model" == *gemma-4* || "$model" == *gemma4* ]]; then
-        vllm=(--no_vllm)
-    fi
 
     echo "############ $tag ############"
     python "$SD/local_sgd_grpo.py" \
