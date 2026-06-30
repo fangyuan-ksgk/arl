@@ -1140,3 +1140,223 @@ class CorrectnessGatedMBEReward:
             rewards.append(reward)
 
         return rewards
+
+
+
+# ===========================================================================
+# KL-distillation reward (iCoT internalization)
+# ===========================================================================
+class KLDistillReward:
+    """Distributional CoT-internalization reward.
+
+    For each training query we have a per-query *oracle* teacher p_θ₁ — one of
+    the 8 seed-200 GRPO checkpoints that solves it with the shortest CoT o*
+    (built offline by `script/build_oracle_data.py`). The teacher supplies a
+    rich target over the gold answer tokens a* conditioned on its FULL reasoning:
+
+        q_i = softmax( teacher_logits(a*_i | q, o*) / τ )   over a top-K support.
+
+    The student p_θ is scored on how well its own answer distribution matches,
+    while conditioning only on its own (shorter) CoT o:
+
+        p_i = softmax( student_logits(a*_i | q, o) / τ )     over the SAME support.
+
+    direction="forward":  kl_i = KL(q_i ‖ p_i)   (oracle teaches the structure)
+    direction="reverse":  kl_i = KL(p_i ‖ q_i)   (student pulled onto oracle mass)
+
+    reward = clip(-mean_i kl_i, -clip, +clip) / scale.   Lower divergence ⇒ higher
+    (less negative) reward. Same bounded convention as the other shapers; GRPO
+    centers per group, so rollouts whose short-CoT answer dist tracks the oracle
+    get higher advantage. Binary correctness reward is kept separately.
+
+    The teacher target is a |a*|×K logit matrix, NOT a scalar log-likelihood —
+    far more signal about the oracle's reasoning structure.
+
+    `prefix_frac` (default 1.0 = full CoT) optionally truncates the student CoT
+    to its first fraction of tokens before scoring — the hook for an iCoT
+    prefix-shrinking curriculum (annealed externally via a callback). Phase-1
+    experiments keep it at 1.0.
+
+    No gradient flows through the teacher — this is a pure scalar reward that
+    slots into TRL's reward-func API. Matches a rollout to its oracle by
+    sha1(user-content), so no query id needs to thread through TRL.
+    """
+
+    def __init__(self, tokenizer, oracle_dir, direction="forward",
+                 scale: float = 4.0, clip: float = 1.0, tau: float = 1.0,
+                 topk: int = 64, prefix_frac: float = 1.0, marker: str = "####",
+                 mode: str = "off_policy", include_eot: bool = True,
+                 repo: str = "Ksgk-fy/arl-gsm8k-multiseed"):
+        assert direction in ("forward", "reverse"), direction
+        assert mode in ("off_policy", "on_policy"), mode
+        self.__name__ = f"kl_distill_{mode.split('_')[0]}_{direction}"  # kl_distill_off_forward / kl_distill_on_forward
+        self.model = None
+        self.tokenizer = tokenizer
+        self.direction = direction
+        self.scale = scale
+        self.clip = clip
+        self.tau = tau
+        self.topk = topk
+        self.prefix_frac = prefix_frac
+        self.marker = marker
+        self.mode = mode
+        self.include_eot = include_eot
+        self.repo = repo
+        self._teacher_models = {}   # on_policy: seed -> live HF model (lazy)
+
+        oracle_dir = Path(oracle_dir)
+        self.oracle = {}
+        with (oracle_dir / "oracle.jsonl").open() as f:
+            for line in f:
+                r = json.loads(line)
+                self.oracle[r["key"]] = r
+        # off_policy uses the precomputed top-K teacher matrix; on_policy scores
+        # the student's own (o,a) with a live teacher, so it needs only routing.
+        self.teacher = {}
+        if mode == "off_policy":
+            self.teacher = torch.load(oracle_dir / "teacher_logits.pt",
+                                      map_location="cpu", weights_only=False)
+        n_with = sum(1 for r in self.oracle.values() if r.get("has_oracle"))
+        print(f"[KLDistillReward] mode={mode} loaded {len(self.oracle)} oracle rows "
+              f"({n_with} with oracle), {len(self.teacher)} logit entries; "
+              f"direction={direction} τ={tau} K={topk} eot={include_eot}",
+              flush=True)
+
+    def set_model(self, model):
+        self.model = model
+
+    def _get_teacher(self, seed):
+        """Lazy-load (and cache) the seed's oracle checkpoint on the policy's
+        device for on-policy scoring of the student's own rollout."""
+        if seed not in self._teacher_models:
+            from transformers import AutoModelForCausalLM
+            from script.build_oracle_data import local_checkpoint_path
+            device = next(self.model.parameters()).device
+            m = AutoModelForCausalLM.from_pretrained(
+                local_checkpoint_path(self.repo, seed),
+                torch_dtype=torch.bfloat16, attn_implementation="eager",
+            ).to(device).eval()
+            for p in m.parameters():
+                p.requires_grad_(False)
+            self._teacher_models[seed] = m
+            print(f"[KLDistillReward] on_policy: loaded teacher seed{seed}", flush=True)
+        return self._teacher_models[seed]
+
+    @staticmethod
+    def _kl_on_support(t_logits, s_logits, topk_ids, tau, direction):
+        """Mean KL between teacher q and student p on the teacher's top-K support."""
+        log_q = torch.log_softmax(torch.gather(t_logits, 1, topk_ids) / tau, dim=-1)
+        log_p = torch.log_softmax(torch.gather(s_logits, 1, topk_ids) / tau, dim=-1)
+        if direction == "forward":          # KL(q || p)
+            kl = (log_q.exp() * (log_q - log_p)).sum(dim=-1)
+        else:                               # KL(p || q)
+            kl = (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+        return kl.mean().item()
+
+    @staticmethod
+    def _content_key(prompt_msgs) -> str:
+        return hashlib.sha1(prompt_msgs[0]["content"].encode("utf-8")).hexdigest()
+
+    def _prompt_text(self, user_content):
+        return self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": user_content}],
+            tokenize=False, add_generation_prompt=True)
+
+    def _find_marker_idx(self, ids):
+        midx = None
+        for i, t in enumerate(ids):
+            if self.marker in self.tokenizer.decode([t]):
+                midx = i
+        return midx
+
+    def _span_logits(self, model, full_ids, a_start, L):
+        """logits of `model` over [a_start-1 : a_start-1+L] (predict the L answer tokens)."""
+        device = next(model.parameters()).device
+        out = model(torch.tensor([full_ids], device=device), use_cache=False).logits[0]
+        return out[a_start - 1: a_start - 1 + L].float()           # (L, V)
+
+    def _native_student_seq(self, user_content, completion_text, a_ids, marker_id):
+        """Native-format student sequence: prompt + the student's own reasoning
+        (its raw CoT up to its own #### — <think> kept, NOT closed) + the teacher's
+        marker token + the teacher answer tokens a_ids appended verbatim. No
+        closed-think reconstruction (these seeds never emit </think>)."""
+        reasoning = completion_text.split(self.marker, 1)[0]       # keep '<think>...'
+        ctx_ids = self.tokenizer(self._prompt_text(user_content) + reasoning,
+                                 add_special_tokens=False)["input_ids"] + [marker_id]
+        a = a_ids.tolist() if hasattr(a_ids, "tolist") else list(a_ids)
+        return ctx_ids + a, len(ctx_ids), len(a)
+
+    def _reward_from_kl(self, kl_mean):
+        return max(-self.clip, min(-kl_mean, self.clip)) / self.scale
+
+    def _rollout_kl(self, prompt, completion):
+        """Mean KL for one rollout (teacher detached, student differentiable in
+        the current grad context). Returns a scalar tensor, or None to skip.
+        Shared by the reward path (wrapped in no_grad) and the `kl_loss` objective."""
+        device = next(self.model.parameters()).device
+        eos = self.tokenizer.eos_token_id
+        key = self._content_key(prompt)
+        entry = self.oracle.get(key)
+        if entry is None or not entry.get("has_oracle"):
+            return None
+        completion_text = completion[0]["content"]
+        user_content = prompt[0]["content"]
+
+        if self.mode == "off_policy":
+            # Teacher target = top-K logprobs from the oracle's greedy rollout.
+            tch = self.teacher.get(key)
+            if tch is None:
+                return None
+            topk_ids = tch["topk_ids"].to(device)                  # (L, K)
+            log_q = torch.log_softmax(tch["topk_logprobs"].float().to(device), dim=-1)
+            full_ids, a_start, L = self._native_student_seq(
+                user_content, completion_text, tch["a_ids"], tch["marker_id"])
+            if a_start < 1 or L < 1:
+                return None
+            s_full = self._span_logits(self.model, full_ids, a_start, L)
+            log_p = torch.log_softmax(torch.gather(s_full, 1, topk_ids) / self.tau, dim=-1)
+        else:  # on_policy: live (frozen) teacher scores the student's OWN raw (o, a)
+            pt = self._prompt_text(user_content)
+            plen = len(self.tokenizer(pt, add_special_tokens=False)["input_ids"])
+            full_ids = self.tokenizer(pt + completion_text, add_special_tokens=False)["input_ids"]
+            comp_ids = full_ids[plen:]
+            midx = self._find_marker_idx(comp_ids)
+            if midx is None:                           # student emitted no #### -> skip
+                return None
+            end = len(comp_ids) - (1 if comp_ids and comp_ids[-1] == eos else 0)
+            L = end - (midx + 1)
+            if L < 1:
+                return None
+            a_start = plen + midx + 1
+            with torch.no_grad():
+                t_full = self._span_logits(self._get_teacher(entry["oracle_seed"]), full_ids, a_start, L)
+            s_full = self._span_logits(self.model, full_ids, a_start, L)
+            topk_ids = t_full.topk(min(self.topk, t_full.shape[-1]), dim=-1).indices
+            log_q = torch.log_softmax(torch.gather(t_full, 1, topk_ids) / self.tau, dim=-1)
+            log_p = torch.log_softmax(torch.gather(s_full, 1, topk_ids) / self.tau, dim=-1)
+
+        if self.direction == "forward":               # KL(teacher q || student p)
+            kl = (log_q.exp() * (log_q - log_p)).sum(-1)
+        else:                                          # KL(student p || teacher q)
+            kl = (log_p.exp() * (log_p - log_q)).sum(-1)
+        return kl.mean()
+
+    @torch.no_grad()
+    def __call__(self, prompts, completions, gold_answer=None, **kwargs):
+        if self.model is None:
+            return [0.0] * len(completions)
+        out = []
+        for prompt, completion in zip(prompts, completions):
+            kl = self._rollout_kl(prompt, completion)
+            out.append(0.0 if kl is None else self._reward_from_kl(kl.item()))
+        return out
+
+    def kl_loss(self, prompts, completions):
+        """Differentiable mean KL over the batch — the objective form of the
+        gadget (add `lambda * kl_loss` to the GRPO loss). Backprops through the
+        student only; the teacher target is detached."""
+        terms = [self._rollout_kl(p, c) for p, c in zip(prompts, completions)]
+        terms = [t for t in terms if t is not None]
+        if not terms:
+            return next(self.model.parameters()).sum() * 0.0   # 0 with a grad path
+        return torch.stack(terms).mean()

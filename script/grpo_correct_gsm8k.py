@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import json
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -33,8 +34,7 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
 # ---------------------------------------------------------------------------
-# Reward functions | @FY. apparently we allows for producing #### answer directly within the CoT (before </think> tag even appears)
-#                    this is fine, but we need to be consistent
+# Reward functions
 # ---------------------------------------------------------------------------
 def extract_answer_from_completion(text: str) -> str:
     match = re.search(r"####\s*([\d,\.\-]+)", text)
@@ -308,6 +308,140 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         return out
 
 
+def _question_from_prompt(prompt) -> str:
+    """Extract the user-content question string from a prompt (msg-list or str)."""
+    if isinstance(prompt, list):
+        for msg in prompt:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                return msg.get("content", "")
+        return ""
+    return prompt if isinstance(prompt, str) else str(prompt)
+
+
+class SelfCorrectGRPOTrainer(FastEvalGRPOTrainer):
+    """GRPO with an online in-loop *two-pass* self-correction step (Idea 2).
+
+    Each TRAIN step, before the real GRPO rollout group is generated:
+      1. The live policy greedily produces ONE first attempt per unique prompt.
+      2. Each attempt is labelled correct/incorrect vs gold.
+      3. A mode-dependent turn-2 raw-string prompt (q + attempt1 + cue) is built
+         and broadcast over the prompt's G group rows, overwriting inputs[i].
+    Then `super()._generate_and_score_completions` runs the normal GRPO group
+    rollout + scoring on the *turn-2 continuations*.
+
+    Eval is untouched: it flows through `prediction_step` (single-pass), so the
+    built-in eval keeps measuring turn-1 greedy@1 for free. The headline two-pass
+    number comes from `script/eval_selfcorrect.py`.
+
+    Set `self.self_correct_controller` (src.self_correct.SelfCorrectController)
+    and `self._sc_tokenizer` after construction. mode="none" disables the hook.
+    """
+
+    @contextlib.contextmanager
+    def _attempt_decoding(self, temperature: float):
+        """Force a fixed temperature for the turn-1 attempt generation pass.
+
+        temperature==0 → greedy (matches the two-pass eval). Mirrors the
+        save/restore dance in `_greedy_eval`.
+        """
+        vg = getattr(self, "vllm_generation", None)
+        gc = getattr(self, "generation_config", None)
+        old_vg_t = getattr(vg, "temperature", None) if vg is not None else None
+        old_gc = (gc.temperature, gc.do_sample) if gc is not None else None
+        greedy = temperature <= 0.0
+        if vg is not None:
+            vg.temperature = 0.0 if greedy else float(temperature)
+        if gc is not None:
+            gc.do_sample = not greedy
+            if not greedy:
+                gc.temperature = float(temperature)
+        try:
+            yield
+        finally:
+            if vg is not None:
+                vg.temperature = old_vg_t
+            if gc is not None:
+                gc.temperature, gc.do_sample = old_gc
+
+    def _attempt_correct(self, text, gold):
+        try:
+            return float(extract_answer_from_completion(text)) == float(gold)
+        except (ValueError, TypeError):
+            return False
+
+    def _generate_and_score_completions(self, inputs):
+        ctrl = getattr(self, "self_correct_controller", None)
+        # Only intercept during training; eval never reaches this method.
+        if ctrl is None or ctrl.mode == "none" or not self.model.training:
+            return super()._generate_and_score_completions(inputs)
+
+        from src.self_correct import build_turn2_prompt
+        from src.self_correct import _completion_text as _sc_text
+
+        tok = self._sc_tokenizer
+        G = self.num_generations
+        prompts = [x["prompt"] for x in inputs]
+        step = int(self.state.global_step)
+
+        # ===== Self-judge: DISTINCT temperature-sampled candidate per row ======
+        # The judge signal is only meaningful if it sees on-policy *correct AND
+        # incorrect* candidates. Greedy attempt-1 is deterministic and ~70%
+        # skewed to correct → the judge degenerates to "always Yes". So we sample
+        # a distinct attempt for every group row (one _generate over all B rows;
+        # the G repeats of each prompt give G independent samples), making each
+        # GRPO group a mix the judge must actually read.
+        if ctrl.mode == "judge":
+            temp = ctrl.attempt1_temperature if ctrl.attempt1_temperature > 0 else 1.0
+            with self._attempt_decoding(temp):
+                res = self._generate(prompts)
+            attempt_texts = [_sc_text(a) for a in res[3]]
+            row_correct = []
+            for i, inp in enumerate(inputs):
+                ok = self._attempt_correct(attempt_texts[i], inp.get("gold_answer", ""))
+                inp["prompt"] = build_turn2_prompt(
+                    _question_from_prompt(prompts[i]), attempt_texts[i],
+                    "judge", ok, tok, cues=ctrl.cues,
+                )
+                row_correct.append(ok)
+            ctrl.row_attempt_correct = row_correct      # consumed by SelfJudgeReward
+            n_pos = sum(row_correct)
+            print(f"[self-correct:judge] step {step}: {n_pos}/{len(row_correct)} "
+                  f"sampled candidates correct (T={temp}); "
+                  f"{len(row_correct) - n_pos} incorrect to judge", flush=True)
+            return super()._generate_and_score_completions(inputs)
+
+        # ===== continue / reroll: ONE attempt per group (shared prefix) ========
+        # G corrections of the *same* first attempt → clean within-group GRPO
+        # contrast. Greedy by default (matches the greedy two-pass eval).
+        uniq_idx = list(range(0, len(inputs), G))          # group starts
+        uniq_prompts = [prompts[i] for i in uniq_idx]
+        with self._attempt_decoding(ctrl.attempt1_temperature):
+            res = self._generate(uniq_prompts)
+        attempt_texts = [_sc_text(a) for a in res[3]]
+        uniq_correct = [self._attempt_correct(attempt_texts[u],
+                                              inputs[gi].get("gold_answer", ""))
+                        for u, gi in enumerate(uniq_idx)]
+
+        inject_p = ctrl.inject_prob_at_step(step)
+        row_correct = []
+        for u, gi in enumerate(uniq_idx):
+            question = _question_from_prompt(prompts[gi])
+            inject = ctrl.mode == "continue" and random.random() < inject_p
+            p2 = build_turn2_prompt(
+                question, attempt_texts[u], ctrl.mode, uniq_correct[u],
+                tok, inject_pivot=inject, cues=ctrl.cues,
+            )
+            for j in range(G):
+                inputs[gi + j]["prompt"] = p2
+                row_correct.append(uniq_correct[u])
+        ctrl.row_attempt_correct = row_correct
+
+        print(f"[self-correct:{ctrl.mode}] step {step}: "
+              f"attempt1 {sum(uniq_correct)}/{len(uniq_correct)} correct, "
+              f"inject_p={inject_p:.2f}", flush=True)
+        return super()._generate_and_score_completions(inputs)
+
+
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops.
 
@@ -396,6 +530,11 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--beta", type=float, default=0.0,
+                        help="KL coefficient (anchor to the reference policy). Default "
+                             "0.0 = no KL (fine for the strong correctness reward). Use a "
+                             "positive value (e.g. 0.04) for weak/noisy rewards like the "
+                             "self-judge, which otherwise collapse into degenerate text.")
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--use_vllm", action="store_true", default=True)
@@ -566,6 +705,39 @@ def main():
     parser.add_argument("--entropy_density_clip",     type=float, default=1.0)
     parser.add_argument("--entropy_density_marker", type=str, default="####",
                         help="Rationale/answer separator (defaults to GSM8K convention).")
+    # KL-distillation reward (iCoT internalization). Matches each rollout to a
+    # per-query oracle (built by script/build_oracle_data.py) and rewards the
+    # student for matching the oracle's answer distribution while conditioning
+    # on its own (shorter) CoT. Extra reward on top of binary correctness.
+    parser.add_argument("--kl_distill_reward", action="store_true",
+                        help="Add distributional CoT-internalization KL reward.")
+    parser.add_argument("--kl_distill_direction", type=str, default="forward",
+                        choices=["forward", "reverse"],
+                        help="forward=KL(teacher||student), reverse=KL(student||teacher)")
+    parser.add_argument("--kl_distill_mode", type=str, default="off_policy",
+                        choices=["off_policy", "on_policy"],
+                        help="off_policy: precomputed teacher target on (o*,a*). "
+                             "on_policy: live teacher scores the student's own (o,a).")
+    parser.add_argument("--kl_distill_include_eot", action=argparse.BooleanOptionalAction,
+                        default=True, help="Include the <|im_end|> end-of-turn in the "
+                             "scored answer span (full standard turn).")
+    parser.add_argument("--kl_distill_repo", type=str,
+                        default="Ksgk-fy/arl-gsm8k-multiseed",
+                        help="HF repo of the seed checkpoints (on_policy live teachers).")
+    parser.add_argument("--kl_distill_scale", type=float, default=4.0,
+                        help="reward = clip(-meanKL, ±clip)/scale; weight w=clip/scale.")
+    parser.add_argument("--kl_distill_clip", type=float, default=1.0)
+    parser.add_argument("--kl_distill_tau", type=float, default=1.0,
+                        help="Softmax temperature for teacher & student distributions.")
+    parser.add_argument("--kl_distill_topk", type=int, default=64,
+                        help="Top-K support (must be ≤ the K stored offline).")
+    parser.add_argument("--kl_distill_prefix_frac", type=float, default=1.0,
+                        help="Fraction of student CoT to condition on (1.0=full; "
+                             "iCoT curriculum hook).")
+    parser.add_argument("--kl_distill_oracle_dir", type=str,
+                        default=str(Path(__file__).resolve().parent.parent
+                                    / "data" / "oracle_gsm8k"),
+                        help="Dir with oracle.jsonl + teacher_logits.pt.")
     # Prefix-conditioned rollout exploration (PCRE)
     parser.add_argument("--prefix_rollout", action="store_true",
                         help="Enable prefix-conditioned rollout exploration")
@@ -600,6 +772,27 @@ def main():
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    # Self-correction (Idea 2): online in-loop two-pass GRPO.
+    #   judge    — model judges its own answer (Yes/No); reward = judge accuracy.
+    #   reroll   — wrong attempt → inject "wait, this is wrong" → GRPO the fix.
+    #   continue — always continue from attempt-1 (neutral self-routed cue, or a
+    #              teacher-forced correctness pivot via --pivot_injection_prob).
+    parser.add_argument("--self_correct_mode", type=str, default="none",
+                        choices=["none", "judge", "reroll", "continue"],
+                        help="Enable Idea-2 self-correction (default 'none' = vanilla GRPO).")
+    parser.add_argument("--attempt1_temperature", type=float, default=0.0,
+                        help="Decoding temperature for the turn-1 attempt "
+                             "(0.0 = greedy, matches two-pass eval).")
+    parser.add_argument("--pivot_injection_prob", type=float, default=0.0,
+                        help="(continue mode) prob. of teacher-forcing the "
+                             "correctness-conditioned pivot instead of the neutral cue.")
+    parser.add_argument("--pivot_anneal_steps", type=int, default=0,
+                        help="(continue mode) linearly anneal --pivot_injection_prob "
+                             "to 0 over this many steps (0 = constant).")
+    parser.add_argument("--reroll_fallback", type=str, default="plain",
+                        choices=["plain"],
+                        help="(reroll mode) what to do when attempt-1 is already "
+                             "correct (currently: plain fresh attempt).")
     args = parser.parse_args()
 
     train_dataset, test_dataset = load_gsm8k()
@@ -617,6 +810,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_train_epochs,
         learning_rate=args.learning_rate,
+        beta=args.beta,
         logging_steps=args.logging_steps,
         bf16=True,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -732,11 +926,47 @@ def main():
             f"from={args.prefix_from_correct}"
         )
 
+    # --- Self-correction controller (Idea 2) -------------------------------
+    self_correct_controller = None
+    self_judge_reward_obj = None
+    if args.self_correct_mode != "none":
+        # Hidden-state rewards index completion[0]["content"]; self-correct turn-2
+        # prompts are raw strings → TRL returns string completions → those rewards
+        # would crash. Block the combination loudly.
+        _hs_flags = [args.mbe_reward, args.gated_mbe_reward, args.mbe_velocity_reward,
+                     args.inv_log_length_reward, args.gated_inv_log_length_reward,
+                     args.entropy_velocity_reward, args.perplexity_velocity_reward,
+                     args.entropy_density_reward, args.predictive_velocity_reward,
+                     args.kl_distill_reward]
+        assert not any(_hs_flags), (
+            "--self_correct_mode is incompatible with MBE/velocity/KL rewards "
+            "(they assume dict-shaped completions; self-correct uses raw-string "
+            "prompts → string completions). Disable those rewards.")
+        from src.self_correct import SelfCorrectController, SelfJudgeReward
+        self_correct_controller = SelfCorrectController(
+            mode=args.self_correct_mode,
+            attempt1_temperature=args.attempt1_temperature,
+            pivot_injection_prob=args.pivot_injection_prob,
+            pivot_anneal_steps=args.pivot_anneal_steps,
+            reroll_fallback=args.reroll_fallback,
+        )
+        print(f"Self-correction enabled: mode={args.self_correct_mode}, "
+              f"attempt1_temp={args.attempt1_temperature}, "
+              f"pivot_injection_prob={args.pivot_injection_prob}, "
+              f"pivot_anneal_steps={args.pivot_anneal_steps}")
+
     # Build reward function list
-    reward_funcs = ([format_reward] if args.no_correctness_reward
-                    else [correctness_reward, format_reward])
-    if args.no_correctness_reward:
-        print("Correctness reward DISABLED for training (eval accuracy still logged).")
+    if args.self_correct_mode == "judge":
+        # The judge's completion is a Yes/No verdict, not an answer: optimise
+        # judge-accuracy and skip the answer-format reward.
+        self_judge_reward_obj = SelfJudgeReward(self_correct_controller)
+        reward_funcs = [self_judge_reward_obj]
+        print("Judge mode: reward = self-judge accuracy (correctness/format rewards off).")
+    else:
+        reward_funcs = ([format_reward] if args.no_correctness_reward
+                        else [correctness_reward, format_reward])
+        if args.no_correctness_reward:
+            print("Correctness reward DISABLED for training (eval accuracy still logged).")
     mbe_reward_obj = None
 
     if args.mbe_log and mbe_logger is not None:
@@ -889,6 +1119,28 @@ def main():
               f"norm_mode='{args.predictive_norm_mode}', "
               f"answer_source='{args.predictive_answer_source}'")
 
+    kl_distill_obj = None
+    if args.kl_distill_reward:
+        from src.mbe_reward import KLDistillReward
+        kl_distill_obj = KLDistillReward(
+            AutoTokenizer.from_pretrained(args.model),
+            oracle_dir=args.kl_distill_oracle_dir,
+            direction=args.kl_distill_direction,
+            scale=args.kl_distill_scale,
+            clip=args.kl_distill_clip,
+            tau=args.kl_distill_tau,
+            topk=args.kl_distill_topk,
+            prefix_frac=args.kl_distill_prefix_frac,
+            mode=args.kl_distill_mode,
+            include_eot=args.kl_distill_include_eot,
+            repo=args.kl_distill_repo,
+        )
+        reward_funcs.append(kl_distill_obj)
+        print(f"KL-distill reward enabled: mode={args.kl_distill_mode}, "
+              f"direction={args.kl_distill_direction}, scale={args.kl_distill_scale}, "
+              f"clip=±{args.kl_distill_clip}, tau={args.kl_distill_tau}, "
+              f"topk={args.kl_distill_topk}, include_eot={args.kl_distill_include_eot}")
+
     eval_dataset = None
     if args.eval_steps > 0:
         eval_dataset = test_dataset
@@ -919,7 +1171,9 @@ def main():
         callbacks.append(SaveAtStepsCallback(save_steps))
         print(f"Forced checkpoint saves at steps: {sorted(set(save_steps))} → {args.output_dir}/checkpoint-<step>")
 
-    trainer = FastEvalGRPOTrainer(
+    trainer_cls = (SelfCorrectGRPOTrainer if args.self_correct_mode != "none"
+                   else FastEvalGRPOTrainer)
+    trainer = trainer_cls(
         model=model,
         reward_funcs=reward_funcs,
         args=config,
@@ -930,6 +1184,11 @@ def main():
     )
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger
+
+    # Bind the self-correction controller + tokenizer for the in-loop two-pass hook.
+    if self_correct_controller is not None:
+        trainer.self_correct_controller = self_correct_controller
+        trainer._sc_tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     # Virtual-rollout advantage shaping (None = TRL default advantages).
     trainer.virtual_rollout_mode = (None if args.virtual_rollout == "none"
@@ -961,6 +1220,8 @@ def main():
         entropy_density_obj.set_model(trainer.model)
     if predictive_velo_obj is not None:
         predictive_velo_obj.set_model(trainer.model)
+    if kl_distill_obj is not None:
+        kl_distill_obj.set_model(trainer.model)
 
     trainer.train()
     if args.save_strategy != "no":

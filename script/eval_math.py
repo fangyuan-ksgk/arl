@@ -6,7 +6,7 @@ differences are the MATH prompt format (\\boxed{}) and answer comparison, both i
 from script/grpo_math.py so eval matches the training recipe.
 
 Usage:
-    python tmp-merge-distill/eval_math.py --model_path <dir> --out r.json --max_tokens 2048
+    python script/eval_math.py --model_path <dir> --out r.json --max_tokens 2048
 """
 import argparse
 import json
@@ -43,6 +43,7 @@ def main():
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--max_tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.0)
+    p.add_argument("--max_model_len", type=int, default=3072)
     p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -62,7 +63,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
     prompts = build_prompts(tokenizer, problems)
 
-    llm = LLM(model=model_dir, dtype="bfloat16",
+    llm = LLM(model=model_dir, dtype="bfloat16", max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_memory_utilization, enforce_eager=True, seed=args.seed)
     sampling = SamplingParams(temperature=args.temperature, top_p=1.0, max_tokens=args.max_tokens,
                               seed=args.seed if args.temperature > 0 else None)

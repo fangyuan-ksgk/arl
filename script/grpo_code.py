@@ -143,7 +143,7 @@ def syntax_reward(completions, **kwargs):
 SYSTEM_PROMPT = (
     "You are an expert Python programmer. "
     "Write a Python function to solve the given task. "
-    "Put your code in a ```python code block."
+    "Put your code in a ```python code block. /no_think"   # disable Qwen3 thinking (align train/eval budget)
 )
 
 
@@ -202,25 +202,83 @@ def load_apps():
             example["test_list"] = []
         return example
 
-    train = dataset["train"].filter(lambda x: x["difficulty"] == "introductory")
-    test = dataset["test"].filter(lambda x: x["difficulty"] == "introductory")
+    train = dataset["train"]            # R2b: no difficulty filter — compare across all APPS levels
+    test = dataset["test"]
     train_dataset = train.map(format_example)
     test_dataset = test.map(format_example)
     # Remove examples with no tests
     train_dataset = train_dataset.filter(lambda x: len(x["test_list"]) > 0)
     test_dataset = test_dataset.filter(lambda x: len(x["test_list"]) > 0)
-    print(f"APPS (introductory) — Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    print(f"APPS (all levels) — Train: {len(train_dataset)}, Test: {len(test_dataset)}")
+    return train_dataset, test_dataset
+
+
+def load_mbppplus():
+    """MBPP+ (evalplus/mbppplus): 378 problems with EvalPlus's augmented tests (stronger reward signal
+    than vanilla MBPP). Used as a training source; 1024 completion length is ample (MBPP code ~250 tok)."""
+    ds = load_dataset("evalplus/mbppplus")["test"].filter(lambda x: len(x.get("test_list", [])) > 0)
+
+    def format_example(example):
+        nl = example["prompt"]
+        example["prompt"] = [{"role": "system", "content": SYSTEM_PROMPT},
+                             {"role": "user", "content": nl}]
+        return example
+
+    full = ds.map(format_example)
+    n = len(full); ntr = int(n * 0.85)
+    train_dataset, test_dataset = full.select(range(ntr)), full.select(range(ntr, n))
+    print(f"MBPP+ — Train: {len(train_dataset)}, Test: {len(test_dataset)}")
     return train_dataset, test_dataset
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+class VirtualRolloutGRPOTrainer(GRPOTrainer):
+    """GRPOTrainer + virtual-rollout advantage shaping (R2c; necessary complement to MBE velocity).
+    No-op when virtual_rollout_mode is None. Ported from grpo_gsm8k/grpo_math (src/arsenal)."""
+    def _calculate_rewards(self, *args, **kwargs):
+        rpf = super()._calculate_rewards(*args, **kwargs)
+        self._last_rewards_per_func = rpf
+        return rpf
+
+    def _local_rewards_per_func(self, out):
+        rpf = getattr(self, "_last_rewards_per_func", None)
+        adv = out.get("advantages")
+        if rpf is None or adv is None:
+            return None
+        Bp = adv.shape[0]
+        lo = self.accelerator.process_index * Bp
+        return rpf[lo:lo + Bp]
+
+    def _virtual_rollout_advantages(self, out, local):
+        from src.arsenal import virtual_rollout_advantages
+        adv = out.get("advantages")
+        names = self.reward_func_names
+        rewards = local.sum(dim=1)
+        if "correctness_reward" in names:
+            corrects = (local[:, names.index("correctness_reward")] == 1.0)
+        else:
+            corrects = torch.zeros_like(rewards, dtype=torch.bool)
+        return virtual_rollout_advantages(
+            rewards, corrects, self.num_generations,
+            max_reward=getattr(self, "virtual_max_reward", 1.2),
+            mode=self.virtual_rollout_mode).to(adv)
+
+    def _generate_and_score_completions(self, inputs):
+        out = super()._generate_and_score_completions(inputs)
+        if getattr(self, "virtual_rollout_mode", None) and self.model.training:
+            local = self._local_rewards_per_func(out)
+            if local is not None and out.get("advantages") is not None:
+                out["advantages"] = self._virtual_rollout_advantages(out, local)
+        return out
+
+
 def main():
     parser = argparse.ArgumentParser(description="GRPO on code generation")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--dataset", type=str, default="mbpp",
-                        choices=["mbpp", "apps"])
+                        choices=["mbpp", "mbppplus", "apps"])
     parser.add_argument("--output_dir", type=str, default="grpo_code_output")
     parser.add_argument("--num_generations", type=int, default=8)
     parser.add_argument("--max_completion_length", type=int, default=1024)
@@ -246,11 +304,17 @@ def main():
                         help="Run eval every N steps (0 to disable)")
     parser.add_argument("--eval_samples", type=int, default=None,
                         help="Subsample N test examples (default: full test set)")
-    # MBE reward
-    parser.add_argument("--mbe_reward", action="store_true")
-    parser.add_argument("--gated_mbe_reward", action="store_true")
-    parser.add_argument("--mbe_scale", type=float, default=40.0)
-    parser.add_argument("--mbe_clip", type=float, default=2.0)
+    # R2c: base MBE reward removed; MBE velocity reward + virtual-max rollout (like grpo_math).
+    parser.add_argument("--mbe_velocity_reward", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--mbe_velocity_scale", type=float, default=5.0)
+    parser.add_argument("--mbe_velocity_clip", type=float, default=1.0)
+    parser.add_argument("--mbe_velocity_stride", type=int, default=8)
+    parser.add_argument("--mbe_velocity_layers", type=str, default="-1")
+    parser.add_argument("--mbe_velocity_mode", type=str, default="trajectory", choices=["trajectory", "rollercoaster"])
+    parser.add_argument("--virtual_rollout", type=str, default="none",
+                        choices=["none", "insert_max", "insert_min", "insert_max_min",
+                                 "insert_max_all_incorrect", "insert_max_mixed"])
+    parser.add_argument("--virtual_max_reward", type=float, default=1.2)
     # LoRA
     parser.add_argument("--use_lora", action="store_true")
     parser.add_argument("--lora_r", type=int, default=16)
@@ -261,6 +325,8 @@ def main():
     # Load dataset
     if args.dataset == "mbpp":
         train_dataset, test_dataset = load_mbpp()
+    elif args.dataset == "mbppplus":
+        train_dataset, test_dataset = load_mbppplus()
     else:
         train_dataset, test_dataset = load_apps()
 
@@ -325,21 +391,17 @@ def main():
         model = args.model
 
     # Rewards
-    reward_funcs = [correctness_reward, format_reward, syntax_reward]
-    mbe_reward_obj = None
-
-    if args.mbe_reward or args.gated_mbe_reward:
-        from src.mbe_reward import MBEReward, CorrectnessGatedMBEReward
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        if args.gated_mbe_reward:
-            mbe_reward_obj = CorrectnessGatedMBEReward(
-                tokenizer, scale=args.mbe_scale, clip=args.mbe_clip,
-            )
-        else:
-            mbe_reward_obj = MBEReward(
-                tokenizer, scale=args.mbe_scale, clip=args.mbe_clip,
-            )
-        reward_funcs.append(mbe_reward_obj)
+    reward_funcs = [correctness_reward, format_reward, syntax_reward]   # R2c: base MBE reward removed
+    mbe_velo_reward_obj = None
+    if args.mbe_velocity_reward:
+        from src.mbe_reward import MBEVeloReward
+        velo_layers = [int(x) for x in args.mbe_velocity_layers.split(",") if x.strip()]
+        mbe_velo_reward_obj = MBEVeloReward(
+            AutoTokenizer.from_pretrained(args.model),
+            layers=velo_layers, stride=args.mbe_velocity_stride,
+            scale=args.mbe_velocity_scale, clip=args.mbe_velocity_clip, mode=args.mbe_velocity_mode)
+        reward_funcs.append(mbe_velo_reward_obj)
+        print(f"MBE velocity reward enabled: scale={args.mbe_velocity_scale}, clip=±{args.mbe_velocity_clip}")
 
     # Eval
     eval_dataset = None
@@ -349,7 +411,7 @@ def main():
             eval_dataset = test_dataset.select(range(min(args.eval_samples, len(test_dataset))))
         print(f"Eval: {len(eval_dataset)} samples every {args.eval_steps} steps")
 
-    trainer = GRPOTrainer(
+    trainer = VirtualRolloutGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=config,
@@ -357,9 +419,12 @@ def main():
         eval_dataset=eval_dataset,
         peft_config=peft_config,
     )
-
-    if mbe_reward_obj is not None:
-        mbe_reward_obj.set_model(trainer.model)
+    trainer.virtual_rollout_mode = None if args.virtual_rollout == "none" else args.virtual_rollout
+    trainer.virtual_max_reward = args.virtual_max_reward
+    if trainer.virtual_rollout_mode:
+        print(f"Virtual-rollout advantage shaping: mode={trainer.virtual_rollout_mode}, max_reward={trainer.virtual_max_reward}")
+    if mbe_velo_reward_obj is not None:
+        mbe_velo_reward_obj.set_model(trainer.model)
 
     trainer.train()
     trainer.save_model(args.output_dir)
