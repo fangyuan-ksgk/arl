@@ -12,23 +12,25 @@
 # Common:   lr=2e-5, K=4 seeds, MATH datasets eval full test; APPS eval = HumanEval+ (proxy).
 #           6 GPUs => server mode runs K=4 branches in 2 waves (3 slots of 2 GPUs).
 #
-# Per (model, dataset) grid (4 runs):
-#   r1  plain Dr.GRPO            one-shot, ONE EPOCH  (--total_steps -1, --period 1)   [lottery gap]
-#   r2  Dr.GRPO + MBE-velo+vmax  one-shot, ONE EPOCH  (+ --mbe_velocity_reward --virtual_rollout insert_max)
-#   r3  plain Dr.GRPO            P=1,  T=128                                            [delayed-sync sweep]
-#   r4  plain Dr.GRPO            P=32, T=128
+# Per (model, dataset) grid (4 runs) — ALL train the SAME T steps, differing only in sync period P:
+#   r1  plain Dr.GRPO            one-shot  (P=T, single merge)   [lottery gap + soup]
+#   r2  Dr.GRPO + MBE-velo+vmax  one-shot  (P=T)                 (+ --mbe_velocity_reward --virtual_rollout insert_max)
+#   r3  plain Dr.GRPO            P=1   (fully synchronized)      [delayed-sync sweep]
+#   r4  plain Dr.GRPO            P=32  (delayed sync)
 #
 # MATH  -> LoRA r512   (4B/8B full-FT is too heavy);  APPS -> FULL fine-tuning.
 #
 #   bash script/run_big_validation.sh [GPUS] [SWEEP_T]
-#   e.g. bash script/run_big_validation.sh 0,1,2,3,4,5 128
+#   e.g. bash script/run_big_validation.sh 0,1,2,3,4,5 300   # all cells train 300 steps
 # ============================================================================
 set -uo pipefail
 SD="$(cd "$(dirname "$0")" && pwd)"
 export HF_HUB_ENABLE_HF_TRANSFER=1 TOKENIZERS_PARALLELISM=false VLLM_LOGGING_LEVEL=WARNING
 
 GPUS="${1:-0,1,2,3,4,5}"      # 6 GPUs -> 3 server-mode slots (2 GPUs/branch), K=4 in 2 waves
-SWEEP_T="${2:-128}"          # bounded step budget for the P=1 / P=32 delayed-sync sweep
+SWEEP_T="${2:-300}"          # shared step budget T for ALL cells (one-shot P=T, P=1, P=32).
+                            #   one-shot/P=1/P=32 train the SAME T steps -> directly comparable,
+                            #   differing only in sync frequency.
 SEEDS="0,1,2,3"              # K=4 branches
 LR="2e-5"
 NUMGEN=4
@@ -71,21 +73,21 @@ run_cell () {
 
 for task in "${DATASETS[@]}"; do
     for model in "${MODELS[@]}"; do
-        # r1: plain Dr.GRPO, one-shot full epoch  (lottery gap + soup)
-        run_cell "$task" "$model" "plain_oneshot_epoch" \
-            --period 1 --total_steps -1
+        # r1: plain Dr.GRPO, one-shot = P=T (single merge round of T steps)  [lottery gap + soup]
+        run_cell "$task" "$model" "plain_oneshot_T${SWEEP_T}" \
+            --period "$SWEEP_T" --total_steps "$SWEEP_T"
 
-        # r2: + MBE velocity reward + virtual max rollout, one-shot full epoch
-        run_cell "$task" "$model" "mbevelo_vmax_oneshot_epoch" \
-            --period 1 --total_steps -1 \
+        # r2: + MBE velocity reward + virtual max rollout, one-shot = P=T
+        run_cell "$task" "$model" "mbevelo_vmax_oneshot_T${SWEEP_T}" \
+            --period "$SWEEP_T" --total_steps "$SWEEP_T" \
             --mbe_velocity_reward --mbe_velocity_scale 5.0 --mbe_velocity_clip 1.0 \
             --virtual_rollout insert_max --virtual_max_reward 1.2
 
-        # r3: plain Dr.GRPO, P=1 (fully synchronized), bounded T
+        # r3: plain Dr.GRPO, P=1 (fully synchronized), same T
         run_cell "$task" "$model" "plain_P1_T${SWEEP_T}" \
             --period 1 --total_steps "$SWEEP_T"
 
-        # r4: plain Dr.GRPO, P=32 (delayed sync), bounded T
+        # r4: plain Dr.GRPO, P=32 (delayed sync), same T
         run_cell "$task" "$model" "plain_P32_T${SWEEP_T}" \
             --period 32 --total_steps "$SWEEP_T"
     done
