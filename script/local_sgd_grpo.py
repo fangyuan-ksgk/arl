@@ -41,7 +41,11 @@ TASKS = {
     "mbpp":  {"script": os.path.join(HERE, "grpo_code.py"), "eval": os.path.join(HERE, "eval_code.py"),
               "family": "code", "maxlen": 1024, "eval_tok": 1024,
               "metric": "pass@1", "majority": False, "eval_flags": ["--bench", "humanevalplus", "--no-think"],
-              "train_extra": ["--dataset", "mbppplus"], "branch_flags": []},
+              "train_extra": ["--dataset", "mbpp"], "branch_flags": []},
+    "apps":  {"script": os.path.join(HERE, "grpo_code.py"), "eval": os.path.join(HERE, "eval_code.py"),
+              "family": "code", "maxlen": 1024, "eval_tok": 1024,
+              "metric": "pass@1", "majority": False, "eval_flags": ["--bench", "humanevalplus", "--no-think"],
+              "train_extra": ["--dataset", "apps"], "branch_flags": []},
     "geo8k": {"script": os.path.join(HERE, "grpo_geometry.py"), "eval": os.path.join(HERE, "eval_geometry.py"),
               "family": "vlm", "maxlen": 1024, "eval_tok": 1024,
               "metric": "acc", "majority": False, "eval_flags": [], "train_extra": ["--no_geoqa"],
@@ -119,11 +123,16 @@ def _launch_vllm_server(gpu, model, port, a, out_dir):
 
 
 def build_train_cmd(tc, a, init_model, out_dir, steps, seed, vllm_flags, reward_flags):
-    """Per-family train command (the inner GRPO scripts have divergent CLIs — R1g)."""
+    """Per-family train command (the inner GRPO scripts have divergent CLIs — R1g).
+
+    steps == -1 => EPOCH MODE: train one full epoch (--max_steps -1, num_train_epochs=1); the inner
+    script's final save_model(out_dir) is the branch checkpoint (no checkpoint-<P>). steps > 0 =>
+    fixed-step mode: force a save at step `steps` via --save_steps_list (-> checkpoint-<steps>)."""
     py = sys.executable
+    epoch = steps < 0
     lora = ["--use_lora", "--lora_r", str(a.lora_r)] if a.use_lora else []
     base = [py, tc["script"], "--model", init_model, "--output_dir", out_dir,
-            "--max_steps", str(steps), "--num_generations", str(a.num_generations),
+            "--max_steps", ("-1" if epoch else str(steps)), "--num_generations", str(a.num_generations),
             "--max_completion_length", str(a.maxlen), "--learning_rate", str(a.learning_rate)]
     if tc["family"] == "vlm":   # grpo_geometry: --grad_accum, always-LoRA, native-vLLM qwen3_5 (vLLM 0.24)
         return base + ["--grad_accum", str(a.grad_accum), "--lora_r", str(a.lora_r),
@@ -132,12 +141,13 @@ def build_train_cmd(tc, a, init_model, out_dir, steps, seed, vllm_flags, reward_
     cmd = base + ["--per_device_train_batch_size", str(a.num_generations),
                   "--gradient_accumulation_steps", str(a.grad_accum),
                   "--gradient_checkpointing", "--eval_steps", "0"] + lora + vllm_flags + reward_flags
-    if tc["family"] == "text":  # grpo_gsm8k / grpo_math: full Dr.GRPO recipe + masking + save-at-step
-        cmd += ["--lr_scheduler_type", a.lr_scheduler, "--warmup_steps", str(a.warmup),
-                "--loss_type", a.loss_type, "--scale_rewards", a.scale_rewards, "--logging_steps", "5",
-                "--save_strategy", "steps", "--save_steps_list", str(steps), "--seed", str(seed),
-                "--report_to", "none"] + (["--mask_truncated_completions"] if a.mask_truncated else [])
-    # family == "code" (grpo_code): subset CLI; reward_flags (velocity/virtual) already appended above
+    # checkpoint-saving: fixed-step => force a save at step `steps`; epoch => rely on final save_model(out_dir).
+    save_flags = [] if epoch else ["--save_strategy", "steps", "--save_steps_list", str(steps)]
+    # text (grpo_gsm8k/grpo_math) and code (grpo_code) both now accept the full Dr.GRPO recipe.
+    cmd += ["--lr_scheduler_type", a.lr_scheduler, "--warmup_steps", str(a.warmup),
+            "--loss_type", a.loss_type, "--scale_rewards", a.scale_rewards, "--logging_steps", "5",
+            "--seed", str(seed), "--report_to", "none"] + save_flags \
+        + (["--mask_truncated_completions"] if a.mask_truncated else [])
     return cmd + tc["train_extra"] + tc["branch_flags"]
 
 
