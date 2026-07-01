@@ -29,6 +29,8 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
 
+from src.iso import iso_loss
+
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
@@ -306,6 +308,33 @@ class FastEvalGRPOTrainer(GRPOTrainer):
                 out["advantages"] = self._virtual_rollout_advantages(out, local)
         return out
 
+    # ------------------------------------------------------------------
+    # Auxiliary iso_loss (VICReg-style isotropy on hidden states, src/iso.py).
+    # When lambda_iso != 0 we add lambda_iso * iso_loss(hidden) to the GRPO
+    # loss. iso_loss is computed on the last-layer hidden states of the
+    # prompt+completion sequence (padding masked out) via one extra forward.
+    # ------------------------------------------------------------------
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        loss = super().compute_loss(
+            model, inputs, return_outputs=return_outputs,
+            num_items_in_batch=num_items_in_batch,
+        )
+        lam = getattr(self, "lambda_iso", 0.0)
+        if lam:
+            input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
+            attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
+            hidden = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            ).hidden_states[-1]
+            rep = hidden[attention_mask.bool()]
+            iso = iso_loss(rep)
+            loss = loss + lam * iso
+            mode = "train" if self.model.training else "eval"
+            self._metrics[mode]["iso_loss"].append(float(iso.detach()))
+        return loss
+
 
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops.
@@ -396,6 +425,10 @@ def main():
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
+    parser.add_argument("--lambda_iso", type=float, default=0.0,
+                        help="Weight for auxiliary iso_loss (VICReg-style isotropy on "
+                             "last-layer hidden states, src/iso.py). 0 = disabled; "
+                             "~0.10 worked best in prior experiments.")
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--use_vllm", action="store_true", default=True)
     parser.add_argument("--no_vllm", action="store_true")
@@ -932,6 +965,11 @@ def main():
     )
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger
+
+    # Auxiliary iso_loss weight (0 = disabled). Read in compute_loss.
+    trainer.lambda_iso = args.lambda_iso
+    if args.lambda_iso:
+        print(f"iso_loss enabled: lambda_iso={args.lambda_iso}")
 
     # Virtual-rollout advantage shaping (None = TRL default advantages).
     trainer.virtual_rollout_mode = (None if args.virtual_rollout == "none"

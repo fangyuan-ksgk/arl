@@ -1,5 +1,5 @@
 import torch
-
+# [Request 1]. Add this 
 def iso_loss(rep: torch.Tensor) -> torch.Tensor:
     """VICReg-style isotropy on a representation.
 

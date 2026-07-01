@@ -56,6 +56,10 @@ MAX_STEPS=300
 EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
 EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 
+# Auxiliary iso_loss weight (src/iso.py). 0 = disabled. Override per-run via
+# `LAMBDA_ISO=0.1 bash script/run_gsm8k_multiseed.sh`, or set per-cell below.
+LAMBDA_ISO="${LAMBDA_ISO:-0.0}"
+
 # Seeds for the multi-seed run. Each seed reshuffles the TRAINING data ordering
 # (passed as --seed); the eval set is sampled sequentially so validation data is
 # identical across seeds. SEED is set per-iteration by the driver loop.
@@ -269,6 +273,7 @@ run_experiment() {
         --report_to none \
         --eval_steps ${EVAL_EVERY} \
         --eval_samples ${EVAL_SAMPLES} \
+        --lambda_iso ${LAMBDA_ISO} \
         ${velo_args} \
         2>&1 | tee "${train_log}"
     local end_time=$(date +%s)
@@ -354,6 +359,10 @@ for SEED in "${SEEDS[@]}"; do
 
     # 2) InvLogLength-short, w=10 (scale 0.1): reward 1/log(T) positive → short CoT.
     # run_cell "invlog_short_w10_seed${SEED}"  invlog         0.1
+
+    # 3) iso_loss ablation, lambda_iso=0.1 (VICReg-style isotropy on hidden states).
+    #    LAMBDA_ISO is read inside run_experiment; set it just for this cell.
+    LAMBDA_ISO=0.1 run_cell "iso_w0.1_seed${SEED}"  trajectory  off
 done
 
 # =============================================
