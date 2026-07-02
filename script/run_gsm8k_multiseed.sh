@@ -1,6 +1,15 @@
 #!/bin/bash
-# Sweep reward shaping designs for Qwen3-1.7B on GSM8K.
-# Layout: GPU 0 = vLLM server, GPU 1 = training (--vllm_mode server).
+# Sweep reward shaping designs for Qwen3 on GSM8K.
+#
+# Layout (LAYOUT=colocate, default since 2026-07-02):
+#   Both GPUs run training (accelerate DDP) AND generation (one vLLM engine
+#   per rank, data-parallel, sleep mode). Benchmarked 6.3 s/optimizer-step vs
+#   20.9 s for the old split layout — 3.3x. Breakdown & comparison vs skyRL:
+#   output/bench_profile/. Same GRPO semantics (8 prompts x 8 gens / step).
+#
+# Layout (LAYOUT=server, legacy fallback):
+#   GPU 0 = vLLM server, GPU 1 = training (--vllm_mode server). ~9.6 s/step
+#   after the 2026-07-02 fixes (CUDA graphs on, bs16 micro-batches).
 #
 # Variants supported by run_experiment's mode switch:
 #   "trajectory"  / "rollercoaster"  — MBE velocity (hidden-state geometry).
@@ -33,35 +42,56 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 export PYTHONPATH="${PROJECT_DIR}:${PYTHONPATH:-}"
-BASE_OUTPUT="${PROJECT_DIR}/output/sweep_mbe_velocity"
+# Colocate mode interleaves vLLM's big allocations with training's fp32-logits
+# peaks in one process; expandable segments prevents fragmentation OOMs after
+# large eval generation batches (observed 2026-07-02).
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+BASE_OUTPUT="${BASE_OUTPUT:-${PROJECT_DIR}/output/sweep_mbe_velocity}"
 TIMESTAMP=$(date +%Y%m%d_%H%M)
 
 MODEL="Qwen/Qwen3-0.6B"
 MODEL_TAG="0.6b"
 
-# GPU layout & vLLM server
+# Layout: "colocate" (default; both GPUs train+generate, 3.3x faster) or
+# "server" (legacy; GPU0 = vLLM server, GPU1 = training).
+LAYOUT="${LAYOUT:-colocate}"
+N_PROC=2                        # colocate: accelerate DDP world size
+
+# GPU layout & vLLM server (LAYOUT=server only)
 VLLM_GPU=0
 TRAIN_GPU=1
 VLLM_HOST="0.0.0.0"
 VLLM_PORT=8950
-VLLM_STARTUP_TIMEOUT=300        # seconds; cold start of 1.7B + KV alloc
+VLLM_STARTUP_TIMEOUT=300        # seconds; cold start + CUDA-graph capture
 VLLM_LOG_DIR="${PROJECT_DIR}/output/sweep_mbe_velocity/vllm_logs"
 
 # Training config
 MAX_TOKENS=1024
 LR=5e-6
 NUM_GEN=8
-GRAD_ACCUM=8
-MAX_STEPS=300
-EVAL_SAMPLES=1319           # full GSM8K test set (1319 questions × NUM_GEN rollouts)
-EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
-
-# Auxiliary iso_loss weight (src/iso.py). 0 = disabled. Override per-run via
-# `LAMBDA_ISO=0.1 bash script/run_gsm8k_multiseed.sh`, or set per-cell below.
-LAMBDA_ISO="${LAMBDA_ISO:-0.0}"
+# Micro-batching (2026-07-02 profile): keep the optimizer batch at 64
+# completions (8 unique prompts x NUM_GEN). Micro-bs is bounded by fp32
+# logits-scale buffers (bs x ~1.1k tok x 151k vocab x 4B, and TRL/torch keep
+# several alive across the loss+backward): bs16 peaks ~60 GB per rank and
+# OOMs colocate whenever eval residue or resident KV eats the margin; bs8
+# peaks ~30 GB and is safe. Server mode (vLLM on the other GPU) can afford
+# bs16. colocate: 8 x 4 accum x 2 ranks = 64; server: 16 x 4 = 64.
+if [ "${LAYOUT}" = "colocate" ]; then MICRO_BS=8; GRAD_ACCUM=4; else MICRO_BS=16; GRAD_ACCUM=4; fi
+MAX_STEPS="${MAX_STEPS:-300}"
+EVAL_SAMPLES="${EVAL_SAMPLES:-1319}"  # full GSM8K test set (× NUM_GEN rollouts)
+EVAL_EVERY="${EVAL_EVERY:-100}"       # log eval every N steps
+# per_device_eval_batch_size. The trainer's eval prediction_step is generation-
+# only (no forward pass), so this just controls how many prompts we hand the
+# vLLM server per call. Small batches (the old NUM_GEN*16=128 default = 16 unique
+# prompts) starve vLLM's continuous batching and make the full-test eval take
+# ~30 min. A big batch lets vLLM saturate → full eval in ~5 min. vLLM admission-
+# controls the KV cache, so an oversized batch queues rather than OOMs. Must be a
+# multiple of NUM_GEN. Here: 512 unique prompts/call → whole test set in ~3 calls.
+EVAL_BATCH=$(( NUM_GEN * 512 ))
 
 # RepAnchor anti-forgetting penalty weight (src/repanchor.py). 0 = disabled.
-# Override per-run via `LAMBDA_REPANCHOR=10 bash ...`, or set per-cell below.
+# Override per-run via `LAMBDA_REPANCHOR=10 bash script/run_gsm8k_multiseed_fix.sh`,
+# or set per-cell below.
 LAMBDA_REPANCHOR="${LAMBDA_REPANCHOR:-0.0}"
 
 # Seeds for the multi-seed run. Each seed reshuffles the TRAINING data ordering
@@ -88,9 +118,12 @@ mkdir -p "${BASE_OUTPUT}" "${VLLM_LOG_DIR}"
 # Pattern adapted from script/run_game24_sweep.sh:
 #   - setsid    : isolates server + EngineCore in a fresh process group so
 #                 we can SIGKILL the whole group on shutdown.
-#   - --enforce-eager: skip torch.compile + CUDA-graph capture. Trades ~15%
-#                 decode throughput for instant, reliable startup across cold
-#                 caches — well worth it for a multi-run sweep.
+#   - NO --enforce-eager (2026-07-02): for a 0.6B model decode is kernel-launch
+#                 bound, so CUDA graphs are a 3.2x generation speedup (15.4s ->
+#                 4.8s per 64-rollout batch), not the ~15% claude.md estimated
+#                 on bigger models. Graph capture adds ~40s to startup, paid
+#                 once per run. If a cold-cache host wedges during capture
+#                 (EngineCore pegs CPU, never allocates), re-add --enforce-eager.
 #   - stop is a three-stage nuke because EngineCore is stubborn:
 #       (1) pkill -f vllm                  — catches the launcher
 #       (2) ps | grep VLLM::EngineCore     — catches workers (16-char comm,
@@ -107,7 +140,6 @@ start_vllm_server() {
         setsid trl vllm-serve \
             --model "${MODEL}" \
             --host "${VLLM_HOST}" --port "${VLLM_PORT}" \
-            --enforce-eager \
             > "${log_file}" 2>&1 &
     VLLM_PID=$!
     echo ">>> [vllm] pid=${VLLM_PID} (pgid=${VLLM_PID})  log=${log_file}"
@@ -257,17 +289,30 @@ run_experiment() {
             --mbe_velocity_layers ${VELO_LAYERS}"
     fi
 
+    # Launcher + vLLM wiring per layout. Colocate runs one vLLM engine inside
+    # each of the two DDP ranks; server talks to the external `trl vllm-serve`
+    # started by run_cell.
+    local launch vllm_args
+    if [ "${LAYOUT}" = "colocate" ]; then
+        launch="accelerate launch --num_processes ${N_PROC} --mixed_precision bf16 ${SCRIPT_DIR}/grpo_gsm8k.py"
+        vllm_args="--use_vllm --vllm_mode colocate \
+            --vllm_gpu_memory_utilization 0.25"
+    else
+        launch="env CUDA_VISIBLE_DEVICES=${TRAIN_GPU} python ${SCRIPT_DIR}/grpo_gsm8k.py"
+        vllm_args="--use_vllm --vllm_mode server \
+            --vllm_server_host ${VLLM_HOST} --vllm_server_port ${VLLM_PORT} \
+            --train_device 0"
+    fi
+
     local start_time=$(date +%s)
-    CUDA_VISIBLE_DEVICES="${TRAIN_GPU}" python "${SCRIPT_DIR}/grpo_gsm8k.py" \
+    ${launch} \
         --model ${MODEL} \
         --output_dir "${run_dir}" \
         --max_steps ${MAX_STEPS} \
-        --use_vllm --vllm_mode server \
-        --vllm_server_host "${VLLM_HOST}" --vllm_server_port "${VLLM_PORT}" \
-        --train_device 0 \
+        ${vllm_args} \
         --num_generations ${NUM_GEN} \
         --max_completion_length ${MAX_TOKENS} \
-        --per_device_train_batch_size ${NUM_GEN} \
+        --per_device_train_batch_size ${MICRO_BS} \
         --gradient_accumulation_steps ${GRAD_ACCUM} \
         --learning_rate ${LR} \
         --logging_steps 10 \
@@ -277,7 +322,7 @@ run_experiment() {
         --report_to none \
         --eval_steps ${EVAL_EVERY} \
         --eval_samples ${EVAL_SAMPLES} \
-        --lambda_iso ${LAMBDA_ISO} \
+        --eval_batch_size ${EVAL_BATCH} \
         --lambda_repanchor ${LAMBDA_REPANCHOR} \
         ${velo_args} \
         2>&1 | tee "${train_log}"
@@ -304,7 +349,7 @@ SUMMARY_FILE="${BASE_OUTPUT}/summary_${TIMESTAMP}.txt"
 cat > "${SUMMARY_FILE}" <<EOF
 MBE Velocity Reward Sweep — ${MODEL}
 Started: $(date)
-Config: tok=${MAX_TOKENS}, lr=${LR}, gen=${NUM_GEN}, grad_accum=${GRAD_ACCUM}, steps=${MAX_STEPS}
+Config: layout=${LAYOUT}, tok=${MAX_TOKENS}, lr=${LR}, gen=${NUM_GEN}, micro_bs=${MICRO_BS}, grad_accum=${GRAD_ACCUM}, steps=${MAX_STEPS}
         eval_every=${EVAL_EVERY}, eval_samples=${EVAL_SAMPLES}
         velocity: stride=${VELO_STRIDE}, layers=${VELO_LAYERS}, clip=${VELO_CLIP}
 Weight w → scale = ±1/w; with clip=1.0, |reward| ≤ w (sign of scale flips reward).
@@ -328,10 +373,16 @@ run_cell() {
     local norm_mode=${5:-log_total}
     local vllm_log="${VLLM_LOG_DIR}/${name}.log"
 
-    if ! start_vllm_server "${vllm_log}"; then
-        echo ">>> [${name}] ✗ vLLM failed to start; skipping"
-        FAILED_RUNS="${FAILED_RUNS} ${name}:vllm"
-        return
+    if [ "${LAYOUT}" = "server" ]; then
+        if ! start_vllm_server "${vllm_log}"; then
+            echo ">>> [${name}] ✗ vLLM failed to start; skipping"
+            FAILED_RUNS="${FAILED_RUNS} ${name}:vllm"
+            return
+        fi
+    else
+        # Colocate: engines live inside the training processes; just make sure
+        # nothing stale is pinning VRAM from a previous (possibly crashed) run.
+        stop_vllm_server
     fi
 
     if ! run_experiment "${name}" "${mode}" "${scale}" "${clip}" "${norm_mode}"; then
@@ -339,7 +390,7 @@ run_cell() {
         FAILED_RUNS="${FAILED_RUNS} ${name}:train"
     fi
 
-    stop_vllm_server
+    if [ "${LAYOUT}" = "server" ]; then stop_vllm_server; fi
 }
 
 # =============================================
@@ -353,26 +404,34 @@ run_cell() {
 #
 # Output dirs are per-seed: <name>_seed<S> so runs never collide.
 # =============================================
-for SEED in "${SEEDS[@]}"; do
+# --- Requested layout (2026-07-01) ------------------------------------------
+#   * Baseline GRPO         : 1 seed  (BASELINE_SEED)
+#   * GRPO + RepAnchor      : 4 seeds (REPANCHOR_SEEDS), lambda_repanchor=10
+# Output dirs are per-seed (<name>_seed<S>) so runs never collide.
+# ---------------------------------------------------------------------------
+BASELINE_SEED=0
+REPANCHOR_SEEDS=(0 1 2 3)
+
+# 1) Baseline GRPO (no MBE velocity reward, no RepAnchor) — single seed.
+echo ""
+echo "############################################################"
+echo "# BASELINE GRPO — seed ${BASELINE_SEED}"
+echo "############################################################"
+SEED=${BASELINE_SEED}
+run_cell "baseline_grpo_seed${SEED}"     trajectory     off
+
+# 2) GRPO + RepAnchor ablation, lambda_repanchor=10 (representation-space
+#    anti-forgetting penalty; full fine-tuning only). LAMBDA_REPANCHOR is read
+#    inside run_experiment; set it just for this cell.
+for SEED in "${REPANCHOR_SEEDS[@]}"; do
     echo ""
     echo "############################################################"
-    echo "# SEED ${SEED}"
+    echo "# GRPO + REPANCHOR (lambda_repanchor=10) — seed ${SEED}"
     echo "############################################################"
-
-    # 1) Baseline GRPO (no MBE velocity reward).
-    run_cell "baseline_grpo_seed${SEED}"     trajectory     off
-
-    # 2) InvLogLength-short, w=10 (scale 0.1): reward 1/log(T) positive → short CoT.
-    # run_cell "invlog_short_w10_seed${SEED}"  invlog         0.1
-
-    # 3) iso_loss ablation, lambda_iso=0.1 (VICReg-style isotropy on hidden states).
-    #    LAMBDA_ISO is read inside run_experiment; set it just for this cell.
-    LAMBDA_ISO=0.1 run_cell "iso_w0.1_seed${SEED}"  trajectory  off
-
-    # 4) RepAnchor ablation, lambda_repanchor=10 (anti-forgetting penalty).
-    #    Full fine-tuning only (no effect under LoRA). Set just for this cell.
-    # LAMBDA_REPANCHOR=10 run_cell "repanchor_w10_seed${SEED}"  trajectory  off
+    LAMBDA_REPANCHOR=10 run_cell "repanchor_w10_seed${SEED}"  trajectory  off
 done
+
+# MBE velocity run
 
 # =============================================
 # Final summary

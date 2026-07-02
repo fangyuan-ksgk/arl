@@ -329,6 +329,15 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         return loss
 
 
+def _mem_debug(tag):
+    if os.environ.get("GRPO_MEM_DEBUG") and torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / 2**30
+        r = torch.cuda.memory_reserved() / 2**30
+        f, t = torch.cuda.mem_get_info()
+        print(f"[mem:{tag}] alloc={a:.1f}G reserved={r:.1f}G "
+              f"free={(f)/2**30:.1f}G/{t/2**30:.1f}G", flush=True)
+
+
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops.
 
@@ -343,13 +352,21 @@ class EvalFlagCallback(TrainerCallback):
     def on_prediction_step(self, args, state, control, **kw):
         self.logger.in_eval     = True
         self.logger.global_step = state.global_step
+        _mem_debug("prediction_step")
 
     def on_step_begin(self, args, state, control, **kw):
         self.logger.in_eval     = False
         self.logger.global_step = state.global_step
+        _mem_debug("step_begin")
 
     def on_evaluate(self, args, state, control, **kw):
         self.logger.in_eval = False
+        # Big eval generation batches fragment the allocator badly enough that
+        # the next training backward (fp32-logits grad, ~9 GB for micro-bs 16)
+        # can OOM in colocate mode. Release the cache between phases.
+        _mem_debug("on_evaluate/pre_empty")
+        torch.cuda.empty_cache()
+        _mem_debug("on_evaluate/post_empty")
 
 
 class SaveAtStepsCallback(TrainerCallback):
@@ -456,7 +473,7 @@ class RepAnchorCallback(TrainerCallback):
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
-def load_gsm8k():
+def load_gsm8k(prompt_prefix: str = ""):
     dataset = load_dataset("openai/gsm8k", "main")
 
     def extract_gold_answer(answer_text: str) -> str:
@@ -478,7 +495,7 @@ def load_gsm8k():
 
     def format_example(example):
         user_content = (
-            f"{example['question']}\n\n{answer_format_instruction} /think"
+            f"{prompt_prefix}{example['question']}\n\n{answer_format_instruction} /think"
         )
         example["prompt"] = [{"role": "user", "content": user_content}]
         example["gold_answer"] = extract_gold_answer(example["answer"])
@@ -502,6 +519,12 @@ def main():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
+    parser.add_argument("--loss_type", type=str, default=None,
+                        help="TRL GRPO loss variant (e.g. 'dapo' [TRL default], "
+                             "'grpo', 'dr_grpo', 'bnpo'). None = TRL default.")
+    parser.add_argument("--scale_rewards", type=str, default=None,
+                        help="TRL scale_rewards ('group', 'batch', 'none'). "
+                             "Dr.GRPO = --loss_type dr_grpo --scale_rewards none.")
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
     # RepAnchor: representation-space anti-forgetting penalty (src/repanchor.py).
     parser.add_argument("--lambda_repanchor", type=float, default=0.0,
@@ -729,12 +752,52 @@ def main():
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
                         help="Use LoRA (PEFT) instead of full fine-tuning.")
+    # Cluster-conditional training (lottery-gap Idea 1): restrict the TRAIN set
+    # to one semantic cluster from script/cluster_gsm8k.py. Eval set untouched.
+    parser.add_argument("--cluster_file", type=str, default=None,
+                        help="clusters_k{K}.json from script/cluster_gsm8k.py")
+    parser.add_argument("--cluster_id", type=int, default=None,
+                        help="Train only on examples whose cluster == this id.")
+    # Neologism / soft-prompt training (lottery-gap Idea 2). Model dir must be
+    # produced by script/prep_skill_model.py (adds the skill tokens).
+    parser.add_argument("--prompt_prefix", type=str, default="",
+                        help="String prepended to every question (e.g. the "
+                             "skill-token prefix '<skill_2_0><skill_2_1>...').")
+    parser.add_argument("--train_embeddings_only", action="store_true",
+                        help="Freeze everything except input-embedding rows of "
+                             "ids >= skill_meta.json's min_new_id (soft-prompt "
+                             "training). Requires --model to be a prep_skill_model "
+                             "output dir.")
+    parser.add_argument("--skill_cluster", type=int, default=None,
+                        help="(with --train_embeddings_only) restrict trainable "
+                             "rows to THIS cluster's skill tokens (skill_meta "
+                             "skill_token_ids[c]) so each cluster run leaves the "
+                             "other clusters' tokens untouched (tied lm_head "
+                             "would otherwise drift them), and set "
+                             "--prompt_prefix to that cluster's prefix "
+                             "automatically if not given.")
     parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA alpha")
     parser.add_argument("--lora_dropout", type=float, default=0.05)
     args = parser.parse_args()
 
-    train_dataset, test_dataset = load_gsm8k()
+    # skill_cluster implies that cluster's skill prefix unless one is given.
+    if args.skill_cluster is not None and not args.prompt_prefix:
+        _meta = json.loads((Path(args.model) / "skill_meta.json").read_text())
+        args.prompt_prefix = _meta["skill_prefix"][str(args.skill_cluster)]
+
+    train_dataset, test_dataset = load_gsm8k(prompt_prefix=args.prompt_prefix)
+    if args.prompt_prefix:
+        print(f"Prompt prefix active: {args.prompt_prefix[:80]!r}")
+
+    if args.cluster_file and args.cluster_id is not None:
+        labels = json.loads(Path(args.cluster_file).read_text())["train"]
+        assert len(labels) == len(train_dataset), \
+            f"cluster file has {len(labels)} train labels, dataset has {len(train_dataset)}"
+        keep = [i for i, c in enumerate(labels) if c == args.cluster_id]
+        train_dataset = train_dataset.select(keep)
+        print(f"Cluster filter: cluster {args.cluster_id} of {args.cluster_file} "
+              f"-> {len(train_dataset)} train examples")
 
     # Tokenizer needed early if prefix rollout is enabled (for prompt formatting)
     if args.prefix_rollout:
@@ -756,6 +819,11 @@ def main():
         report_to=args.report_to,
         seed=args.seed,
     )
+    if args.loss_type:
+        config_kwargs["loss_type"] = args.loss_type
+    if args.scale_rewards:
+        config_kwargs["scale_rewards"] = (
+            False if args.scale_rewards == "none" else args.scale_rewards)
     if args.save_strategy == "steps":
         config_kwargs["save_steps"] = args.save_steps
     if args.save_total_limit is not None:
@@ -782,8 +850,14 @@ def main():
         # serializes into one tiny call per prompt-group and dispatch overhead
         # dominates (1319 calls × ~7s ≈ 2.7h on full GSM8K). Must satisfy
         # eval_batch % num_generations == 0.
-        config_kwargs["per_device_eval_batch_size"] = (
-            args.eval_batch_size or args.num_generations * 16
+        _n_eval = min(args.eval_samples, len(test_dataset)) if args.eval_samples \
+            else len(test_dataset)
+        # Clamp to the eval set's row count (n_eval * num_generations): TRL's
+        # repeat sampler happily wraps a small eval set to fill a bigger batch,
+        # re-evaluating every prompt num_generations extra times.
+        config_kwargs["per_device_eval_batch_size"] = min(
+            args.eval_batch_size or args.num_generations * 16,
+            _n_eval * args.num_generations,
         )
 
     config = GRPOConfig(**config_kwargs)
@@ -824,6 +898,36 @@ def main():
             )
     else:
         model = args.model  # let TRL handle device placement for colocate/no-vllm
+
+    # Soft-prompt (neologism) regime: only the skill-token embedding rows learn.
+    if args.train_embeddings_only:
+        meta = json.loads((Path(args.model) / "skill_meta.json").read_text())
+        if args.skill_cluster is not None:
+            train_ids = meta["skill_token_ids"][str(args.skill_cluster)]
+        else:
+            train_ids = None
+        if isinstance(model, str):
+            model = AutoModelForCausalLM.from_pretrained(
+                model, torch_dtype=torch.bfloat16)
+        emb = model.get_input_embeddings().weight
+        for p in model.parameters():
+            p.requires_grad_(False)
+        emb.requires_grad_(True)
+
+        if train_ids is not None:
+            row_mask = torch.zeros(emb.shape[0], dtype=torch.bool)
+            row_mask[train_ids] = True
+        else:
+            row_mask = torch.arange(emb.shape[0]) >= meta["min_new_id"]
+
+        def _mask_rows(grad, _keep=row_mask):
+            grad = grad.clone()
+            grad[~_keep.to(grad.device)] = 0
+            return grad
+        emb.register_hook(_mask_rows)
+        print(f"Soft-prompt training: {int(row_mask.sum())} embedding rows "
+              f"trainable (cluster={args.skill_cluster}). "
+              f"(tied lm_head shares the matrix; same mask applies)")
 
     # Rollout recorder: lightweight text-only logger, zero forward-pass overhead.
     # Run script/compute_mbe.py after training to get full MBE/CE traces.
@@ -1036,8 +1140,13 @@ def main():
     # eval log during eval loops via `EvalFlagCallback`.
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    train_rollout_path = out_dir / "rollouts.jsonl"
-    eval_rollout_path  = out_dir / "eval_rollout.jsonl"
+    # Under multi-process (accelerate DDP) each rank logs its own local batch
+    # slice; give each rank its own file so concurrent appends can't interleave
+    # mid-line. Merge with `cat rollouts*.jsonl` (the `step` field orders them).
+    _rank = int(os.environ.get("RANK", "0"))
+    _suffix = f".rank{_rank}" if int(os.environ.get("WORLD_SIZE", "1")) > 1 else ""
+    train_rollout_path = out_dir / f"rollouts{_suffix}.jsonl"
+    eval_rollout_path  = out_dir / f"eval_rollout{_suffix}.jsonl"
     train_rollout_path.write_text("")
     eval_rollout_path.write_text("")
     rollout_logger = GSM8KRolloutLogger(
