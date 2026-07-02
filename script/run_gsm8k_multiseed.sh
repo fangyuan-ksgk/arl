@@ -60,6 +60,10 @@ EVAL_EVERY=100               # log eval (incl. MBE velocity) every N steps
 # `LAMBDA_ISO=0.1 bash script/run_gsm8k_multiseed.sh`, or set per-cell below.
 LAMBDA_ISO="${LAMBDA_ISO:-0.0}"
 
+# RepAnchor anti-forgetting penalty weight (src/repanchor.py). 0 = disabled.
+# Override per-run via `LAMBDA_REPANCHOR=10 bash ...`, or set per-cell below.
+LAMBDA_REPANCHOR="${LAMBDA_REPANCHOR:-0.0}"
+
 # Seeds for the multi-seed run. Each seed reshuffles the TRAINING data ordering
 # (passed as --seed); the eval set is sampled sequentially so validation data is
 # identical across seeds. SEED is set per-iteration by the driver loop.
@@ -274,6 +278,7 @@ run_experiment() {
         --eval_steps ${EVAL_EVERY} \
         --eval_samples ${EVAL_SAMPLES} \
         --lambda_iso ${LAMBDA_ISO} \
+        --lambda_repanchor ${LAMBDA_REPANCHOR} \
         ${velo_args} \
         2>&1 | tee "${train_log}"
     local end_time=$(date +%s)
@@ -363,6 +368,10 @@ for SEED in "${SEEDS[@]}"; do
     # 3) iso_loss ablation, lambda_iso=0.1 (VICReg-style isotropy on hidden states).
     #    LAMBDA_ISO is read inside run_experiment; set it just for this cell.
     LAMBDA_ISO=0.1 run_cell "iso_w0.1_seed${SEED}"  trajectory  off
+
+    # 4) RepAnchor ablation, lambda_repanchor=10 (anti-forgetting penalty).
+    #    Full fine-tuning only (no effect under LoRA). Set just for this cell.
+    # LAMBDA_REPANCHOR=10 run_cell "repanchor_w10_seed${SEED}"  trajectory  off
 done
 
 # =============================================

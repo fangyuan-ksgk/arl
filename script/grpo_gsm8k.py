@@ -29,7 +29,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
 
-from src.iso import iso_loss
+from src.repanchor import RepAnchor
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
@@ -309,30 +309,23 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         return out
 
     # ------------------------------------------------------------------
-    # Auxiliary iso_loss (VICReg-style isotropy on hidden states, src/iso.py).
-    # When lambda_iso != 0 we add lambda_iso * iso_loss(hidden) to the GRPO
-    # loss. iso_loss is computed on the last-layer hidden states of the
-    # prompt+completion sequence (padding masked out) via one extra forward.
+    # Auxiliary losses added on top of the GRPO objective:
+    #   * RepAnchor penalty (src/repanchor.py): representation-space anti-forgetting
+    #     penalty on the current weights vs a pre-training anchor. Weight-only
+    #     (no forward). Present iff self.repanchor is set (see RepAnchorCallback).
     # ------------------------------------------------------------------
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         loss = super().compute_loss(
             model, inputs, return_outputs=return_outputs,
             num_items_in_batch=num_items_in_batch,
         )
-        lam = getattr(self, "lambda_iso", 0.0)
-        if lam:
-            input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
-            attention_mask = torch.cat([inputs["prompt_mask"], inputs["completion_mask"]], dim=1)
-            hidden = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-            ).hidden_states[-1]
-            rep = hidden[attention_mask.bool()]
-            iso = iso_loss(rep)
-            loss = loss + lam * iso
-            mode = "train" if self.model.training else "eval"
-            self._metrics[mode]["iso_loss"].append(float(iso.detach()))
+        mode = "train" if self.model.training else "eval"
+
+        rap = getattr(self, "repanchor", None)
+        if rap is not None:
+            penalty = rap.penalty()          # already scaled by lam=lambda_repanchor
+            loss = loss + penalty.to(loss.dtype)
+            self._metrics[mode]["repanchor_penalty"].append(float(penalty.detach()))
         return loss
 
 
@@ -373,6 +366,91 @@ class SaveAtStepsCallback(TrainerCallback):
         if state.global_step in self.steps:
             control.should_save = True
         return control
+
+
+class RepAnchorCallback(TrainerCallback):
+    """Build a RepAnchor snapshot at train start, then bind it to the trainer.
+
+    Deferred to `on_train_begin` so the model is already prepared and on-device
+    (grpo_gsm8k builds the model as a path string in colocate/no-vllm mode, and
+    accelerate places it on the first step). We anchor on the sequences the
+    policy actually processes during training: each prompt is completed by the
+    *current model's own generation* (mode="generate"), then the prompt+completion
+    sequences snapshot the model's protected input subspaces + importances. The
+    RepAnchor is stashed on `trainer.repanchor` — `FastEvalGRPOTrainer.compute_loss`
+    then adds `repanchor.penalty()` to every training loss.
+    """
+    def __init__(self, trainer, tokenizer, prompts, lam, rank_mult, load,
+                 mode, prompt_max_len, gen_max_new_tokens, gen_temperature,
+                 gen_top_p, gen_batch):
+        self.trainer = trainer
+        self.tokenizer = tokenizer
+        self.prompts = prompts
+        self.lam = lam
+        self.rank_mult = rank_mult
+        self.load = load
+        self.mode = mode
+        self.prompt_max_len = prompt_max_len
+        self.gen_max_new_tokens = gen_max_new_tokens
+        self.gen_temperature = gen_temperature
+        self.gen_top_p = gen_top_p
+        self.gen_batch = gen_batch
+        self._done = False
+
+    def _encode_prompts(self, group, device):
+        enc = self.tokenizer.apply_chat_template(
+            group,
+            add_generation_prompt=True,
+            tokenize=True,
+            padding=True,
+            truncation=True,
+            max_length=self.prompt_max_len,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        return {k: v.to(device) for k, v in enc.items()}
+
+    def on_train_begin(self, args, state, control, **kw):
+        if self._done:
+            return
+        self._done = True
+        model = self.trainer.accelerator.unwrap_model(self.trainer.model)
+        device = next(model.parameters()).device
+        tok = self.tokenizer
+        pad_id = tok.pad_token_id
+
+        # Generate completions with the current policy, in groups. Each group
+        # becomes one anchor micro-batch (prompt + own generation), so we never
+        # have to pad across groups of differing length.
+        was_training = model.training
+        model.eval()
+        tok.padding_side = "left"
+        gen_kwargs = dict(max_new_tokens=self.gen_max_new_tokens, pad_token_id=pad_id)
+        if self.gen_temperature and self.gen_temperature > 0:
+            gen_kwargs.update(do_sample=True, temperature=self.gen_temperature,
+                              top_p=self.gen_top_p)
+        else:
+            gen_kwargs.update(do_sample=False)
+
+        batches, total_tok = [], 0
+        with torch.no_grad():
+            for s in range(0, len(self.prompts), self.gen_batch):
+                group = self.prompts[s:s + self.gen_batch]
+                penc = self._encode_prompts(group, device)
+                seq = model.generate(**penc, **gen_kwargs)      # [b, prompt+gen]
+                attn = (seq != pad_id).long()
+                batches.append({"input_ids": seq, "attention_mask": attn})
+                total_tok += int(attn.sum())
+        model.train(was_training)
+
+        anchor = RepAnchor(model, lam=self.lam, rank_mult=self.rank_mult, load=self.load)
+        anchor.update_anchor(batches)                           # micro-batches, memory-bounded
+        self.trainer.repanchor = anchor
+        print(f"[RepAnchor] anchored {len(anchor.lin)} Linear layers on "
+              f"{len(self.prompts)} self-generated rollouts "
+              f"(~{total_tok} real tokens, gen_max_new={self.gen_max_new_tokens}, "
+              f"temp={self.gen_temperature}); lam={self.lam}, "
+              f"rank_mult={self.rank_mult}, load={self.load}")
 
 
 # ---------------------------------------------------------------------------
@@ -425,10 +503,32 @@ def main():
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--learning_rate", type=float, default=5e-6)
     parser.add_argument("--max_steps", type=int, default=20, help="-1 for full epoch")
-    parser.add_argument("--lambda_iso", type=float, default=0.0,
-                        help="Weight for auxiliary iso_loss (VICReg-style isotropy on "
-                             "last-layer hidden states, src/iso.py). 0 = disabled; "
-                             "~0.10 worked best in prior experiments.")
+    # RepAnchor: representation-space anti-forgetting penalty (src/repanchor.py).
+    parser.add_argument("--lambda_repanchor", type=float, default=0.0,
+                        help="Weight (RepAnchor lam) for the representation-space "
+                             "anti-forgetting penalty. 0 = disabled. Snapshots the "
+                             "pre-training model on a batch of GSM8K prompts and "
+                             "penalises weight drift along protected input directions. "
+                             "Full fine-tuning only (no effect under LoRA).")
+    parser.add_argument("--repanchor_rank_mult", type=float, default=1.0,
+                        help="RepAnchor: multiplier on each layer's effective rank "
+                             "when choosing how many input directions to protect.")
+    parser.add_argument("--repanchor_load", type=int, default=4,
+                        help="RepAnchor: cap protected directions at load x effective rank.")
+    parser.add_argument("--repanchor_samples", type=int, default=64,
+                        help="RepAnchor: number of GSM8K prompts rolled out to build the anchor.")
+    parser.add_argument("--repanchor_prompt_max_len", type=int, default=320,
+                        help="RepAnchor: max prompt length (tokens); 320 fully covers GSM8K prompts.")
+    parser.add_argument("--repanchor_gen_max_new_tokens", type=int, default=512,
+                        help="RepAnchor: max new tokens the policy generates per anchor prompt. "
+                             "The anchor is built on prompt + the model's OWN generation.")
+    parser.add_argument("--repanchor_gen_temperature", type=float, default=1.0,
+                        help="RepAnchor: sampling temperature for anchor generation "
+                             "(match the GRPO rollout temp; 0 = greedy).")
+    parser.add_argument("--repanchor_gen_top_p", type=float, default=1.0,
+                        help="RepAnchor: top-p for anchor generation.")
+    parser.add_argument("--repanchor_gen_batch", type=int, default=8,
+                        help="RepAnchor: generation/anchor micro-batch size (memory lever).")
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--use_vllm", action="store_true", default=True)
     parser.add_argument("--no_vllm", action="store_true")
@@ -966,10 +1066,36 @@ def main():
     # Direct handle for the fast-eval greedy pass (records pass@1 rollouts).
     trainer._rollout_logger = rollout_logger
 
-    # Auxiliary iso_loss weight (0 = disabled). Read in compute_loss.
-    trainer.lambda_iso = args.lambda_iso
-    if args.lambda_iso:
-        print(f"iso_loss enabled: lambda_iso={args.lambda_iso}")
+    # RepAnchor anti-forgetting penalty (0 = disabled). Built at train start by
+    # RepAnchorCallback and read in compute_loss via trainer.repanchor.
+    if args.lambda_repanchor:
+        if args.use_lora:
+            print("[RepAnchor] WARNING: --use_lora set → base weights are frozen, "
+                  "so the RepAnchor penalty has no gradient. Skipping RepAnchor.")
+        else:
+            anchor_tok = AutoTokenizer.from_pretrained(args.model)
+            if anchor_tok.pad_token is None:
+                anchor_tok.pad_token = anchor_tok.eos_token
+            n_anchor = min(args.repanchor_samples, len(train_dataset))
+            # Anchor on the policy's OWN generations: pass prompts; the callback
+            # rolls them out with the current model at train start.
+            anchor_prompts = [train_dataset[i]["prompt"] for i in range(n_anchor)]
+            trainer.add_callback(RepAnchorCallback(
+                trainer, anchor_tok, anchor_prompts,
+                lam=args.lambda_repanchor,
+                rank_mult=args.repanchor_rank_mult,
+                load=args.repanchor_load,
+                mode="generate",
+                prompt_max_len=args.repanchor_prompt_max_len,
+                gen_max_new_tokens=args.repanchor_gen_max_new_tokens,
+                gen_temperature=args.repanchor_gen_temperature,
+                gen_top_p=args.repanchor_gen_top_p,
+                gen_batch=args.repanchor_gen_batch,
+            ))
+            print(f"RepAnchor enabled: lambda={args.lambda_repanchor}, "
+                  f"rank_mult={args.repanchor_rank_mult}, load={args.repanchor_load}, "
+                  f"samples={n_anchor}, gen_max_new={args.repanchor_gen_max_new_tokens}, "
+                  f"gen_temp={args.repanchor_gen_temperature}")
 
     # Virtual-rollout advantage shaping (None = TRL default advantages).
     trainer.virtual_rollout_mode = (None if args.virtual_rollout == "none"
