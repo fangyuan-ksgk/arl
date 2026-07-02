@@ -1,44 +1,77 @@
 # Environment Setup
 
-## Verified Working Stack
+## Verified Working Stack (2026-07-02)
 
 | Package | Version | Notes |
 |---------|---------|-------|
-| torch | 2.8.0+cu128 | Pre-installed in RunPod CUDA 12.8 base image — **do not upgrade** |
-| vllm | 0.11.0 | Compatible with torch 2.8.0; upgrading to 0.17.x breaks cu128 binding |
-| trl | 1.1.0 | Requires transformers==4.56.2 |
-| transformers | 4.56.2 | Satisfies both trl 1.1.0 and vllm 0.11.0 lower bounds |
-| CUDA | 12.8 | — |
+| torch | 2.11.0 (+cu130 on CUDA-13 drivers, else +cu128) | — |
+| vllm | 0.23.0 | 0.24 breaks TRL server-mode weight sync — do not upgrade |
+| trl | 1.7.0 | GRPOTrainer with steps_per_generation, sleep mode, profiling hooks |
+| transformers | 5.12.1 | — |
+| flash-attn | **not installed** | transformers 5 defaults to SDPA; vllm 0.23 ships flashinfer kernels. The old source-compile dance is obsolete. |
 
-## Setup
+`bash env.sh` is idempotent (checks the stack first) and driver-aware:
+CUDA-13 drivers (>= 580) get the cu130 PyPI wheels; older lottery hosts get
+torch cu128 + vLLM's cu129 wheel (the pairing SkyRL uses).
 
-```bash
-pip install flash-attn --no-build-isolation
-python -c "import torch; import flash_attn_2_cuda; print('✅ Pytorch and flash-attn are compatible')"
+The pre-2026-07 stack (torch 2.8.0+cu128 / vllm 0.11.0 / trl 1.1.0 /
+transformers 4.56.2 + source-built flash-attn) still works but no current
+script assumes it; see git history of env.sh for its pin rationale.
 
-git clone https://github.com/fangyuan-ksgk/arl.git && cd arl
-pip install -r requirements.txt
-```
+## GRPO speed (2026-07-02 profiling, Qwen3-0.6B, 2×H100, 64 rollouts/step)
 
-## Why This Exact Stack
+Full breakdowns in `output/bench_profile/*/profile.json`
+(`script/bench_grpo_profile.py`); SkyRL control in
+`skyrl_terminal/run_gsm8k_bench.sh`.
 
-### vLLM version lock
-`vllm==0.11.0` is the highest version that does **not** force a torch upgrade.
-`vllm>=0.17.x` pulls `torch==2.10.0+cu126`, replacing the base cu128 build and
-breaking any flash_attn binary compiled against cu128.
+| Config | s/step |
+|--------|--------|
+| server mode + `--enforce-eager` (old default) | 20.9 |
+| server mode, CUDA graphs | 10.6 |
+| server mode, CUDA graphs + bs16 micro-batches | 9.6 |
+| colocate 2-GPU DDP + sleep mode, micro-bs 16 (latent OOM after evals) | 6.3 |
+| **colocate, micro-bs 8 (new default)** | **~6.5** |
+| SkyRL colocated GRPO, same config (control) | ~7.5 |
 
-### transformers version lock
-`transformers==4.56.2` is the intersection of:
-- `trl==1.1.0` → requires `transformers==4.56.2`
-- `vllm==0.11.0` → requires `transformers>=4.55.x`
-- vLLM also requires `transformers<5`
+### Why each knob works (2026-07-02 profiling)
 
-### flash_attn binary compatibility
-flash_attn ships precompiled wheels targeting specific (torch, CUDA) pairs.
-No prebuilt wheel exists for torch 2.8.0+cu128, so it **must** be compiled from source
-with `--no-binary flash-attn`. The `--no-build-isolation` flag ensures the build uses
-the current environment's torch headers, not a fresh torch pulled into an isolated env.
-`--no-deps` prevents pip from re-pulling torch during the flash_attn install.
+1. **Never `--enforce-eager` a small model.** The flag disables vLLM's CUDA
+   graphs (whole decode step replayed as ONE graph launch) and affects
+   GENERATION ONLY — the trainer never runs through vLLM. Small-model decode
+   is kernel-LAUNCH-bound (hundreds of tiny kernels/token), so graphs are
+   3.2× on generation for 0.6B (15.4s → 4.8s per 64×1024-tok batch) — the
+   "~15%" folklore is only true for big models whose kernels dominate launch
+   overhead. What enforce-eager buys instead: ~40s faster engine startup, no
+   cold-cache compile wedge, a few hundred MB of graph-pool VRAM. Irrelevant
+   over a multi-hour run.
+2. **Fewer, fatter micro-batches.** Grad accumulation is sequential; each
+   micro-pass pays fixed overhead and bs8 GEMMs don't saturate an H100.
+   Same 64-seq optimizer batch as 4×bs16 instead of 8×bs8 ≈ −1 s/step.
+3. **fp32 logits cap the micro-batch (the vocab is the memory wall, not the
+   model).** TRL casts logits to fp32: bs × seq × 151k vocab × 4B ≈ 9.3 GB at
+   bs16, and SEVERAL such buffers coexist during loss+backward (fp32 cast,
+   log_softmax, entropies, grads) ⇒ bs64 = instant 37 GB OOM; bs16 works in
+   server mode but is a LATENT OOM in colocate — fine eval-free, dies on the
+   first backward after any eval pass (~60 GB transient + eval residue).
+   Colocate default = bs8 (accum 4), costs only ~0.2 s/step vs bs16.
+4. **Colocate ≠ faster comms, it's zero idle GPUs.** Server layout: the train
+   GPU idles during generation, the vLLM GPU idles during fwd/bwd. Colocate
+   runs one engine inside each DDP rank → generation is data-parallel
+   (4.3→2.6s) AND training is DDP (3.0→1.7s). Weight sync also drops
+   0.8→0.28s (in-process CUDA copy vs NCCL+RPC to another process). The tax
+   is ~1s of cross-rank gather/scatter + sleep/wake, far below the ~4s saved.
+5. **Sleep mode is a VRAM timeshare, not a speedup.** During the optimizer
+   phase the engine offloads weights to CPU and unmaps its KV cache, waking
+   before the next generation (~0.1–0.3s/cycle). It exists so training's
+   fp32-logits peaks can use the VRAM vLLM would otherwise pin. Colocate
+   needs `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` and an
+   `empty_cache()` after eval (both wired into the scripts).
+6. **Scaling colocate up:** generation side scales (sleep mode; SkyRL trains
+   32B colocated). The constraint is the TRAINING side — TRL colocate is DDP,
+   so full model + Adam states (~8 B/param) must fit per GPU: full-FT is
+   comfortable ≤ ~1.7B, feasible to ~4B w/ grad ckpt, dead ≥ ~8B on 80 GB.
+   Bigger: keep colocation but shard the trainer (DeepSpeed ZeRO via
+   accelerate) or use LoRA (easy to ~30B).
 
 ## Common Pitfalls
 
@@ -49,7 +82,7 @@ the current environment's torch headers, not a fresh torch pulled into an isolat
 | torch loses cu128 after vllm install | vllm pulled cu126 torch wheel | Pin vllm to 0.11.0 (cu128-safe) or reinstall torch with `--index-url .../cu128 --no-deps` |
 | `ImportError: flash_attn_2_cuda` after any pip install | pip silently upgraded torch | Rebuild flash_attn from source after settling all other packages |
 | vLLM server won't die from `pkill -f vllm`; orphan `VLLM::EngineCore` survives | EngineCore cmdline is bare `python`; comm `VLLM::EngineCore` is 16 chars, exceeding pkill's 15-char comm match | **Golden line:** `ps -ef \| grep 'VLLM::EngineCore' \| grep -v grep \| awk '{print $2}' \| xargs kill -9` |
-| vLLM `EngineCore` pegs CPU at 99 %, never allocates GPU | torch.compile / CUDA-graph capture stalled on cold cache | Launch with `--enforce-eager` (skips compile + graph capture; ~15 % decode throughput cost) |
+| vLLM `EngineCore` pegs CPU at 99 %, never allocates GPU | torch.compile / CUDA-graph capture stalled on cold cache | Launch with `--enforce-eager` as a LAST resort — on a 0.6B model it costs 3.2× generation throughput (see GRPO speed table). Try once more with a warm cache first. |
 | `trl vllm-serve` hangs at "Waiting for application startup" after repeated kill/restart cycles | Leaked CUDA contexts from orphan EngineCores deadlock vLLM's NCCL init even though `nvidia-smi` shows GPU free | **Restart the container.** `vllm serve` may still work while `trl vllm-serve` doesn't — the trl path stresses NCCL setup more. |
 
 ## TRL GRPOTrainer Modes
