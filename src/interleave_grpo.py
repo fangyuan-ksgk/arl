@@ -17,7 +17,11 @@ Experimental motivation:
   * GRPO/SFT may forget because representation-similar queries are not
     continually interleaved during training.
 
-Current status: intervention (2) is implemented below as compute-matched replay.
+Current status:
+  * Intervention (1) is implemented in ``src/complement_grpo.py``.
+  * Intervention (2) is implemented below as compute-matched replay.
+  * Intervention (3) remains open.
+
 Each generation batch replaces a fixed fraction of unique prompts with known
 forgettable prompts while preserving complete ``num_generations`` groups.
 """

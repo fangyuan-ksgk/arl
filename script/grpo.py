@@ -30,6 +30,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
 
+from src.complement_grpo import ComplementGRPOTrainer
 from src.interleave_grpo import InterleavedGRPOTrainer, load_forgettable_indices
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
@@ -365,8 +366,12 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         return torch.zeros((), device=self.accelerator.device), None, None
 
 
-class InterleavedFastEvalGRPOTrainer(FastEvalGRPOTrainer, InterleavedGRPOTrainer):
-    """Fast evaluation plus compute-matched forgettable-query replay."""
+class ComplementFastEvalGRPOTrainer(
+    FastEvalGRPOTrainer,
+    ComplementGRPOTrainer,
+    InterleavedGRPOTrainer,
+):
+    """Fast evaluation plus replay and shortest-correct self-distillation."""
 
 
 class EvalFlagCallback(TrainerCallback):
@@ -445,6 +450,12 @@ def main():
     parser.add_argument("--replay_fraction", type=float, default=0.25,
                         help="Fraction of unique prompt groups in every generation "
                              "batch replaced by forgettable queries.")
+    parser.add_argument("--replay_sft_weight", type=float, default=0.1,
+                        help="Weight of shortest-correct SFT loss on replay queries; "
+                             "0 disables self-distillation.")
+    parser.add_argument("--replay_sft_batch_size", type=int, default=1,
+                        help="Replay queries independently sampled for the SFT "
+                             "objective per GRPO generation step.")
     # MBE velocity reward gadget
     parser.add_argument("--mbe_velocity_reward",
                         action=argparse.BooleanOptionalAction, default=True,
@@ -479,13 +490,15 @@ def main():
         raise ValueError(f"No forgettable indices found in {args.forgettable_indices}")
     if replay_indices:
         print(f"Interleaved replay: {len(replay_indices)} queries, "
-              f"{args.replay_fraction:.0%} of every generation batch")
+              f"{args.replay_fraction:.0%} of every generation batch; "
+              f"shortest-correct SFT weight={args.replay_sft_weight}")
 
     config_kwargs = dict(
         output_dir=args.output_dir,
         loss_type=args.loss_type,
         scale_rewards=(False if args.scale_rewards == "none" else args.scale_rewards),
         num_generations=args.num_generations,
+        temperature=1.0,  # target cache samples t=1, matching the GRPO policy
         max_completion_length=args.max_completion_length,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -578,7 +591,13 @@ def main():
     reward_funcs.append(rollout_logger)
     print(f"Rollout logs → {train_rollout_path} / {eval_rollout_path}")
 
-    trainer = InterleavedFastEvalGRPOTrainer(
+    def replay_correctness(completion, example):
+        return domain["equal"](
+            domain["extract"](completion),
+            example["gold_answer"],
+        )
+
+    trainer = ComplementFastEvalGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=config,
@@ -587,6 +606,10 @@ def main():
         callbacks=[EvalFlagCallback(rollout_logger)],
         replay_indices=replay_indices,
         replay_fraction=args.replay_fraction,
+        correctness_fn=replay_correctness,
+        sft_replay_indices=replay_indices,
+        sft_weight=(args.replay_sft_weight if replay_indices else 0.0),
+        replay_sft_batch_size=args.replay_sft_batch_size,
     )
     trainer._rollout_logger = rollout_logger
 
