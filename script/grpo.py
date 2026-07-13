@@ -13,6 +13,8 @@ Usage:
     python script/grpo.py                                  # GSM8K smoke (20 steps)
     python script/grpo.py --dataset math --max_steps -1    # MATH, full epoch
     python script/grpo.py --no-mbe_velocity_reward         # correctness+format only
+    python script/grpo.py --forgettable_indices forgotten.json \
+        --replay_fraction 0.25                             # interleaved replay
 """
 
 import argparse
@@ -27,6 +29,8 @@ import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainerCallback
 from trl import GRPOTrainer, GRPOConfig
+
+from src.interleave_grpo import InterleavedGRPOTrainer, load_forgettable_indices
 
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 # Colocate mode: eval-generation fragmentation + fp32-logits backward peaks
@@ -361,6 +365,10 @@ class FastEvalGRPOTrainer(GRPOTrainer):
         return torch.zeros((), device=self.accelerator.device), None, None
 
 
+class InterleavedFastEvalGRPOTrainer(FastEvalGRPOTrainer, InterleavedGRPOTrainer):
+    """Fast evaluation plus compute-matched forgettable-query replay."""
+
+
 class EvalFlagCallback(TrainerCallback):
     """Routes reward-fn calls to the right rollout log around eval loops."""
 
@@ -430,6 +438,13 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=None,
                         help="Default num_generations*16; must be a multiple of "
                              "num_generations. Bigger = better vLLM batching.")
+    # Forgettable-query interleaving. The file contains train-dataset row
+    # indices, or per-index correctness trajectories (see load_forgettable_indices).
+    parser.add_argument("--forgettable_indices", type=str, default=None,
+                        help="JSON/JSONL forgettable-query indices or trajectories.")
+    parser.add_argument("--replay_fraction", type=float, default=0.25,
+                        help="Fraction of unique prompt groups in every generation "
+                             "batch replaced by forgettable queries.")
     # MBE velocity reward gadget
     parser.add_argument("--mbe_velocity_reward",
                         action=argparse.BooleanOptionalAction, default=True,
@@ -456,6 +471,15 @@ def main():
 
     train_dataset, test_dataset = domain["load"]()
     print(f"{args.dataset}: train {len(train_dataset)}, test {len(test_dataset)}")
+    replay_indices = (
+        load_forgettable_indices(args.forgettable_indices)
+        if args.forgettable_indices else []
+    )
+    if args.forgettable_indices and not replay_indices:
+        raise ValueError(f"No forgettable indices found in {args.forgettable_indices}")
+    if replay_indices:
+        print(f"Interleaved replay: {len(replay_indices)} queries, "
+              f"{args.replay_fraction:.0%} of every generation batch")
 
     config_kwargs = dict(
         output_dir=args.output_dir,
@@ -554,13 +578,15 @@ def main():
     reward_funcs.append(rollout_logger)
     print(f"Rollout logs → {train_rollout_path} / {eval_rollout_path}")
 
-    trainer = FastEvalGRPOTrainer(
+    trainer = InterleavedFastEvalGRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=config,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         callbacks=[EvalFlagCallback(rollout_logger)],
+        replay_indices=replay_indices,
+        replay_fraction=args.replay_fraction,
     )
     trainer._rollout_logger = rollout_logger
 

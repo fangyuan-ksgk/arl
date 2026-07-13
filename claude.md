@@ -159,3 +159,131 @@ fall back to the model's native window and let `max_completion_length`
 
 Runs in `logs/game24_sweep1/` were collected under the buggy regime
 (`--max-model-len LEN`) and are **not** comparable to clean baselines.
+
+## MILESTONE (2026-07-03): the lottery gap IS a forgetting gap
+
+**Finding.** On GSM8K/Qwen3-0.6B, the cross-seed *lottery gap* (8 GRPO seeds:
+union-of-solved − mean-per-seed = **21.5 pt** on validation) is quantitatively
+matched by the within-run *forgetting gap* of a single Dr.GRPO run
+(ever-solved − currently-solved by step 300 = **23.9 pt** validation / 22.1 pt
+train). Same magnitude, same signature (a run's ever-solved envelope ≈ the
+8-seed union ≈ 92%). Interpretation: each seed samples a *churning* solvable
+set at its own stopping point; the "lottery" across seeds is the same
+per-query forgetting churn seen within one run. ~24% of validation queries are
+solved at some checkpoint then wrong at the end; the truly-never-solved set is
+only ~7% (the real capacity ceiling). This reframes the whole
+routing-fails/soup-wins story: the exploitable diversity is temporal, not
+semantic.
+
+**The figure** (`output/forgetting/dr_grpo_dense/forgetting_grouped_g100.{png,gif}`):
+two panels (train, validation), queries grouped into class-pure bars of 100 by
+their trajectory-vs-step-0 class {KEPT, IMPROVED, REGRESSED, TRANSIENT, NEVER}
+(NEVER = never greedy-correct at any checkpoint → ~0). Bar solid = current
+running-avg greedy acc (RdYlGn: green 1.0 → red 0.0); grey shade on top =
+forgetting gap (per-query running-best − current, avg in group). Validation
+panel annotates `forgetting gap X pt / lottery gap Y pt`.
+
+### Reproduce
+```bash
+# 1. dense Dr.GRPO run (seed 1), checkpoint every 15 steps
+#    -> output/dr_grpo_dense/checkpoint-{15,30,...,300}   (output/pipeline_2b*.sh)
+# 2. greedy-eval every ckpt over 2000 train + full 1319 val, per-query correctness
+CUDA_VISIBLE_DEVICES=0 python script/eval_forgetting.py --run output/dr_grpo_dense --train_subset 2000
+#    -> output/forgetting/dr_grpo_dense/step{S}_{train,test}.jsonl
+# 3. the 8-seed lottery-gap numbers (union/mean) come from:
+#    output/lottery_gap/seed{0..7}_step200_test.jsonl  (script/eval_lottery_gap.py)
+# 4. build the diagram + gif (fast static PNG + optional GIF)
+python script/forgetting_viz.py --group_size 100                 # PNG only (instant)
+python script/forgetting_viz.py --group_size 100 --gif --fps 2 --hold_s 4
+```
+
+**`script/forgetting_viz.py` knobs** (built to iterate): `--group_size` (queries
+per bar, class-pure/truncated), `--gif`, `--fps` (lower = slower), `--hold_s`
+(seconds to hold the end frame). Class definitions live in `classify()`; the
+lottery-gap reference is recomputed live by `lottery_gap()` from the seed
+jsonls. `step2trainidx.json` (seed-1 training order, validated 300/300 steps vs
+logged rollout golds) supports the train-chunk analysis in `make_gif_v3.py`.
+
+---
+
+# Cross-domain Dr.GRPO training — setup experiences, bugs to avoid, speed
+
+Hard-won lessons from standing up GRPO on GSM8K / MATH / code / SearchR1 /
+Terminal-Bench. Read this before starting a new domain — most of these cost hours.
+
+## Environment (incl. the CUDA-12.8 fallback)
+- **`bash env.sh` is idempotent + driver-aware.** It picks cu130 wheels only if
+  the driver is ≥580; otherwise **cu128 torch + vLLM's cu129 wheel** (CUDA
+  minor-version compat — the pairing SkyRL uses). Don't hand-install torch.
+- **Pin the torch trio with a constraints file** during every `pip install`.
+  The single worst env bug we hit: a later package (vllm/deepspeed) silently
+  moved torch to a mismatched CUDA build → import-time CUDA errors that look
+  like driver problems. `-c constraints.txt` freezing torch/vision/audio kills it.
+- **Versions that matter:** vllm **0.23.0** (0.24 breaks TRL weight-sync), trl
+  **1.7.0**, transformers **5.12**. The old 2.8/cu128 + vllm 0.11 + trl 1.1
+  stack runs but current scripts assume trl-1.7 APIs.
+- **flash-attn is NOT needed** — transformers 5.x defaults to SDPA and vllm 0.23
+  ships flashinfer kernels. Skipping it removes a fragile, slow-to-build dep.
+
+## Bugs that silently waste GPU (verify, don't assume)
+- **vLLM sleep mode is BROKEN with trl 1.7 + vllm 0.23.** `vllm_enable_sleep_mode`
+  makes weight-sync a silent no-op → gradients collapse to ~1e-4 in ~10 steps,
+  training looks alive but learns nothing. Keep it **OFF everywhere**. Gate new
+  drivers with `script/test_vllm_sync.py`. (SkyRL's *own* colocate sleep/wake is
+  separate and does work — that's the FSDP backend, not TRL.)
+- **Never gate object-sharing on a container's truthiness.**
+  `self.buf = kwargs.get("buf") or ReplayBuffer()` swaps in a fresh buffer when
+  the passed one is empty (`__len__`==0 → falsy) → producer and consumer hold
+  different objects, the term never fires. Use `x if x is not None else ...`.
+- **Instrument the term and print a value the first few steps** (e.g. the online
+  loss magnitude). Two separate no-ops this project were only caught by a stray
+  print. When logging a quantity that *ramps* (KL vs a periodic ref), sample the
+  whole window, not one endpoint — post-refresh KL is 0 by construction.
+- **`save_only_model` is incompatible with SHARDED_STATE_DICT**; FSDP1 × paged
+  8-bit Adam mismatches optimizer-state device. Use FULL_STATE_DICT to checkpoint.
+- **LoRA lr ≠ full-FT lr.** 5e-6 (full-FT) silently undertrains LoRA; use ~1e-4.
+- **SFT on *gold* terse CoT degrades the model** below base (overwrites native
+  reasoning). If you want self-improvement, SFT/distill on the model's OWN
+  correct rollouts (best-of-N), not gold.
+
+## Speed (Qwen3-0.6B, 2×H100 — 20.9→6.5 s/step, beats SkyRL's 7.27)
+- **Drop `--enforce-eager`** — CUDA graphs are ~3.2× on 0.6B decode. Biggest single win.
+- **Colocate 2-GPU DDP** (vllm_mode=colocate) > server mode for small models:
+  no cross-process weight-sync latency, both GPUs do policy fwd/bwd.
+- **bs 8 × accum 4** sweet spot; raising micro-bs hits the **fp32-logits memory
+  wall** (bs × seq × 151k vocab × 4B) — the real cap on long-seq domains, not params.
+- `vllm_gpu_memory_utilization` 0.25–0.5 for colocate (leave room for training).
+- Eval: greedy over vLLM, one engine rebuild per ckpt is the cost — batch ckpts,
+  don't `--enforce-eager` the eval either.
+- **Orchestration:** distinct `MASTER_PORT` per GPU (`29510+gpu`), distinct
+  output dirs/logs, and reap orphan `VLLM::EngineCore` + `multiprocessing.resource_tracker`
+  after any kill (they reparent to init and hold 70GB). Never point a crash-monitor
+  at the shared append-only `pipeline_status.txt` — stale `EXIT=1` lines false-fire.
+
+## Per-domain entry points & critical spots
+All default to Qwen3-0.6B + colocate vLLM; `--max_steps -1` = one full epoch;
+server mode = `trl vllm-serve` on GPU0 + `--vllm_mode server` on GPU1.
+
+- **MATH** (`script/grpo_math.py`, Hendrycks): `--max_completion_length 3072`
+  (long proofs), `per_device_bs 2 × accum 4`. Long seq → fp32-logits wall is the
+  binding constraint; keep micro-bs tiny. Smoke: `python script/grpo_math.py` (20 steps).
+- **Code** (`script/grpo_code.py`): `--dataset mbpp` (374/500, default) or `apps`
+  (harder). **Execution-based reward runs untrusted model code** — it uses full
+  process-group reaping (`_run` helper); a runaway generation will spawn/hang
+  procs without it. `--enable_thinking` defaults **False** for code. Smoke: 20 steps.
+- **SearchR1** (`searchr1_trl/run_searchr1_trl.sh`, default Qwen2.5-3B-Instruct):
+  multi-turn `rollout_func` — model emits `<search>q</search>` → **mini retrieval
+  server** (`skyrl_terminal/mini_retrieval_server.py`, e5 over `corpus.jsonl`,
+  cpu or cuda) returns docs as `<information>` injected with **`env_mask=0` so
+  retrieved tokens are excluded from the GRPO loss** (critical — don't train on
+  the retriever's text). Reward = `qa_em` exact match. The script builds the
+  dataset once (`build_searchr1_trl.py`) and health-checks the retriever via a
+  `/retrieve` curl before launching. Sleep mode OFF here too.
+- **Terminal-Bench** (`skyrl_terminal/`, see `SETUP.md`): **different stack —
+  SkyRL FSDP+vLLM backend, not TRL** (`uv sync --extra fsdp`; torch 2.11+cu128,
+  vllm 0.20.2, its own `.venv`). Biggest gotcha: **unprivileged container = no
+  Docker/bubblewrap**, so the sandbox is **`proot`** (userspace chroot, zero
+  privilege) and the verifier runs pytest in a *separate* venv
+  (`TBENCH_VERIFIER_PYTHON`). Register the custom `terminal` SkyRL-gym env,
+  `curate_tasks.py` (keeps ~32 of 241) → `build_dataset.py` → `run_terminal_grpo.sh`.
+  Sandbox timeouts via `TBENCH_EXEC_TIMEOUT`/`TBENCH_VERIFY_TIMEOUT` keep steps short.
