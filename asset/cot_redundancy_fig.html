@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>">
+<title>CoT redundancy — original vs ablated</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b0e14; color: #d7dce6; min-height: 100%;
+               font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif; }
+  #wrap { max-width: 1340px; margin: 0 auto; padding: 34px 28px 50px; }
+  h1 { font-size: 19px; font-weight: 600; text-align: center; margin: 0 0 28px; color: #eef2f8;
+       letter-spacing: 0.2px; }
+  .cols { display: grid; grid-template-columns: 1.15fr 1fr; gap: 28px; align-items: stretch; }
+  .card { background: #10141d; border: 1px solid #262d3b; border-radius: 12px; display: flex;
+          flex-direction: column; }
+  .card h2 { font-size: 12.5px; font-weight: 600; letter-spacing: 1.4px; margin: 0;
+             padding: 12px 20px; border-bottom: 1px solid #232a38; color: #7e879a; }
+
+  /* left: the held breath — dense, dim, cramped */
+  .orig .transcript { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11.5px;
+                      line-height: 1.52; padding: 16px 20px 20px; white-space: pre-wrap;
+                      word-break: break-word; color: #79818f; }
+  .orig .tok { color: #565e6e; }
+  .orig .ans { color: #aeb6c4; }
+
+  /* right: the exhale — air, calm, slow fade-in */
+  .ablate { border-color: #2b3a45; }
+  .ablate .transcript { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 15.5px;
+                        line-height: 2.35; padding: 46px 44px; white-space: pre-wrap;
+                        word-break: break-word; color: #cfd6e2; flex: 1;
+                        display: flex; flex-direction: column; justify-content: center;
+                        opacity: 0; animation: breatheIn 1.6s ease-out 0.7s forwards; }
+  .ablate .tok { color: #6f7a8d; }
+  .ablate .ans { color: #eef2f8; }
+
+  /* the shared answer — both sides settle on it together */
+  .same { border-radius: 6px; padding: 1px 7px; transition: background 1s ease; }
+  body.landed .same { background: rgba(95, 224, 192, 0.13); box-shadow: 0 0 0 1px rgba(95,224,192,0.25) inset; }
+  .orig .same { color: #cfd6e2; }
+  .ablate .same { color: #eef2f8; font-weight: 600; }
+
+  .footnote { text-align: center; margin-top: 26px; font-size: 13.5px; color: #6f7a8d;
+              opacity: 0; animation: breatheIn 1.4s ease-out 2.4s forwards; }
+  .footnote b { color: #5fe0c0; font-weight: 600; }
+
+  /* who-wrote-what labels */
+  .who { display: block; font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+         font-size: 11px; font-weight: 600; letter-spacing: 1.1px; line-height: 1.4;
+         margin: 6px 0 2px; }
+  .who.us    { color: #5fe0c0; }
+  .who.model { color: #8fa8d4; }
+  .orig .who { font-size: 10.5px; margin: 4px 0 1px; }
+
+  @keyframes breatheIn { from { opacity: 0; transform: translateY(10px); }
+                         to   { opacity: 1; transform: translateY(0); } }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>Ablate the model&rsquo;s chain of thought &mdash; the model still generates the same answer</h1>
+  <div class="cols">
+
+    <div class="card orig">
+      <h2>ORIGINAL ROLLOUT &mdash; THE MODEL WRITES CoT + ANSWER (292-TOKEN CoT)</h2>
+      <div class="transcript"><span class="tok">&lt;|im_start|&gt;user</span>
+1 + 1 = ?<span class="tok">&lt;|im_end|&gt;</span>
+<span class="tok">&lt;|im_start|&gt;assistant</span>
+<span class="who model">&#9654; MODEL GENERATES EVERYTHING BELOW</span><span class="tok">&lt;think&gt;</span>
+Okay, so I need to figure out what 1 + 1 equals. Let me start by recalling basic arithmetic. When you add two numbers together, you just add their values. In this case, both numbers are 1. So, adding 1 and 1 should give me 2.
+
+Wait, is there any trick here? Sometimes problems might have hidden meanings or maybe use some special operations. But the question is straightforward. It's just a simple addition problem. There's no indication that it's a more complex operation like multiplication or something else.
+
+Let me think again. If I have 1 and 1, and I add them, it's like having one object and another one. So, combining them would result in two objects. That makes sense. So, 1 + 1 = 2.
+
+I don't think there's any other way this could be interpreted. Maybe if there was a different context, like in a different number system or something, but the question is written in base 10, right? So, it's just regular addition.
+
+Another way to check is to use the addition table. If I remember correctly, 1 + 1 is 2. So, that's consistent.
+
+I guess there's no confusion here. The answer should be 2. I don't see any other possible interpretations. Maybe if there was a typo or if the question was part of a larger problem, but as it stands, 1 + 1 equals 2.
+<span class="tok">&lt;/think&gt;</span>
+
+<span class="ans"><span class="same">1 + 1 = 2</span>.
+
+This is a straightforward addition problem where both numbers are 1. The result is simply the sum of the two numbers. There are no hidden meanings or special operations implied here.
+
+**Answer:** 2</span></div>
+    </div>
+
+    <div class="card ablate">
+      <h2>ABLATED &mdash; WE REPLACE ITS CoT, THE MODEL CONTINUES (6 TOKENS)</h2>
+      <div class="transcript"><span class="tok">&lt;|im_start|&gt;user</span>
+1 + 1 = ?<span class="tok">&lt;|im_end|&gt;</span>
+<span class="tok">&lt;|im_start|&gt;</span>
+<span class="who us">&#9998; WE INJECT THIS CoT</span><span class="tok">&lt;think&gt;</span>
+1 + 1 = 2
+<span class="tok">&lt;/think&gt;</span>
+
+<span class="who model">&#9654; MODEL GENERATES FROM HERE</span><span class="ans"><span class="same">1 + 1 = 2</span></span></div>
+    </div>
+
+  </div>
+  <div class="footnote">left: the model wrote both the CoT and the answer &middot; right: we overwrite its CoT with one line, then let the <b>same model</b> keep decoding &mdash; it accepts the injected CoT, keeps the template, and answers <b>2</b>. The other 286 CoT tokens weren&rsquo;t load-bearing</div>
+</div>
+<script>
+  setTimeout(() => document.body.classList.add("landed"), 2600);
+</script>
+</body>
+</html>

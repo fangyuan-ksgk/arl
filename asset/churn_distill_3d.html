@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg'/>">
+<title>Churn → per-query-best distillation</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #04060f; overflow: hidden;
+               font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif; }
+  #app { position: fixed; inset: 0; }
+  .hud { position: fixed; color: #dfe7ff; z-index: 10; pointer-events: none; }
+  #title { top: 10px; left: 24%; right: 24%; text-align: center; }
+  #title .main { font-size: 21px; font-weight: 700; letter-spacing: 0.4px; color: #eaf1ff; }
+  #title .sub  { font-size: 14px; margin-top: 3px; color: #93a4cf; }
+  #facts { top: 16px; right: 20px; max-width: 320px; text-align: right;
+           font-size: 12.5px; line-height: 1.55; color: #8fb7d9;
+           background: rgba(13,20,40,0.75); border: 1px solid #24345e;
+           border-radius: 8px; padding: 9px 12px; }
+  #facts b { color: #ffd24a; font-weight: 700; }
+  #status { bottom: 84px; left: 20px; font-size: 13px; color: #9aa9d4;
+            background: rgba(13,20,40,0.75); border: 1px solid #24345e;
+            border-radius: 8px; padding: 9px 12px; line-height: 1.6; }
+  #status b { color: #7ecbff; }
+  #status .badge { display: inline-block; background: #ffd24a; color: #0a0e1a; font-weight: 700;
+                   border-radius: 4px; padding: 1px 7px; font-size: 12px; }
+  #caption-bar { left: 0; right: 0; bottom: 0; background: rgba(8,12,26,0.9);
+                 border-top: 1px solid #253359; padding: 13px 38px 15px;
+                 display: flex; align-items: center; gap: 18px; }
+  #beat-tag { flex: 0 0 auto; font-size: 12px; font-weight: 700; letter-spacing: 1.2px;
+              color: #0a0e1a; background: #ffd24a; border-radius: 5px; padding: 4px 10px; }
+  #caption { flex: 1 1 auto; font-size: 18px; line-height: 1.45; color: #e8eeff; }
+  #caption em { color: #7ecbff; font-style: normal; font-weight: 600; }
+  #caption .warm { color: #ffb36b; font-style: normal; font-weight: 600; }
+  #caption .gold { color: #ffd24a; font-style: normal; font-weight: 600; }
+  #caption .mint { color: #5fe0c0; font-style: normal; font-weight: 600; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="app"></div>
+
+<div class="hud" id="title">
+  <div class="main">The lottery gap is a forgetting gap &nbsp;&mdash;&nbsp; distill the per-query best checkpoint</div>
+  <div class="sub">GSM8K &middot; Qwen3-0.6B &middot; one Dr.GRPO run, checkpoints every 15 steps &mdash; 440 validation queries simulated at measured class rates</div>
+</div>
+
+<div class="hud" id="facts">
+  Measured (run seed 1, step 300):<br>
+  forgetting gap <b>23.9 pt</b> &nbsp;&middot;&nbsp; 8-seed lottery gap <b>21.5 pt</b><br>
+  ever-solved envelope <b>&asymp; 92%</b> &nbsp;&middot;&nbsp; never-solved <b>&asymp; 7%</b><br>
+  <span style="color:#6f81ad">Act&nbsp;2 (distillation lift) is the proposal, simulated</span>
+</div>
+
+<div class="hud" id="status">
+  <span id="status-line">&hellip;</span>
+</div>
+
+<div class="hud" id="caption-bar">
+  <div id="beat-tag">STAGE 1/5</div>
+  <div id="caption">&hellip;</div>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
+import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
+
+/* ------------------------------ renderer / scene / camera ------------------------------ */
+const app = document.getElementById("app");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.1;
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x04060f);
+
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 200);
+camera.position.set(0.8, 4.4, 25.2);          // FIXED front-on, slight tilt
+camera.lookAt(0.8, 2.6, 0);
+
+scene.add(new THREE.AmbientLight(0xbfd0ff, 0.6));
+const key = new THREE.DirectionalLight(0xffffff, 1.1);
+key.position.set(6, 14, 10);
+scene.add(key);
+const fill = new THREE.DirectionalLight(0x7ea0ff, 0.35);
+fill.position.set(-8, 6, -5);
+scene.add(fill);
+
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+const bloom = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 0.42, 0.55, 0.16);
+composer.addPass(bloom);
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  composer.setSize(window.innerWidth, window.innerHeight);
+});
+
+/* ------------------------------- text sprite helper ------------------------------- */
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function makeTextSprite(text, { font = "700 46px 'Avenir Next','Segoe UI',sans-serif",
+                                color = "#eaf1ff", pad = 24, scale = 0.010, bg = null, stroke = null } = {}) {
+  const c = document.createElement("canvas");
+  const g0 = c.getContext("2d");
+  g0.font = font;
+  const w = Math.ceil(g0.measureText(text).width) + pad * 2;
+  const h = 92;
+  c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  if (bg) { g.fillStyle = bg; roundRect(g, 2, 8, w - 4, h - 16, 14); g.fill(); }
+  if (stroke) { g.strokeStyle = stroke; g.lineWidth = 3; roundRect(g, 2, 8, w - 4, h - 16, 14); g.stroke(); }
+  g.font = font; g.fillStyle = color; g.textAlign = "center"; g.textBaseline = "middle";
+  g.fillText(text, w / 2, h / 2 + 2);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  sp.renderOrder = 50;
+  sp.scale.set(w * scale, h * scale, 1);
+  sp.userData.redraw = (t2) => {   // in-place text update, reuses canvas
+    g.clearRect(0, 0, w, h);
+    if (bg) { g.fillStyle = bg; roundRect(g, 2, 8, w - 4, h - 16, 14); g.fill(); }
+    if (stroke) { g.strokeStyle = stroke; g.lineWidth = 3; roundRect(g, 2, 8, w - 4, h - 16, 14); g.stroke(); }
+    g.font = font; g.fillStyle = color; g.textAlign = "center"; g.textBaseline = "middle";
+    g.fillText(t2, w / 2, h / 2 + 2);
+    tex.needsUpdate = true;
+  };
+  return sp;
+}
+
+/* ------------------------------------ seeded PRNG ------------------------------------ */
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(20260716);
+
+/* =====================================================================================
+   THE SIMULATION — per-query greedy-correctness trajectories over 20 checkpoints,
+   generated once (seeded) at the measured class rates, then every on-screen quantity
+   (current acc, ever-solved envelope, forgetting gap, per-query best ckpt, student
+   capture) is RE-COMPUTED from this table. No canned values downstream.
+   ===================================================================================== */
+const N_CKPT = 20;                               // steps 15..300
+const CLASSES = [                                 // measured validation shares (gif legend)
+  { key: "KEPT",      n: 246, col: "#2ecf6f" },   // 55%
+  { key: "IMPROVED",  n: 57,  col: "#9be36b" },   // 13%
+  { key: "REGRESSED", n: 40,  col: "#ffb36b" },   // 9%
+  { key: "TRANSIENT", n: 66,  col: "#ff8f5c" },   // 15%
+  { key: "NEVER",     n: 31,  col: "#a24545" },   // 7%
+];
+const NQ = CLASSES.reduce((s, c) => s + c.n, 0);  // 440
+
+const queries = [];                               // { cls, traj: Uint8Array(N_CKPT) }
+for (const cls of CLASSES) {
+  for (let i = 0; i < cls.n; i++) {
+    const traj = new Uint8Array(N_CKPT);
+    if (cls.key === "KEPT") {
+      let s = rng() < 0.92 ? 1 : 0;
+      for (let t = 0; t < N_CKPT; t++) { traj[t] = s; s = s ? (rng() < 0.955 ? 1 : 0) : (rng() < 0.75 ? 1 : 0); }
+      traj[N_CKPT - 1] = 1;
+    } else if (cls.key === "IMPROVED") {
+      const tOn = 4 + Math.floor(rng() * 11);
+      for (let t = 0; t < N_CKPT; t++) traj[t] = t >= tOn ? 1 : (rng() < 0.12 ? 1 : 0);
+      traj[N_CKPT - 1] = 1;
+    } else if (cls.key === "REGRESSED") {
+      const tOff = 8 + Math.floor(rng() * 9);
+      for (let t = 0; t < N_CKPT; t++) traj[t] = t < tOff ? (rng() < 0.85 ? 1 : 0) : (rng() < 0.08 ? 1 : 0);
+      traj[0] = 1; traj[N_CKPT - 1] = 0;
+    } else if (cls.key === "TRANSIENT") {
+      let any = 0;
+      for (let t = 0; t < N_CKPT; t++) { traj[t] = rng() < 0.38 ? 1 : 0; any |= traj[t]; }
+      if (!any) traj[2 + Math.floor(rng() * 15)] = 1;
+      traj[N_CKPT - 1] = 0;
+    } // NEVER: all zeros
+    queries.push({ cls: cls.key, traj });
+  }
+}
+// derived, from the actual table:
+const bestCkpt = queries.map(q => { let b = -1; for (let t = 0; t < N_CKPT; t++) if (q.traj[t]) b = t; return b; });
+const everByEnd = queries.map(q => q.traj.some(v => v));
+const P_TRANSFER = 0.96;                          // distillation capture rate (proposal, simulated)
+const studentGets = queries.map((q, i) => everByEnd[i] && rng() < P_TRANSFER);
+const finalAcc = queries.reduce((s, q) => s + q.traj[N_CKPT - 1], 0) / NQ;
+const envelopeAcc = everByEnd.filter(Boolean).length / NQ;
+const studentAcc = studentGets.filter(Boolean).length / NQ;
+
+/* ------------------------------------ scene-graph ------------------------------------ */
+window.nodes = [];
+function reg(id, label, type, obj) { window.nodes.push({ id, label, type, pos: obj.position.toArray(), obj }); return obj; }
+
+/* ------------------------------- query grid (40 × 11) ------------------------------- */
+const COLS = 40, ROWS = 11, PITCH = 0.5, TILE = 0.42;
+const GRID_X0 = -12.0, GRID_Y0 = 1.3;             // bottom-left tile center
+const tilePos = q => {
+  const col = Math.floor(q / ROWS), row = q % ROWS;
+  return new THREE.Vector3(GRID_X0 + col * PITCH, GRID_Y0 + row * PITCH, 0);
+};
+const COL_SOLVED = new THREE.Color("#22c05e");
+const COL_UNSOLVED = new THREE.Color("#4a1f27");
+const COL_NEVER = new THREE.Color("#2b1016");
+const COL_STUDENT = new THREE.Color("#3fd6b0");
+const COL_LOST = new THREE.Color("#7a4a2a");
+
+const tileGeo = new THREE.BoxGeometry(TILE, TILE, 0.16);
+const tileMat = new THREE.MeshStandardMaterial({ roughness: 0.42, metalness: 0.1 });
+const tiles = new THREE.InstancedMesh(tileGeo, tileMat, NQ);
+tiles.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(NQ * 3), 3);
+{
+  const m = new THREE.Matrix4();
+  for (let q = 0; q < NQ; q++) {
+    m.setPosition(tilePos(q));
+    tiles.setMatrixAt(q, m);
+    tiles.setColorAt(q, COL_UNSOLVED);
+  }
+}
+scene.add(reg("query-grid", "440 validation queries (class-sorted)", "grid", tiles));
+
+// ever-solved halo: additive gold frames behind tiles (black = invisible)
+const haloGeo = new THREE.PlaneGeometry(TILE + 0.14, TILE + 0.14);
+const haloMat = new THREE.MeshBasicMaterial({ blending: THREE.AdditiveBlending, depthWrite: false });
+const halos = new THREE.InstancedMesh(haloGeo, haloMat, NQ);
+halos.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(NQ * 3), 3);
+{
+  const m = new THREE.Matrix4();
+  for (let q = 0; q < NQ; q++) {
+    const p = tilePos(q); m.setPosition(p.x, p.y, -0.12);
+    halos.setMatrixAt(q, m);
+    halos.setColorAt(q, new THREE.Color(0x000000));
+  }
+}
+scene.add(reg("ever-solved-halos", "ever-solved envelope (gold halo)", "overlay", halos));
+
+// class band separators + labels
+{
+  let acc = 0;
+  for (let ci = 0; ci < CLASSES.length; ci++) {
+    const cls = CLASSES[ci];
+    const midCol = (acc + cls.n / 2) / ROWS;
+    const lbl = makeTextSprite(`${cls.key} ${Math.round(cls.n / NQ * 100)}%`,
+      { font: "700 40px 'Avenir Next','Segoe UI',sans-serif", color: cls.col, scale: 0.0072 });
+    lbl.position.set(GRID_X0 + midCol * PITCH, GRID_Y0 + ROWS * PITCH + 0.42 + (ci % 2 ? 0.42 : 0), 0.2);
+    scene.add(reg(`band-${cls.key.toLowerCase()}`, `${cls.key} band label`, "label", lbl));
+    acc += cls.n;
+    if (ci < CLASSES.length - 1) {
+      const bx = GRID_X0 + (Math.ceil(acc / ROWS) - 0.5) * PITCH - PITCH / 2 + PITCH / 2;
+      const sep = new THREE.Mesh(new THREE.BoxGeometry(0.03, ROWS * PITCH + 0.25, 0.05),
+        new THREE.MeshBasicMaterial({ color: 0x3a4c7e }));
+      sep.position.set(GRID_X0 + (acc / ROWS) * PITCH - PITCH / 2, GRID_Y0 + (ROWS - 1) * PITCH / 2, 0.02);
+      scene.add(sep);
+    }
+  }
+}
+
+/* ------------------------------ checkpoint timeline ------------------------------ */
+const ckptChips = [];
+const CKPT_Y = GRID_Y0 + ROWS * PITCH + 1.35;
+const ckptHue = t => new THREE.Color().setHSL(0.54 - 0.42 * (t / (N_CKPT - 1)), 0.85, 0.6);  // cyan → gold, no red
+for (let t = 0; t < N_CKPT; t++) {
+  const x = GRID_X0 + 1.0 + t * ((COLS - 2) * PITCH / (N_CKPT - 1));
+  const chip = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.34, 0.18),
+    new THREE.MeshStandardMaterial({ color: 0x1a2440, emissive: ckptHue(t), emissiveIntensity: 0.06, roughness: 0.4 }));
+  chip.position.set(x, CKPT_Y, 0);
+  scene.add(reg(`ckpt-${(t + 1) * 15}`, `checkpoint step ${(t + 1) * 15}`, "checkpoint", chip));
+  ckptChips.push(chip);
+  if (t % 5 === 4 || t === 0) {
+    const l = makeTextSprite(String((t + 1) * 15), { font: "600 34px 'Avenir Next',sans-serif", color: "#93a4cf", scale: 0.0062 });
+    l.position.set(x, CKPT_Y + 0.42, 0);
+    scene.add(l);
+  }
+}
+const tlLabel = makeTextSprite("Dr.GRPO checkpoints (step 15 → 300)",
+  { font: "600 36px 'Avenir Next',sans-serif", color: "#7ecbff", scale: 0.0068 });
+tlLabel.position.set(GRID_X0 + (COLS * PITCH) / 2 - 0.25, CKPT_Y + 0.95, 0);
+scene.add(tlLabel);
+// sweep cursor
+const cursor = new THREE.Mesh(new THREE.ConeGeometry(0.16, 0.34, 4),
+  new THREE.MeshBasicMaterial({ color: 0xffd24a }));
+cursor.rotation.x = Math.PI;
+cursor.position.set(ckptChips[0].position.x, CKPT_Y - 0.44, 0.05);
+scene.add(reg("ckpt-cursor", "active checkpoint cursor", "cursor", cursor));
+
+/* ------------------------------------ meters ------------------------------------ */
+const METER_H = 5.2, METER_Y0 = 1.0;
+function makeMeter(id, x, colorHex, label) {
+  const gp = new THREE.Group(); gp.position.set(x, METER_Y0, 0);
+  const frame = new THREE.Mesh(new THREE.BoxGeometry(0.95, METER_H, 0.3),
+    new THREE.MeshStandardMaterial({ color: 0x101830, roughness: 0.6, transparent: true, opacity: 0.85 }));
+  frame.position.y = METER_H / 2; gp.add(frame);
+  const bar = new THREE.Mesh(new THREE.BoxGeometry(0.72, 1, 0.34),
+    new THREE.MeshStandardMaterial({ color: colorHex, emissive: colorHex, emissiveIntensity: 0.35, roughness: 0.35 }));
+  bar.scale.y = 0.001; bar.position.y = 0; gp.add(bar);
+  const pct = makeTextSprite("0.0%", { font: "700 44px 'Avenir Next',sans-serif", color: "#eaf1ff", scale: 0.0075 });
+  pct.position.set(0, METER_H + 0.38, 0.2); gp.add(pct);
+  const lab = makeTextSprite(label, { font: "600 30px 'Avenir Next',sans-serif", color: "#93a4cf", scale: 0.0068 });
+  lab.position.set(0, -0.42, 0.2); gp.add(lab);
+  scene.add(reg(id, label, "meter", gp));
+  let val = 0;
+  return {
+    group: gp, bar, pct,
+    set(v) {
+      if (Math.abs(v - val) < 0.0005) return;
+      val = v;
+      const h = Math.max(0.001, v * METER_H);
+      bar.scale.y = h; bar.position.y = h / 2;
+      pct.userData.redraw((v * 100).toFixed(1) + "%");
+    },
+    top() { return new THREE.Vector3(gp.position.x, METER_Y0 + val * METER_H, 0.2); },
+    get val() { return val; },
+  };
+}
+const meterCur = makeMeter("meter-current", 10.6, 0x39d2a0, "current ckpt");
+const meterEnv = makeMeter("meter-envelope", 12.35, 0xffd27a, "ever-solved");
+const meterStu = makeMeter("meter-student", 14.1, 0x66e0ff, "student");
+meterStu.group.visible = false;
+
+// forgetting-gap bracket (between current & envelope meter tops), shown in stage 3
+const gapGroup = new THREE.Group(); gapGroup.visible = false;
+const gapLineMat = new THREE.LineBasicMaterial({ color: 0xffd24a });
+const gapGeom = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+gapGroup.add(new THREE.Line(gapGeom, gapLineMat));
+const gapLabel = makeTextSprite("forgetting gap 23.9 pt",
+  { font: "700 38px 'Avenir Next',sans-serif", color: "#ffd24a", scale: 0.0072, bg: "rgba(13,20,40,0.9)", stroke: "#4a5a8e" });
+gapGroup.add(gapLabel);
+scene.add(reg("gap-bracket", "forgetting gap bracket", "annotation", gapGroup));
+
+/* ------------------------------------ student ------------------------------------ */
+const student = new THREE.Group();
+student.position.set(-2.2, -1.15, 0.6);
+const stuBody = new THREE.Mesh(new THREE.BoxGeometry(5.4, 1.15, 0.9),
+  new THREE.MeshStandardMaterial({ color: 0x0e2237, emissive: 0x66e0ff, emissiveIntensity: 0.10, roughness: 0.35 }));
+student.add(stuBody);
+const stuLabel = makeTextSprite("STUDENT — one model, distilled from per-query best ckpt",
+  { font: "700 34px 'Avenir Next',sans-serif", color: "#66e0ff", scale: 0.0068 });
+stuLabel.position.set(0, -0.95, 0.4);
+student.add(stuLabel);
+const stuCount = makeTextSprite("KL( student ∥ teacher_q* )   ·   0 / 440 captured",
+  { font: "600 34px 'Avenir Next',sans-serif", color: "#bfe9ff", scale: 0.0066 });
+stuCount.position.set(0, 0.02, 0.55);
+student.add(stuCount);
+student.visible = false;
+scene.add(reg("student", "distilled student model", "model", student));
+
+/* ---------------------------------- logit particles ---------------------------------- */
+const P_MAX = 340;
+const pGeo = new THREE.BufferGeometry();
+const pPos = new Float32Array(P_MAX * 3), pCol = new Float32Array(P_MAX * 3);
+pGeo.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
+pGeo.setAttribute("color", new THREE.BufferAttribute(pCol, 3));
+const pMat = new THREE.PointsMaterial({ size: 0.34, vertexColors: true, transparent: true, opacity: 1.0,
+                                        blending: THREE.AdditiveBlending, depthWrite: false });
+const points = new THREE.Points(pGeo, pMat);
+points.frustumCulled = false;      // positions stream every frame; lazy bounding sphere would cull it
+points.visible = false;
+scene.add(reg("logit-stream", "per-query logit distillation stream", "particles", points));
+const particles = Array.from({ length: P_MAX }, () => ({ live: false, t: 0, dur: 1, q: -1,
+  a: new THREE.Vector3(), b: new THREE.Vector3(), c: new THREE.Vector3() }));
+
+/* =====================================================================================
+   STAGE MACHINE — one deterministic ~64 s loop
+   ===================================================================================== */
+const beatTag = document.getElementById("beat-tag");
+const captionEl = document.getElementById("caption");
+const statusEl = document.getElementById("status-line");
+
+const CHURN_T0 = 7, CHURN_DT = 0.95;              // ckpt sweep timing
+const STAGES = [
+  { t: 0,  tag: "STAGE 1/5", cap: `One Dr.GRPO run on GSM8K. Each tile is a <em>validation query</em>, sorted by its eventual trajectory class. Greedy-decode every query at the <em>first checkpoint (step 15)</em>: green = correct.` },
+  { t: 7,  tag: "STAGE 2/5", cap: `<em>Churn.</em> Sweep the 20 checkpoints — tiles keep flipping: different checkpoints solve <em>different</em> queries. Every query ever solved keeps a <span class="gold">gold halo</span>: the ever-solved envelope races ahead of any single checkpoint.` },
+  { t: 27, tag: "STAGE 3/5", cap: `Training ends at step 300 with <em>68%</em> — but the envelope sits at <span class="gold">~92%</span>: a <span class="gold">forgetting gap of ~24 pt</span> (≈ the 21.5 pt 8-seed lottery gap). Now recolor each ever-solved query by its <span class="warm">best checkpoint</span> — the diversity is <em>temporal</em>, not semantic.` },
+  { t: 38, tag: "STAGE 4/5", cap: `<span class="mint">Logit distillation.</span> For each query, take the checkpoint that solves it as the <em>teacher</em> and minimize KL(student ∥ teacher<sub>q*</sub>) on its own rollouts — the streams carry per-query logits into <em>one student</em>.` },
+  { t: 56, tag: "STAGE 5/5", cap: `The student consolidates the churn: <span class="mint">~89%</span> vs 68% for the final checkpoint — recovering most of the <span class="gold">24 pt</span> forgetting gap. Only the <span class="warm">never-solved ~7%</span> (true capacity ceiling) stays out of reach.` },
+];
+const LOOP_S = 64;
+
+/* ------------------------------ simulation state ------------------------------ */
+let simCkpt = -1;                                  // last applied checkpoint index
+const everSolved = new Uint8Array(NQ);             // real bookkeeping, rebuilt every loop
+let curSolvedCount = 0, everCount = 0;
+let stuCaptured = 0, stuSolvedCount = 0;
+const distillOrder = [...Array(NQ).keys()].filter(q => everByEnd[q]);
+for (let i = distillOrder.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [distillOrder[i], distillOrder[j]] = [distillOrder[j], distillOrder[i]]; }
+let distillPtr = 0;
+const tileDone = new Uint8Array(NQ);               // student-final tile state applied
+
+function applyCkpt(t) {                            // recompute grid + meters from the table
+  simCkpt = t;
+  curSolvedCount = 0;
+  for (let q = 0; q < NQ; q++) {
+    const s = queries[q].traj[t];
+    curSolvedCount += s;
+    if (s && !everSolved[q]) { everSolved[q] = 1; halos.setColorAt(q, new THREE.Color(0x6b5313)); }
+    tiles.setColorAt(q, s ? COL_SOLVED : (queries[q].cls === "NEVER" ? COL_NEVER : COL_UNSOLVED));
+  }
+  everCount = everSolved.reduce((a, b) => a + b, 0);
+  tiles.instanceColor.needsUpdate = true;
+  halos.instanceColor.needsUpdate = true;
+  for (let i = 0; i < N_CKPT; i++)
+    ckptChips[i].material.emissiveIntensity = i === t ? 0.9 : (i < t ? 0.18 : 0.06);
+  cursor.position.x = ckptChips[t].position.x;
+}
+
+function resetLoop() {
+  everSolved.fill(0); tileDone.fill(0);
+  stuCaptured = 0; stuSolvedCount = 0; distillPtr = 0;
+  for (let q = 0; q < NQ; q++) halos.setColorAt(q, new THREE.Color(0x000000));
+  particles.forEach(p => p.live = false);
+  points.visible = false; student.visible = false; meterStu.group.visible = false;
+  gapGroup.visible = false;
+  meterStu.set(0);
+  stuCount.userData.redraw("KL( student ∥ teacher_q* )   ·   0 / 440 captured");
+  applyCkpt(0);
+}
+
+/* stage-3 best-ckpt recolor (progressive wipe, driven in tick) */
+function bestCkptColor(q) {
+  return bestCkpt[q] >= 0 ? ckptHue(bestCkpt[q]) : COL_NEVER;
+}
+
+/* particle spawning for stage 4 */
+const stuTarget = new THREE.Vector3(-2.2, -1.05, 0.9);
+function spawnParticle(q) {
+  const p = particles.find(pp => !pp.live);
+  if (!p) return false;
+  p.live = true; p.t = 0; p.q = q;
+  p.dur = 0.75 + rng() * 0.4;
+  p.a.copy(tilePos(q)); p.a.z = 0.25;
+  p.b.set((p.a.x + stuTarget.x) / 2 + (rng() - 0.5) * 3, Math.min(p.a.y, 0.4) - 1.6 - rng() * 1.2, 1.8);
+  p.c.copy(stuTarget); p.c.x += (rng() - 0.5) * 4.4;
+  const col = bestCkptColor(q);
+  return true;
+}
+
+/* ------------------------------------ main loop ------------------------------------ */
+window.__dbg = () => ({ live: particles.filter(p => p.live).length, vis: points.visible,
+  sample: particles.find(p => p.live), t: elapsed % LOOP_S, ptr: distillPtr });
+const clock = new THREE.Clock();
+let elapsed = 0, stageIdx = -1, lastLoop = -1;
+resetLoop();
+
+function tick() {
+  requestAnimationFrame(tick);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  elapsed += dt;
+  const T = elapsed % LOOP_S;
+  const loopN = Math.floor(elapsed / LOOP_S);
+  if (loopN !== lastLoop) { lastLoop = loopN; resetLoop(); }
+
+  // stage bookkeeping
+  let si = 0;
+  for (let i = 0; i < STAGES.length; i++) if (T >= STAGES[i].t) si = i;
+  if (si !== stageIdx) {
+    stageIdx = si;
+    beatTag.textContent = STAGES[si].tag;
+    captionEl.innerHTML = STAGES[si].cap;
+    if (si === 3) { student.visible = true; points.visible = true; meterStu.group.visible = true; }
+  }
+
+  /* ---- stage 1–2: checkpoint sweep ---- */
+  if (T < STAGES[2].t) {
+    const want = T < CHURN_T0 ? 0 : Math.min(N_CKPT - 1, Math.floor((T - CHURN_T0) / CHURN_DT));
+    if (want !== simCkpt) applyCkpt(want);
+  }
+
+  /* ---- stage 3: freeze at final ckpt, gap bracket + best-ckpt recolor wipe ---- */
+  if (stageIdx === 2) {
+    if (simCkpt !== N_CKPT - 1) applyCkpt(N_CKPT - 1);
+    gapGroup.visible = true;
+    const a = meterCur.top(), b = meterEnv.top();
+    const mid = new THREE.Vector3((a.x + b.x) / 2, METER_Y0 + METER_H + 1.15, 0.2);
+    gapGeom.setFromPoints([new THREE.Vector3(a.x, a.y + 0.12, 0.2), new THREE.Vector3(a.x, mid.y, 0.2),
+                           new THREE.Vector3(b.x, mid.y, 0.2), new THREE.Vector3(b.x, b.y + 0.12, 0.2)]);
+    gapLabel.position.set(mid.x, mid.y + 0.42, 0.2);
+    // progressive recolor by best ckpt: wipe left→right over 4 s starting 3 s into stage
+    const wipe = THREE.MathUtils.clamp((T - STAGES[2].t - 3) / 4, 0, 1);
+    if (wipe > 0) {
+      const upTo = Math.floor(wipe * NQ);
+      for (let q = 0; q < upTo; q++)
+        tiles.setColorAt(q, everByEnd[q] ? bestCkptColor(q) : COL_NEVER);
+      tiles.instanceColor.needsUpdate = true;
+    }
+  }
+
+  /* ---- stage 4: distillation streams ---- */
+  if (stageIdx === 3) {
+    gapGroup.visible = false;
+    const rate = 34;                               // queries/s → covers 409 in ~12 s
+    let toSpawn = Math.min(Math.floor(rate * dt) + (rng() < rate * dt % 1 ? 1 : 0), 6);
+    while (toSpawn-- > 0 && distillPtr < distillOrder.length) {
+      if (spawnParticle(distillOrder[distillPtr])) distillPtr++;
+      else break;
+    }
+    stuBody.material.emissiveIntensity = 0.10 + 0.25 * Math.abs(Math.sin(T * 2.2));
+  }
+
+  // particle integration (also drains remaining flights in stage 5)
+  if (points.visible) {
+    let anyLive = false;
+    for (let i = 0; i < P_MAX; i++) {
+      const p = particles[i];
+      if (!p.live) { pPos[i * 3 + 1] = -999; continue; }
+      anyLive = true;
+      p.t += dt / p.dur;
+      if (p.t >= 1) {
+        p.live = false; pPos[i * 3 + 1] = -999;
+        // arrival: student either captures the query or transfer fails
+        if (!tileDone[p.q]) {
+          tileDone[p.q] = 1;
+          stuCaptured++;
+          if (studentGets[p.q]) { stuSolvedCount++; tiles.setColorAt(p.q, COL_STUDENT); }
+          else tiles.setColorAt(p.q, COL_LOST);
+          tiles.instanceColor.needsUpdate = true;
+          stuCount.userData.redraw(`KL( student ∥ teacher_q* )   ·   ${stuCaptured} / ${NQ} captured`);
+        }
+        continue;
+      }
+      const u = p.t, v = 1 - u;                    // quadratic bezier
+      const x = v * v * p.a.x + 2 * v * u * p.b.x + u * u * p.c.x;
+      const y = v * v * p.a.y + 2 * v * u * p.b.y + u * u * p.c.y;
+      const z = v * v * p.a.z + 2 * v * u * p.b.z + u * u * p.c.z;
+      pPos[i * 3] = x; pPos[i * 3 + 1] = y; pPos[i * 3 + 2] = z;
+      const col = bestCkptColor(p.q);
+      pCol[i * 3] = col.r; pCol[i * 3 + 1] = col.g; pCol[i * 3 + 2] = col.b;
+    }
+    pGeo.attributes.position.needsUpdate = true;
+    pGeo.attributes.color.needsUpdate = true;
+    if (stageIdx === 4 && !anyLive && distillPtr >= distillOrder.length) points.visible = false;
+  }
+
+  /* ---- meters (always recomputed from live counters) ---- */
+  meterCur.set(curSolvedCount / NQ);
+  meterEnv.set(everCount / NQ);
+  if (meterStu.group.visible) meterStu.set(stuSolvedCount / NQ);
+
+  /* ---- status line ---- */
+  const step = (simCkpt + 1) * 15;
+  if (stageIdx <= 1) {
+    statusEl.innerHTML = `ckpt <b>step ${step}</b> &nbsp;|&nbsp; current <b>${(curSolvedCount / NQ * 100).toFixed(1)}%</b> · ever-solved <b>${(everCount / NQ * 100).toFixed(1)}%</b> &nbsp;|&nbsp; <span class="badge">churn</span>`;
+  } else if (stageIdx === 2) {
+    statusEl.innerHTML = `final ckpt <b>step 300</b> · gap <b>${((everCount - curSolvedCount) / NQ * 100).toFixed(1)} pt</b> &nbsp;|&nbsp; tiles → hue of <b>per-query best ckpt</b>`;
+  } else {
+    statusEl.innerHTML = `distilling <b>${stuCaptured}/${distillOrder.length}</b> ever-solved queries &nbsp;|&nbsp; student <b>${(stuSolvedCount / NQ * 100).toFixed(1)}%</b> vs final ckpt <b>${(finalAcc * 100).toFixed(1)}%</b>`;
+  }
+
+  composer.render();
+}
+tick();
+</script>
+</body>
+</html>
