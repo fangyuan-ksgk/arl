@@ -189,9 +189,12 @@ class SuperCoT:
     def mix(self, probs):  # [B,k,V] -> [B,k,d]: convex combination of vocab embeddings
         return probs.to(self.E.dtype) @ self.E
 
-    def dot_probs(self, B, peak=5.0):  # '.'-peaked slots: off-policy search init (idea #1)
+    def dot_probs(self, B):
+        """'.'-peaked slots: off-policy search init (idea #1).
+        peak is a RAW logit against a V-way partition, so it must beat log(V) ~ 11.9
+        at Qwen3's V=151936: peak=5 leaves '.' with 0.1% mass (i.e. uniform, H~12 nats)."""
         lg = torch.zeros(B, self.args.k, self.E.shape[0], device=DEVICE)
-        lg[..., self.DOT] = peak
+        lg[..., self.DOT] = self.args.dot_peak
         return F.softmax(lg, -1)
 
     def filler_embs(self, B):
@@ -279,19 +282,31 @@ class SuperCoT:
         a = self.args
         lg = (p0.clamp_min(1e-9).log() * a.tau).detach().requires_grad_(True)
         opt = torch.optim.Adam([lg], lr=a.inner_lr)
-        logp0, ce, kl, i = p0.clamp_min(1e-9).log(), 0.0, 0.0, 0
+        logp0 = p0.clamp_min(1e-9).log()
+        ce = kl = dec = h = 0.0
+        i = 0
         with frozen(self.model):
             for i in range(a.inner_steps):
                 p = F.softmax(lg / a.tau, -1)
-                kl_t = (p * (p.clamp_min(1e-9).log() - logp0)).sum(-1).mean()
-                ce_t = self.score(batch, self.mix(p))[0].mean()
-                ce, kl = float(ce_t), float(kl_t)
+                logp = p.clamp_min(1e-9).log()
+                kl_t = (p * (logp - logp0)).sum(-1).mean()
+                h_t = -(p * logp).sum(-1).mean()
+                # loss_C: answer CE + alpha * decodability CE(p || model's own next-token
+                # dist at that slot). The latter is linear in p, so it PULLS p toward the
+                # model's argmax -> low-entropy, on-manifold targets worth distilling.
+                # score's slot_target is exactly that CE, so it is free: one forward.
+                ce_v, dec_v = self.score(batch, self.mix(p), slot_target=p)
+                ce_t, dec_t = ce_v.mean(), dec_v.mean()
+                ce, kl, dec, h = float(ce_t), float(kl_t), float(dec_t), float(h_t)
                 if a.kl_cap and kl >= a.kl_cap:  # trust region on the improvement step
                     break
-                loss = ce_t + (a.beta * kl_t if anchor else 0.0)
+                loss = ce_t + a.alpha * dec_t + a.gamma * h_t
+                if anchor:
+                    loss = loss + a.beta * kl_t
                 opt.zero_grad(); loss.backward(); opt.step()
         return F.softmax(lg / a.tau, -1).detach(), {
-            "inner_steps": i, "inner_ce": round(ce, 4), "inner_kl": round(kl, 4)}
+            "inner_steps": i, "inner_ce": round(ce, 4), "inner_kl": round(kl, 4),
+            "inner_dec": round(dec, 4), "inner_H": round(h, 3)}
 
     # -- training ------------------------------------------------------------
     def loss(self, batch):
@@ -385,6 +400,12 @@ def main():
     # inner search (distill / search)
     ap.add_argument("--inner_steps", type=int, default=4)
     ap.add_argument("--inner_lr", type=float, default=0.5)
+    ap.add_argument("--alpha", type=float, default=0.1,
+                    help="decodability CE weight in the inner objective (loss_C); sharpens p*")
+    ap.add_argument("--gamma", type=float, default=0.0,
+                    help="explicit entropy penalty on p* (nats); alpha usually suffices")
+    ap.add_argument("--dot_peak", type=float, default=20.0,
+                    help="raw logit for '.' in the distill init; must beat log(V)~11.9")
     ap.add_argument("--beta", type=float, default=0.1, help="KL(p*||p0) anchor, search only")
     ap.add_argument("--kl_cap", type=float, default=1.0, help="stop inner loop at this KL; 0=off")
     ap.add_argument("--lam", type=float, default=1.0, help="weight on slot-matching CE")
