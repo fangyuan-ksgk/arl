@@ -22,17 +22,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL, K, LAYER, STEPS = "Qwen/Qwen3-1.7B", 16, 14, 250
 ALPHA = 0.1                                    # weight of the super-logit decodability CE in loss_C
+DEVICE = "cuda" if torch.cuda.is_available() else (
+    "mps" if torch.backends.mps.is_available() else "cpu")
 
-tok = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, device_map="cuda",
-                                             attn_implementation="eager").eval()
-for p in model.parameters(): # freeze any parameter in the model entirely
-    p.requires_grad_(False)
-E = model.get_input_embeddings().weight
-CLOSE = tok.encode("</think>\n\n", add_special_tokens=False) # we assume the <think> as well as the user end, assistant start indicator is contained in the prompt & cot but NOT the </think> symbol, a strange assumption
-APFX = tok.encode("The final answer is \\boxed{", add_special_tokens=False)
-DOT = tok.encode(".", add_special_tokens=False)[0]
-emb = lambda ids: E[torch.tensor(ids, device="cuda")]
+# globals populated by load(); the module is import-safe (no download at import time)
+tok = model = E = None
+CLOSE = APFX = DOT = None
+
+
+def load(model_name=MODEL):
+    """Load model/tokenizer and set module globals. Call once before anything else."""
+    global tok, model, E, CLOSE, APFX, DOT
+    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32  # fp32 off-cuda: we backprop through the model
+    tok = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=dtype, attn_implementation="eager").to(DEVICE).eval()
+    for p in model.parameters(): # freeze any parameter in the model entirely
+        p.requires_grad_(False)
+    E = model.get_input_embeddings().weight
+    CLOSE = tok.encode("</think>\n\n", add_special_tokens=False) # we assume the <think> as well as the user end, assistant start indicator is contained in the prompt & cot but NOT the </think> symbol, a strange assumption
+    APFX = tok.encode("The final answer is \\boxed{", add_special_tokens=False)
+    DOT = tok.encode(".", add_special_tokens=False)[0]
+    return model, tok
+
+
+emb = lambda ids: E[torch.tensor(ids, device=DEVICE)]
 soft = lambda l: torch.softmax(l, -1).to(E.dtype) @ E
 
 # Q1. what is K, what is E? 
@@ -44,74 +58,119 @@ soft = lambda l: torch.softmax(l, -1).to(E.dtype) @ E
 
 
 
-def optimize(loss_fn, steps=STEPS, lr=0.15):
-    logits = torch.zeros(K, E.shape[0], device="cuda")
+def optimize(loss_fn, k=K, steps=STEPS, lr=0.15, log_every=0):
+    logits = torch.zeros(k, E.shape[0], device=DEVICE)
     logits[:, DOT] = 6.0                       # start AT the filler baseline
     logits.requires_grad_(True)
     opt = torch.optim.Adam([logits], lr=lr)
-    for _ in range(steps):
+    for step in range(steps):
         loss = loss_fn(soft(logits), logits)
         opt.zero_grad(); loss.backward(); opt.step()
+        if log_every and (step % log_every == 0 or step == steps - 1):
+            print(f"step {step:4d}  loss {float(loss):.4f}")
     return logits.detach()
 
 
 @torch.no_grad()
-def decode(prefix_embeds, n=12): # just greedy decoding for n+1 more tokens
-    o = model(inputs_embeds=torch.cat([prefix_embeds, emb(CLOSE + APFX)])[None], use_cache=True)
+def generate(prefix_embeds, n=12): # raw greedy decoding from arbitrary prefix embeds; returns text
+    o = model(inputs_embeds=prefix_embeds[None], use_cache=True)
     ca, nt, out = o.past_key_values, int(o.logits[0, -1].argmax()), []
     for _ in range(n):
         if nt == tok.eos_token_id:
             break
         out.append(nt)
-        o = model(input_ids=torch.tensor([[nt]], device="cuda"), past_key_values=ca, use_cache=True)
+        o = model(input_ids=torch.tensor([[nt]], device=DEVICE), past_key_values=ca, use_cache=True)
         ca, nt = o.past_key_values, int(o.logits[0, -1].argmax())
-    m = re.findall(r"-?\d+\.?\d*|[A-J]\b|yes|no", tok.decode(out).replace(",", ""), re.I)
+    return tok.decode(out)
+
+
+def decode(prefix_embeds, n=12): # greedy decoding through the answer scaffold
+    return generate(torch.cat([prefix_embeds, emb(CLOSE + APFX)]), n)
+
+
+def parse_answer(text):
+    m = re.findall(r"-?\d+\.?\d*|[A-J]\b|yes|no", text.replace(",", ""), re.I)
     return m[0].lower().rstrip(".") if m else None
+
+
+# --- loss factories: build a loss_fn(se, l) closure for optimize() ---------------------
+
+def make_loss_A(p, ans):
+    """answer CE (planted) given super-positioned logit embedding"""
+    pe, tail = emb(p), torch.tensor(ans, device=DEVICE)
+    def loss_A(se, _l=None):
+        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE + APFX + ans)])[None])
+        return torch.nn.functional.cross_entropy(o.logits[0, -(len(ans)+1):-1].float(), tail)
+    return loss_A
+
+
+def make_loss_C(p, ans, alpha=ALPHA):
+    """answer CE + alpha * decodability CE(super-logits | query)"""
+    pe, tail = emb(p), torch.tensor(ans, device=DEVICE)
+    def loss_C(se, l):
+        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE + APFX + ans)])[None])
+        ce_ans = torch.nn.functional.cross_entropy(o.logits[0, -(len(ans)+1):-1].float(), tail)
+        # CE(super-logits | query): the model's next-token distribution at positions
+        # len(p)-1 .. len(p)+k-2 predicts soft tokens 0..k-1; target = softmax of the raw logits
+        k = l.shape[0]
+        pred = torch.log_softmax(o.logits[0, len(p)-1:len(p)+k-1].float(), -1)
+        q = torch.softmax(l.float(), -1)
+        ce_dec = -(q * pred).sum(-1).mean()
+        return ce_ans + alpha * ce_dec
+    return loss_C
+
+
+@torch.no_grad()
+def graft_targets(p, cot, k=K):
+    """top-k answer-attended CoT tokens' layer-LAYER states; ONLY needed for loss_B"""
+    c = tok(cot, add_special_tokens=False).input_ids    # Concern #1. tokenize separately and concatenate might not be equivalent to tokenize on the entire sequence
+    o = model(torch.tensor([p + c + CLOSE + APFX], device=DEVICE),
+              output_hidden_states=True, output_attentions=True)
+    lo, hi = len(p), len(p) + len(c)
+    sc = sum(A[0, :, hi:, lo:hi].float().mean(0).mean(0) for A in o.attentions)
+    sel = (torch.topk(sc, min(k, len(c))).indices.sort().values + lo).tolist()
+    return o.hidden_states[LAYER][0, sel].float()
+
+
+def make_loss_B(p, target):
+    """residual MSE to graft targets (answer-free)"""
+    pe = emb(p)
+    def loss_B(se, _l=None):
+        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE)])[None], output_hidden_states=True)
+        return torch.nn.functional.mse_loss(
+            o.hidden_states[LAYER][0, len(p):len(p)+se.shape[0]].float(), target)
+    return loss_B
+
+
+def inspect_logits(logits, topk=5, label=""):
+    """Per-slot entropy (bits) + top-k tokens: what are the super logits 'saying'?"""
+    probs = torch.softmax(logits, -1)
+    ent = -(probs * probs.clamp_min(1e-12).log2()).sum(-1)
+    for i in range(logits.shape[0]):
+        top = torch.topk(probs[i], topk)
+        toks = " | ".join(f"{tok.decode([int(j)])!r} {float(v):.2f}"
+                          for v, j in zip(top.values, top.indices))
+        print(f"{label}slot {i}  H={float(ent[i]):5.2f} bits   {toks}")
+    return probs, ent
 
 
 def run(prompt, cot, gt):
     p = tok(prompt, add_special_tokens=False).input_ids
-    pe = emb(p) # prompt embedding 
+    pe = emb(p) # prompt embedding
     ans = tok(str(gt), add_special_tokens=False).input_ids
-    tail = torch.tensor(ans, device="cuda") 
 
-    def loss_A(se, _l=None):                               # answer CE (planted) given super-positioned logit embedding
-        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE + APFX + ans)])[None])
-        return torch.nn.functional.cross_entropy(o.logits[0, -(len(ans)+1):-1].float(), tail)
+    target = graft_targets(p, cot)                          # ONLY needed for loss_B
 
-    def loss_C(se, l):                                     # answer CE + alpha * decodability CE
-        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE + APFX + ans)])[None])
-        ce_ans = torch.nn.functional.cross_entropy(o.logits[0, -(len(ans)+1):-1].float(), tail)
-        # CE(super-logits | query): the model's next-token distribution at positions
-        # len(p)-1 .. len(p)+K-2 predicts soft tokens 0..K-1; target = softmax of the raw logits
-        pred = torch.log_softmax(o.logits[0, len(p)-1:len(p)+K-1].float(), -1)
-        q = torch.softmax(l.float(), -1)
-        ce_dec = -(q * pred).sum(-1).mean()
-        return ce_ans + ALPHA * ce_dec
-
-    with torch.no_grad():                                   # graft targets, ONLY needed for loss_B
-        c = tok(cot, add_special_tokens=False).input_ids    # Concern #1. tokenize separately and concatenate might not be equivalent to tokenize on the entire sequence
-        o = model(torch.tensor([p + c + CLOSE + APFX], device="cuda"),
-                  output_hidden_states=True, output_attentions=True)
-        lo, hi = len(p), len(p) + len(c)
-        sc = sum(A[0, :, hi:, lo:hi].float().mean(0).mean(0) for A in o.attentions)
-        sel = (torch.topk(sc, K).indices.sort().values + lo).tolist()
-        target = o.hidden_states[LAYER][0, sel].float()
-        del o
-
-    def loss_B(se, _l=None):                               # residual MSE (answer-free)
-        o = model(inputs_embeds=torch.cat([pe, se, emb(CLOSE)])[None], output_hidden_states=True)
-        return torch.nn.functional.mse_loss(o.hidden_states[LAYER][0, len(p):len(p)+K].float(), target)
-
-    a = decode(torch.cat([pe, soft(optimize(loss_A))]))
-    b = decode(torch.cat([pe, soft(optimize(loss_B))]))
-    c_ = decode(torch.cat([pe, soft(optimize(loss_C))]))
-    f = decode(torch.cat([pe, emb([DOT] * K)]))
+    a = parse_answer(decode(torch.cat([pe, soft(optimize(make_loss_A(p, ans)))])))
+    b = parse_answer(decode(torch.cat([pe, soft(optimize(make_loss_B(p, target)))])))
+    c_ = parse_answer(decode(torch.cat([pe, soft(optimize(make_loss_C(p, ans)))])))
+    f = parse_answer(decode(torch.cat([pe, emb([DOT] * K)])))
     return a, b, c_, f
 
 
 if __name__ == "__main__":
     import random, collections
+    load()
     random.seed(0)
     pool = collections.defaultdict(list)
     for r in torch.load("/home/claudeuser/cot_lab/rollouts_v2.pt", weights_only=False):
